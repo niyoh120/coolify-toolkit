@@ -1,0 +1,19 @@
+# Dependencies / build output
+node_modules/
+dist/
+dist-web/
+
+# Local data & secrets
+data/
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.local
+registry-credentials*.json
+
+# Tooling / temp
+.pi/
+*.log
+tmp/
+coverage/

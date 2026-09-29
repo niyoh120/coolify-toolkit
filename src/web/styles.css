@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+/* Coolify 4.3.23-inspired graphite tokens (dark, layered, thin borders). */
+@theme {
+  --color-bg-base: #18181b;
+  --color-bg-raised: #1e1e22;
+  --color-bg-overlay: #26262b;
+  --color-bg-input: #232327;
+  --color-border-base: #2e2e33;
+  --color-border-strong: #3f3f46;
+  --color-text-primary: #e4e4e7;
+  --color-text-secondary: #a1a1aa;
+  --color-text-muted: #71717a;
+  --color-accent: #6be4ff; /* coolify cyan-ish */
+  --color-accent-strong: #22d3ee;
+  --color-success: #4ade80;
+  --color-warning: #fbbf24;
+  --color-danger: #f87171;
+  --color-info: #93c5fd;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-bg-base);
+  color: var(--color-text-primary);
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    "Helvetica Neue",
+    Arial,
+    "Noto Sans SC",
+    sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+/* Digest / uuid monospace identity */
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+/* Status badge base */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  border: 1px solid var(--color-border-base);
+  border-radius: 9999px;
+  padding: 0.05rem 0.55rem;
+  font-size: 12px;
+  white-space: nowrap;
+}

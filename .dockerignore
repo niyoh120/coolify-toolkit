@@ -1,0 +1,16 @@
+node_modules
+dist
+data
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.local
+registry-credentials*.json
+tests
+docs
+.pi
+.git
+coverage
+*.log
+drizzle/meta

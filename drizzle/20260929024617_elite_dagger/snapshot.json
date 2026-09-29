@@ -1,0 +1,1129 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "id": "f4814a09-b4b0-4d86-b528-50dde4325d17",
+  "prevIds": [
+    "00000000-0000-0000-0000-000000000000"
+  ],
+  "ddl": [
+    {
+      "name": "image_tracks",
+      "entityType": "tables"
+    },
+    {
+      "name": "notification_outbox",
+      "entityType": "tables"
+    },
+    {
+      "name": "resources",
+      "entityType": "tables"
+    },
+    {
+      "name": "settings",
+      "entityType": "tables"
+    },
+    {
+      "name": "update_jobs",
+      "entityType": "tables"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "resource_id",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_registry",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_repository",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_repository_authored",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_tag",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "target_platform",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "platform_source",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "configured_reference",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "configured_digest",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "configured_reference_kind",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "observed_digest",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "observed_at",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "upstream_tag_updated_at",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "observed_reference_kind",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "platform_manifest_digest",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "observed_error",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_successful_digest",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_success_at",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_success_deployment_uuid",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_success_source",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "pinned_at",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'discovered'",
+      "generated": null,
+      "name": "track_source",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "updated_at",
+      "entityType": "columns",
+      "table": "image_tracks"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "notification_outbox"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "event_type",
+      "entityType": "columns",
+      "table": "notification_outbox"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "resource_id",
+      "entityType": "columns",
+      "table": "notification_outbox"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "dedupe_key",
+      "entityType": "columns",
+      "table": "notification_outbox"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "title",
+      "entityType": "columns",
+      "table": "notification_outbox"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "body",
+      "entityType": "columns",
+      "table": "notification_outbox"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'pending'",
+      "generated": null,
+      "name": "status",
+      "entityType": "columns",
+      "table": "notification_outbox"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "attempts",
+      "entityType": "columns",
+      "table": "notification_outbox"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "next_attempt_at",
+      "entityType": "columns",
+      "table": "notification_outbox"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_error",
+      "entityType": "columns",
+      "table": "notification_outbox"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "table": "notification_outbox"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "sent_at",
+      "entityType": "columns",
+      "table": "notification_outbox"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "kind",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "coolify_uuid",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "parent_id",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "name",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "compose_service_name",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "server_uuid",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "server_name",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "project_name",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "environment_name",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "project_uuid",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "check_cron",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "environment_uuid",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "domains",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "current_image",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "config_fingerprint",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'ignore'",
+      "generated": null,
+      "name": "policy",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'active'",
+      "generated": null,
+      "name": "status",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "blocked_reason",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "excluded_infra",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "is_stopped",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "updated_at",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_synced_at",
+      "entityType": "columns",
+      "table": "resources"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "key",
+      "entityType": "columns",
+      "table": "settings"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "value",
+      "entityType": "columns",
+      "table": "settings"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "updated_at",
+      "entityType": "columns",
+      "table": "settings"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "resource_id",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "kind",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "trigger",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "candidate_digest",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "candidate_reference",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "prior_digest",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "prior_reference",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "expected_fingerprint",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'pending'",
+      "generated": null,
+      "name": "status",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'queued'",
+      "generated": null,
+      "name": "stage",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "deployment_uuid",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "error_code",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "error_message",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "attempts",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'[]'",
+      "generated": null,
+      "name": "log",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "confirmed_manually",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "idempotency_key",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "updated_at",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "started_at",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "finished_at",
+      "entityType": "columns",
+      "table": "update_jobs"
+    },
+    {
+      "columns": [
+        "resource_id"
+      ],
+      "tableTo": "resources",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_image_tracks_resource_id_resources_id_fk",
+      "entityType": "fks",
+      "table": "image_tracks"
+    },
+    {
+      "columns": [
+        "resource_id"
+      ],
+      "tableTo": "resources",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_notification_outbox_resource_id_resources_id_fk",
+      "entityType": "fks",
+      "table": "notification_outbox"
+    },
+    {
+      "columns": [
+        "resource_id"
+      ],
+      "tableTo": "resources",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_update_jobs_resource_id_resources_id_fk",
+      "entityType": "fks",
+      "table": "update_jobs"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "image_tracks_pk",
+      "table": "image_tracks",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "notification_outbox_pk",
+      "table": "notification_outbox",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "resources_pk",
+      "table": "resources",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "key"
+      ],
+      "nameExplicit": false,
+      "name": "settings_pk",
+      "table": "settings",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "update_jobs_pk",
+      "table": "update_jobs",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        {
+          "value": "resource_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "image_tracks_resource_uq",
+      "entityType": "indexes",
+      "table": "image_tracks"
+    },
+    {
+      "columns": [
+        {
+          "value": "dedupe_key",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "notification_dedupe_uq",
+      "entityType": "indexes",
+      "table": "notification_outbox"
+    },
+    {
+      "columns": [
+        {
+          "value": "status",
+          "isExpression": false
+        },
+        {
+          "value": "next_attempt_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "notification_status_idx",
+      "entityType": "indexes",
+      "table": "notification_outbox"
+    },
+    {
+      "columns": [
+        {
+          "value": "kind",
+          "isExpression": false
+        },
+        {
+          "value": "coolify_uuid",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "resources_kind_uuid_uq",
+      "entityType": "indexes",
+      "table": "resources"
+    },
+    {
+      "columns": [
+        {
+          "value": "parent_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "resources_parent_idx",
+      "entityType": "indexes",
+      "table": "resources"
+    },
+    {
+      "columns": [
+        {
+          "value": "policy",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "resources_policy_idx",
+      "entityType": "indexes",
+      "table": "resources"
+    },
+    {
+      "columns": [
+        {
+          "value": "status",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "resources_status_idx",
+      "entityType": "indexes",
+      "table": "resources"
+    },
+    {
+      "columns": [
+        {
+          "value": "idempotency_key",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "update_jobs_idem_uq",
+      "entityType": "indexes",
+      "table": "update_jobs"
+    },
+    {
+      "columns": [
+        {
+          "value": "resource_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "update_jobs_resource_idx",
+      "entityType": "indexes",
+      "table": "update_jobs"
+    },
+    {
+      "columns": [
+        {
+          "value": "status",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "update_jobs_status_idx",
+      "entityType": "indexes",
+      "table": "update_jobs"
+    }
+  ],
+  "renames": []
+}

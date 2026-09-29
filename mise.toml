@@ -1,0 +1,110 @@
+[tools]
+node = "24.19.0"
+
+[settings]
+# 任务输出走原始流，保留颜色与交互提示
+raw = true
+
+[vars]
+# Docker 镜像仓库地址
+image_repo = "ghcr.io/niyoh120/coolify-toolkit"
+
+# ---------- 质量门 ----------
+
+[tasks.lint]
+description = "Biome 静态检查（含格式）"
+run = "./node_modules/.bin/biome check src tests scripts"
+
+[tasks.typecheck]
+description = "双端 TypeScript 类型检查"
+run = [
+  "npx tsc -p tsconfig.server.json --noEmit",
+  "npx tsc -p tsconfig.web.json --noEmit",
+]
+
+[tasks.test]
+description = "Vitest 全量测试"
+run = "npx vitest run"
+
+[tasks.build]
+description = "构建 web + server 产物"
+run = [
+  "npx vite build",
+  "node scripts/build-server.mjs",
+]
+
+[tasks.ci]
+description = "CI 全流程：lint → typecheck → test → build"
+depends = ["lint", "typecheck", "test", "build"]
+
+# ---------- 本地测试环境 ----------
+
+# 启动本地服务（:8080，读 .env）；重复调用安全，已在跑则跳过
+[tasks.start]
+description = "启动本地测试服务（构建 + :8080）"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+mise run build >/dev/null
+if [ -f data/server.pid ] && kill -0 "$(cat data/server.pid)" 2>/dev/null; then
+  echo "已在运行 (pid $(cat data/server.pid)) → http://localhost:8080"
+  exit 0
+fi
+mkdir -p data
+nohup node --env-file=.env dist/server/index.js > data/local-server.log 2>&1 &
+echo $! > data/server.pid
+sleep 2
+if kill -0 "$(cat data/server.pid)" 2>/dev/null; then
+  echo "已启动 (pid $(cat data/server.pid)) → http://localhost:8080"
+else
+  echo "启动失败，查看 data/local-server.log:" >&2
+  tail -20 data/local-server.log >&2
+  exit 1
+fi
+"""
+
+# 停止本地服务；pid 过期（孤儿进程）时按命令行兜底清理
+[tasks.stop]
+description = "停止本地测试服务"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+if [ -f data/server.pid ]; then
+  pid="$(cat data/server.pid)"
+  kill "$pid" 2>/dev/null || true
+  rm -f data/server.pid
+fi
+# 兜底：kill 遗留的孤儿进程（pid 文件过期时占住 toolkit.lock）
+pkill -f 'node --env-file=.env dist/server/index.js' 2>/dev/null || true
+sleep 1
+echo "已停止"
+"""
+
+[tasks.restart]
+description = "重启本地测试服务"
+run = ["mise run stop", "mise run start"]
+
+# ---------- Docker 镜像 ----------
+
+[tasks.docker-build]
+description = "构建 Docker 镜像"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+IMAGE="{{ vars.image_repo }}"
+TAG="$(git rev-parse --short HEAD)"
+docker build -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" .
+echo "构建完成: ${IMAGE}:${TAG}"
+"""
+
+[tasks.docker-push]
+description = "推送 Docker 镜像（先构建）"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+IMAGE="{{ vars.image_repo }}"
+TAG="$(git rev-parse --short HEAD)"
+docker push "${IMAGE}:${TAG}"
+docker push "${IMAGE}:latest"
+echo "已推送: ${IMAGE}:${TAG} 与 ${IMAGE}:latest"
+"""

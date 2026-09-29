@@ -1,0 +1,55 @@
+{
+  "name": "coolify-toolkit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Homelab companion for Coolify: third-party image update management with digest pinning.",
+  "engines": {
+    "node": ">=24.19.0 <25"
+  },
+  "scripts": {
+    "dev": "concurrently -n web,api -c cyan,magenta \"npm:dev:web\" \"npm:dev:server\"",
+    "dev:web": "vite",
+    "dev:server": "tsx watch src/server/index.ts",
+    "build": "npm run build:web && npm run build:server",
+    "build:web": "vite build",
+    "build:server": "node scripts/build-server.mjs",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm run lint && npm run test && npm run build",
+    "db:generate": "drizzle-kit generate",
+    "start": "node dist/server/index.js"
+  },
+  "dependencies": {
+    "@hono/node-server": "2.1.1",
+    "@snyk/docker-registry-v2-client": "4.0.6",
+    "@tanstack/react-query": "5.104.0",
+    "croner": "10.0.1",
+    "drizzle-orm": "1.0.0-rc.4",
+    "hono": "4.13.9",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "undici": "8.11.2",
+    "yaml": "2.9.1",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.14",
+    "@tailwindcss/vite": "4.3.3",
+    "@types/node": "24.10.9",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "concurrently": "10.0.5",
+    "drizzle-kit": "1.0.0-rc.4",
+    "esbuild": "0.28.2",
+    "tailwindcss": "4.3.3",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vite": "8.3.1",
+    "vitest": "5.0.2"
+  }
+}

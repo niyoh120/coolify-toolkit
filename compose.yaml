@@ -1,0 +1,47 @@
+# Production deployment example behind Traefik.
+# The toolkit itself never publishes a public port; Traefik provides auth (e.g.
+# forward-auth / basic middleware) for BOTH the UI and /api/* on one entrypoint.
+#
+# Required labels on your Traefik instance: network attachment below must match.
+# Auth example: traefik.http.routers.coolify-toolkit.middlewares=toolkit-auth
+# where toolkit-auth is your basicAuth / forwardAuth middleware.
+
+services:
+  coolify-toolkit:
+    build: .
+    image: coolify-toolkit:0.1.0
+    restart: unless-stopped
+    environment:
+      COOLIFY_BASE_URL: ${COOLIFY_BASE_URL}
+      COOLIFY_API_KEY: ${COOLIFY_API_KEY}
+      EXCLUDED_RESOURCE_UUIDS: ${EXCLUDED_RESOURCE_UUIDS:-}
+      REGISTRY_CREDENTIALS_FILE: ${REGISTRY_CREDENTIALS_FILE:-}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN}
+      APPRISE_API_URL: ${APPRISE_API_URL:-}
+      APPRISE_CONFIG_KEY: ${APPRISE_CONFIG_KEY:-}
+      APPRISE_TAG: ${APPRISE_TAG:-}
+    volumes:
+      - toolkit-data:/data
+      # Optional: read-only registry credentials file
+      # - ./registry-credentials.json:/run/secrets/registry-credentials.json:ro
+    networks:
+      - toolkit-internal
+      # If Traefik runs in a docker network, join it and drop the internal one:
+      # proxy:
+      #   external: true
+    labels:
+      - traefik.enable=true
+      # Router: adjust host rule + entrypoint + certresolver to your setup.
+      - traefik.http.routers.coolify-toolkit.rule=Host(`toolkit.example.com`)
+      - traefik.http.routers.coolify-toolkit.entrypoints=websecure
+      - traefik.http.routers.coolify-toolkit.tls.certresolver=le
+      # REQUIRED: attach your auth middleware so UI + /api/* are protected.
+      - traefik.http.routers.coolify-toolkit.middlewares=toolkit-auth
+      - traefik.http.services.coolify-toolkit.loadbalancer.server.port=8080
+
+networks:
+  toolkit-internal:
+    driver: bridge
+
+volumes:
+  toolkit-data:

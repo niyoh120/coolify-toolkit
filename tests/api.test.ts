@@ -231,4 +231,128 @@ describe('api', () => {
     expect(health.status).toBe(200);
     void settings;
   });
+
+  describe('GET /api/resources?parent=', () => {
+    interface SeedRow {
+      kind: 'application' | 'compose_service' | 'service_application';
+      coolifyUuid: string;
+      name: string;
+      parentId?: number;
+      policy?: 'ignore' | 'notify' | 'manual' | 'auto';
+      status?: 'active' | 'removed';
+    }
+    let parentA: number;
+    let parentB: number;
+
+    beforeEach(() => {
+      const now = Date.now();
+      const insert = (row: SeedRow): number =>
+        h.db
+          .insert(resources)
+          .values({
+            kind: row.kind,
+            coolifyUuid: row.coolifyUuid,
+            name: row.name,
+            parentId: row.parentId ?? null,
+            policy: row.policy ?? 'ignore',
+            status: row.status ?? 'active',
+            configFingerprint: 'fp',
+            lastSyncedAt: now,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning()
+          .get()!.id;
+      parentA = insert({ kind: 'compose_service', coolifyUuid: 'svc-a', name: 'svc-a' });
+      parentB = insert({ kind: 'compose_service', coolifyUuid: 'svc-b', name: 'svc-b' });
+      insert({
+        kind: 'service_application',
+        coolifyUuid: 'child-a1',
+        name: 'web',
+        parentId: parentA,
+        policy: 'notify',
+      });
+      insert({
+        kind: 'service_application',
+        coolifyUuid: 'child-a2',
+        name: 'db',
+        parentId: parentA,
+      });
+      insert({
+        kind: 'service_application',
+        coolifyUuid: 'child-a-removed',
+        name: 'old',
+        parentId: parentA,
+        status: 'removed',
+      });
+      insert({
+        kind: 'service_application',
+        coolifyUuid: 'child-b1',
+        name: 'api',
+        parentId: parentB,
+        policy: 'auto',
+      });
+      insert({ kind: 'application', coolifyUuid: 'standalone', name: 'standalone' });
+    });
+
+    const listNames = async (query: string): Promise<string[]> => {
+      const app = createApp(deps);
+      const res = await app.request(`/api/resources${query}`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { resources: Array<{ name: string }> };
+      return body.resources.map((r) => r.name);
+    };
+
+    it('returns only the target parent active children and keeps parent names', async () => {
+      const app = createApp(deps);
+      const res = await app.request(`/api/resources?parent=${parentA}`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        resources: Array<{ name: string; parentName: string | null; kind: string }>;
+      };
+      expect(body.resources.map((r) => r.name).sort()).toEqual(['db', 'web']);
+      for (const r of body.resources) {
+        expect(r.parentName).toBe('svc-a');
+        expect(r.kind).toBe('service_application');
+      }
+    });
+
+    it('intersects with kind, policy and status filters', async () => {
+      await expect(listNames(`?parent=${parentA}&kind=application`)).resolves.toEqual([]);
+      await expect(listNames(`?parent=${parentA}&policy=notify`)).resolves.toEqual(['web']);
+      await expect(
+        listNames(`?parent=${parentA}&status=all`).then((names) => names.sort()),
+      ).resolves.toEqual(['db', 'old', 'web']);
+    });
+
+    it('returns an empty list for a valid but unknown parent id', async () => {
+      await expect(listNames('?parent=999999')).resolves.toEqual([]);
+    });
+
+    it.each([
+      '?parent=abc',
+      '?parent=',
+      '?parent=0',
+      '?parent=-1',
+      '?parent=1.5',
+      '?parent=1e3',
+      '?parent=0x10',
+      '?parent=1%20',
+      '?parent=999999999999999999999',
+      '?parent=1&parent=2',
+    ])('rejects invalid parent param %s with 400', async (query) => {
+      const app = createApp(deps);
+      const res = await app.request(`/api/resources${query}`);
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe('validation_error');
+    });
+
+    it('keeps the default list behavior when parent is absent', async () => {
+      const names = await listNames('');
+      expect(names).toContain('standalone');
+      expect(names).toContain('web');
+      expect(names).toContain('svc-a');
+    });
+  });
 });

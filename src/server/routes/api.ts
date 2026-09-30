@@ -63,6 +63,39 @@ function errorResponse(c: Context, err: unknown): Response {
   return c.json({ error: { code: 'internal_error', message, details: null } }, 500 as never);
 }
 
+/**
+ * 严格解析十进制正安全整数查询参数：缺省返回 null；空值、零、负数、小数、
+ * 非数字、混合字符、超出安全整数范围均抛 400 验证错误。
+ */
+function parseIdQuery(value: string | undefined, name: string): number | null {
+  if (value == null || value === '') {
+    if (value === '') {
+      throw new ApiRequestError(
+        errorCodes.validation,
+        `Query param ${name} must not be empty`,
+        400,
+      );
+    }
+    return null;
+  }
+  if (!/^[0-9]+$/.test(value)) {
+    throw new ApiRequestError(
+      errorCodes.validation,
+      `Query param ${name} must be a positive integer`,
+      400,
+    );
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new ApiRequestError(
+      errorCodes.validation,
+      `Query param ${name} must be a positive safe integer`,
+      400,
+    );
+  }
+  return parsed;
+}
+
 export function createApi(deps: Deps): Hono {
   const api = new Hono();
   const { db, settings, jobs, checker, sync, outbox, coolify } = deps;
@@ -129,6 +162,17 @@ export function createApi(deps: Deps): Hono {
       const kind = c.req.query('kind');
       const policy = c.req.query('policy');
       const status = c.req.query('status') ?? 'active';
+      // 重复 parent 参数按无效参数处理；缺省保持原有列表行为。
+      // Hono 的 queries() 在参数完全缺失时返回 undefined，需兜底为空数组。
+      const parentValues = c.req.queries('parent') ?? [];
+      if (parentValues.length > 1) {
+        throw new ApiRequestError(
+          errorCodes.validation,
+          'Query param parent must not be repeated',
+          400,
+        );
+      }
+      const parentId = parseIdQuery(parentValues[0], 'parent');
       const rows = db.select().from(resources).orderBy(resources.kind, resources.name).all();
       const tracks = db.select().from(imageTracks).all();
       const trackByResource = new Map(tracks.map((t) => [t.resourceId, t]));
@@ -147,6 +191,7 @@ export function createApi(deps: Deps): Hono {
         .filter((r) => (status === 'all' ? true : r.status === status))
         .filter((r) => (kind == null ? true : r.kind === kind))
         .filter((r) => (policy == null ? true : r.policy === policy))
+        .filter((r) => (parentId == null ? true : r.parentId === parentId))
         .map((r) => {
           const dto = resourceToDTO(
             r,

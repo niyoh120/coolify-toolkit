@@ -208,11 +208,14 @@ export function Pagination({
   pageSize,
   total,
   onChange,
+  unit = '项',
 }: {
   page: number;
   pageSize: number;
   total: number;
   onChange: (page: number) => void;
+  /** 计数单位：资源页为“项”，服务 Tab 按组计数为“组”。 */
+  unit?: string;
 }) {
   const pages = Math.max(1, Math.ceil(total / pageSize));
   if (total <= 0) return null;
@@ -221,7 +224,7 @@ export function Pagination({
   return (
     <div className="flex items-center justify-between gap-2 border-t border-[var(--color-border-base)] px-3 py-2 text-[12px] text-[var(--color-text-secondary)]">
       <span>
-        共 {total} 项 · 第 {current} / {pages} 页
+        共 {total} {unit} · 第 {current} / {pages} 页
       </span>
       <div className="flex items-center gap-1.5">
         <Button variant="ghost" disabled={current <= 1} onClick={() => onChange(current - 1)}>

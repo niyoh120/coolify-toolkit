@@ -178,9 +178,24 @@ describe('checker policy rules', () => {
     const id = await seed({ policy: 'ignore' });
     const r = await checker.checkResource(id, 'scheduled');
     expect(r.outcome).toBe('blocked');
+    expect(r.message).toBe('忽略策略的资源不检查更新');
     expect(resolveCalls).toBe(0);
     const track = handle.db.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get();
     expect(track?.observedDigest).toBeNull();
+  });
+
+  it('reports specific block reasons for removed and excluded resources', async () => {
+    const removedId = await seed({ policy: 'notify' });
+    handle.db.update(resources).set({ status: 'removed' }).where(eq(resources.id, removedId)).run();
+    const removed = await checker.checkResource(removedId, 'manual');
+    expect(removed.outcome).toBe('blocked');
+    expect(removed.message).toBe('资源已移除');
+
+    const excludedId = await seed({ policy: 'notify', excluded: true });
+    const excluded = await checker.checkResource(excludedId, 'manual');
+    expect(excluded.outcome).toBe('blocked');
+    expect(excluded.message).toBe('已排除（基础设施）');
+    expect(resolveCalls).toBe(0);
   });
 
   it('records the first observation without changing config (unfixed)', async () => {
@@ -251,6 +266,7 @@ describe('checker policy rules', () => {
     const id = await seed({ policy: 'notify', configuredDigest: D2, platform: null });
     const r = await checker.checkResource(id, 'scheduled');
     expect(r.outcome).toBe('blocked');
+    expect(r.message).toBe('目标平台待配置');
     expect(resolveCalls).toBe(0);
   });
 
@@ -262,6 +278,7 @@ describe('checker policy rules', () => {
     });
     const r = await checker.checkResource(id, 'scheduled');
     expect(r.outcome).toBe('blocked');
+    expect(r.message).toBe('外部修改，需重新确认');
     expect(resolveCalls).toBe(0);
   });
 
@@ -285,6 +302,7 @@ describe('checker policy rules', () => {
     const id = await seed({ policy: 'notify', sourceTag: '' });
     const r = await checker.checkResource(id, 'scheduled');
     expect(r.outcome).toBe('blocked');
+    expect(r.message).toBe('追踪 tag 待配置');
     expect(resolveCalls).toBe(0);
   });
 });

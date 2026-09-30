@@ -29,12 +29,6 @@ function Icon({ name }: { name: NavIcon }): ReactNode {
         <path d="M7 7.5h.01M7 16.5h.01" />
       </>
     ),
-    history: (
-      <>
-        <circle cx="12" cy="12" r="9" />
-        <path d="M12 7v5l3 3" />
-      </>
-    ),
     notifications: (
       <>
         <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
@@ -64,7 +58,7 @@ function Icon({ name }: { name: NavIcon }): ReactNode {
   );
 }
 
-type NavIcon = 'overview' | 'resources' | 'history' | 'notifications' | 'settings';
+type NavIcon = 'overview' | 'resources' | 'notifications' | 'settings';
 
 const NAV_SECTIONS: Array<{
   label: string;
@@ -75,7 +69,7 @@ const NAV_SECTIONS: Array<{
     items: [
       { key: 'overview', label: '概览', icon: 'overview' },
       { key: 'resources', label: '资源', icon: 'resources' },
-      { key: 'history', label: '更新历史', icon: 'history' },
+      // 更新历史从资源页顶部子 Tab 进入，不再重复出现在侧边栏。
     ],
   },
   {

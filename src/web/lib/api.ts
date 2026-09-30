@@ -1,10 +1,13 @@
 // Typed fetch client for the toolkit API.
 import type {
+  CheckOutcome,
   JobDTO,
   NotificationDTO,
   OverviewDTO,
   Policy,
   ResourceDTO,
+  ResourceKind,
+  ResourceStatus,
   SettingsDTO,
   TrackDTO,
 } from '../../shared/types.js';
@@ -51,10 +54,43 @@ export interface PreviewResult {
   message?: string;
 }
 
+export interface CheckResultDTO {
+  resourceId: number;
+  outcome: CheckOutcome;
+  observedDigest: string | null;
+  candidate: boolean;
+  message: string | null;
+}
+
+/** /api/resources 查询参数：字段间取交集；缺省字段保持服务端默认。 */
+export interface ResourceListParams {
+  kind?: ResourceKind;
+  policy?: Policy;
+  status?: ResourceStatus | 'all';
+  /** 只返回该父服务的子容器；服务端严格校验十进制正安全整数。 */
+  parent?: number;
+}
+
+export function resourceListQuery(params: ResourceListParams = {}): string {
+  const pairs: string[] = [];
+  if (params.kind != null) pairs.push(`kind=${params.kind}`);
+  if (params.policy != null) pairs.push(`policy=${params.policy}`);
+  if (params.status != null) pairs.push(`status=${params.status}`);
+  if (params.parent != null) pairs.push(`parent=${params.parent}`);
+  return pairs.join('&');
+}
+
 export const api = {
   overview: () => request<OverviewDTO>('/api/overview'),
-  resources: (params?: string) =>
-    request<{ resources: ResourceDTO[] }>(`/api/resources${params ? `?${params}` : ''}`),
+  resources: (params?: string | ResourceListParams) => {
+    const qs = typeof params === 'string' ? params : resourceListQuery(params);
+    return request<{ resources: ResourceDTO[] }>(`/api/resources${qs ? `?${qs}` : ''}`);
+  },
+  /** 服务详情用：按父资源筛选 active 子容器。 */
+  resourcesByParent: (parentId: number) =>
+    request<{ resources: ResourceDTO[] }>(
+      `/api/resources?${resourceListQuery({ parent: parentId })}`,
+    ),
   resource: (id: number) =>
     request<{ resource: ResourceDTO; jobs: JobDTO[] }>(`/api/resources/${id}`),
   patchResource: (
@@ -76,7 +112,7 @@ export const api = {
       body: JSON.stringify({ resourceIds, policy }),
     }),
   checkResource: (id: number) =>
-    request<{ check: { outcome: string; message: string | null } }>(`/api/resources/${id}/check`, {
+    request<{ check: CheckResultDTO }>(`/api/resources/${id}/check`, {
       method: 'POST',
       body: '{}',
     }),
@@ -133,4 +169,4 @@ export const api = {
     }),
 };
 
-export type { Policy, TrackDTO };
+export type { CheckOutcome, Policy, TrackDTO };

@@ -550,4 +550,147 @@ describe('per-node platform resolution', () => {
     expect(track?.targetPlatform).toBe('linux/arm64');
     expect(track?.platformSource).toBe('node');
   });
+
+  it('backfills missing serverUuid on existing parent/child rows once destination data appears (update branch)', async () => {
+    // 第一轮：Coolify 未返回 destination（历史版本/数据缺失）→ 父行 serverUuid=null。
+    const svcNoDest = SVC({
+      uuid: 'svc-late',
+      destination: undefined,
+      docker_compose_raw: 'services:\n  web:\n    image: nginx:1.27\n',
+    });
+    const children = [CHILD({ uuid: 'child-late', name: 'web', image: 'nginx:1.27' })];
+    sync = new InventorySync(handle.db, stubCoolify([], [svcNoDest], children), cfg, settings);
+    await sync.run();
+    let parent = handle.db
+      .select()
+      .from(resources)
+      .where(eq(resources.coolifyUuid, 'svc-late'))
+      .get();
+    expect(parent?.serverUuid).toBeNull();
+    const trackFor = (): typeof imageTracks.$inferSelect | undefined => {
+      const row = handle.db
+        .select()
+        .from(resources)
+        .where(eq(resources.coolifyUuid, 'child-late'))
+        .get();
+      return handle.db.select().from(imageTracks).where(eq(imageTracks.resourceId, row!.id)).get();
+    };
+    expect(trackFor()?.targetPlatform).toBeNull();
+
+    // 第二轮：destination 数据出现（destId=5 → srv-5, x86_64）→ update 分支补全
+    // serverUuid，子容器经由父级继承回填节点平台。
+    const svcWithDest = SVC({
+      uuid: 'svc-late',
+      destination: { id: 5, name: 'late-node' } as CoolifyService['destination'],
+      docker_compose_raw: 'services:\n  web:\n    image: nginx:1.27\n',
+    });
+    await new InventorySync(
+      handle.db,
+      stubCoolify([], [svcWithDest], children, [DEST(5, 'srv-late', 'x86_64')]),
+      cfg,
+      settings,
+    ).run();
+    parent = handle.db.select().from(resources).where(eq(resources.coolifyUuid, 'svc-late')).get();
+    expect(parent?.serverUuid).toBe('5');
+    expect(trackFor()).toMatchObject({ targetPlatform: 'linux/amd64', platformSource: 'node' });
+  });
+
+  it('backfills missing serverUuid on existing application rows once destination data appears', async () => {
+    const appNoDest = APP({ uuid: 'app-late' });
+    sync = new InventorySync(handle.db, stubCoolify([appNoDest], [], []), cfg, settings);
+    await sync.run();
+    let row = handle.db.select().from(resources).where(eq(resources.coolifyUuid, 'app-late')).get();
+    expect(row?.serverUuid).toBeNull();
+    let track = handle.db
+      .select()
+      .from(imageTracks)
+      .where(eq(imageTracks.resourceId, row!.id))
+      .get();
+    expect(track?.targetPlatform).toBeNull();
+
+    const appWithDest = APP({
+      uuid: 'app-late',
+      destination: { id: 9, name: 'late' } as CoolifyApplication['destination'],
+    });
+    await new InventorySync(
+      handle.db,
+      stubCoolify([appWithDest], [], [], [DEST(9, 'srv-9', 'aarch64')]),
+      cfg,
+      settings,
+    ).run();
+    row = handle.db.select().from(resources).where(eq(resources.coolifyUuid, 'app-late')).get();
+    expect(row?.serverUuid).toBe('9');
+    track = handle.db.select().from(imageTracks).where(eq(imageTracks.resourceId, row!.id)).get();
+    expect(track).toMatchObject({ targetPlatform: 'linux/arm64', platformSource: 'node' });
+  });
+
+  it('keeps child node platforms stable across full syncs, heals null and honors explicit platforms', async () => {
+    // web 带显式 compose platform；db 无 compose platform，只能从父服务节点继承。
+    const svc = SVC({
+      uuid: 'svc-node',
+      destination: { id: 5 } as CoolifyService['destination'],
+      docker_compose_raw:
+        'services:\n  web:\n    image: nginx:1.27\n    platform: linux/arm64\n  db:\n    image: postgres:16\n',
+    });
+    const children = [
+      CHILD({ uuid: 'child-web', name: 'web', image: 'nginx:1.27' }),
+      CHILD({ uuid: 'child-db', name: 'db', image: 'postgres:16' }),
+    ];
+    const topology = [DEST(5, 'srv-5', 'x86_64')];
+    sync = new InventorySync(handle.db, stubCoolify([], [svc], children, topology), cfg, settings);
+    await sync.run();
+    const trackFor = (uuid: string) => {
+      const row = handle.db.select().from(resources).where(eq(resources.coolifyUuid, uuid)).get();
+      return handle.db.select().from(imageTracks).where(eq(imageTracks.resourceId, row!.id)).get();
+    };
+    expect(trackFor('child-web')).toMatchObject({
+      targetPlatform: 'linux/arm64',
+      platformSource: 'compose',
+    });
+    // 子容器继承父服务的节点平台（回填父级映射缺失时这里会被清空）。
+    expect(trackFor('child-db')).toMatchObject({
+      targetPlatform: 'linux/amd64',
+      platformSource: 'node',
+    });
+
+    // 模拟历史缺陷产生的 null/null 追踪记录：下一次同步应自愈回节点平台。
+    handle.db
+      .update(imageTracks)
+      .set({ targetPlatform: null, platformSource: null })
+      .where(eq(imageTracks.resourceId, trackFor('child-db')!.resourceId))
+      .run();
+    // web 手动改过平台：manual 来源保持原值。
+    handle.db
+      .update(imageTracks)
+      .set({ targetPlatform: 'linux/riscv64', platformSource: 'manual' })
+      .where(eq(imageTracks.resourceId, trackFor('child-web')!.resourceId))
+      .run();
+
+    await new InventorySync(
+      handle.db,
+      stubCoolify([], [svc], children, topology),
+      cfg,
+      settings,
+    ).run();
+    expect(trackFor('child-db')).toMatchObject({
+      targetPlatform: 'linux/amd64',
+      platformSource: 'node',
+    });
+    expect(trackFor('child-web')).toMatchObject({
+      targetPlatform: 'linux/riscv64',
+      platformSource: 'manual',
+    });
+
+    // 再次完整同步：节点派生平台保持稳定，无二次清空。
+    await new InventorySync(
+      handle.db,
+      stubCoolify([], [svc], children, topology),
+      cfg,
+      settings,
+    ).run();
+    expect(trackFor('child-db')).toMatchObject({
+      targetPlatform: 'linux/amd64',
+      platformSource: 'node',
+    });
+  });
 });

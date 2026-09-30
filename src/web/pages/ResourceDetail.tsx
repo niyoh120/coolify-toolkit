@@ -1,6 +1,9 @@
 // Resource detail: source/platform editing, check, preview, update, job history.
+// Entry point dispatches by resource kind: compose services render the
+// aggregated ServiceDetail; everything else renders the single-resource view.
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { type ReactNode, useState } from 'react';
+import type { JobDTO, ResourceDTO } from '../../shared/types.js';
 import {
   BlockedBadge,
   CheckBadge,
@@ -25,18 +28,34 @@ import {
   Select,
 } from '../components/ui.js';
 import { api, type Policy, type PreviewResult } from '../lib/api.js';
-import { useRefresh } from '../main.js';
+import { checkBlockedHint, checkOutcomeFeedback, type FeedbackTone } from '../lib/resource-view.js';
+import { useRefresh, useRouter } from '../main.js';
+import { ServiceDetail } from './ServiceDetail.js';
 
 export function ResourceDetailPage({ id }: { id: number }) {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['resource', id],
+    queryFn: () => api.resource(id),
+  });
+  if (isLoading) return <Loading />;
+  if (error != null) return <ErrorBox error={error} />;
+  if (data == null) return null;
+  const { resource, jobs } = data;
+  if (resource.kind === 'compose_service') return <ServiceDetail parent={resource} />;
+  return <SingleResourceDetail resource={resource} jobs={jobs} />;
+}
+
+function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs: JobDTO[] }) {
+  const id = resource.id;
+  const { navigate } = useRouter();
   const refresh = useRefresh();
   const [sourceTag, setSourceTag] = useState<string | null>(null);
   const [checkCron, setCheckCron] = useState<string | null>(null);
   const [preview, setPreview] = useState<PreviewResult['preview'] | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const { data, isLoading, error } = useQuery({
-    queryKey: ['resource', id],
-    queryFn: () => api.resource(id),
-  });
+  const [checkFeedback, setCheckFeedback] = useState<{ text: string; tone: FeedbackTone } | null>(
+    null,
+  );
   const settingsQ = useQuery({ queryKey: ['settings'], queryFn: api.settings });
   const deployTimeQ = useQuery({
     queryKey: ['deploy-time', id],
@@ -47,7 +66,20 @@ export function ResourceDetailPage({ id }: { id: number }) {
     mutationFn: (p: Parameters<typeof api.patchResource>[1]) => api.patchResource(id, p),
     onSuccess: () => void refresh(),
   });
-  const check = useMutation({ mutationFn: api.checkResource, onSuccess: () => void refresh() });
+  const check = useMutation({
+    mutationFn: api.checkResource,
+    onSuccess: (res) => {
+      // blocked（HTTP 200）不改变任何数据，必须显式展示结果，否则像“没反应”。
+      setCheckFeedback(checkOutcomeFeedback(resource.name, res.check.outcome, res.check.message));
+      refresh();
+    },
+    onError: (e) => {
+      setCheckFeedback({
+        text: `检查失败（${e instanceof Error ? e.message : '请求错误'}）`,
+        tone: 'danger',
+      });
+    },
+  });
   const previewMut = useMutation({
     mutationFn: () => api.preview(id),
     onSuccess: (res) => {
@@ -69,11 +101,10 @@ export function ResourceDetailPage({ id }: { id: number }) {
     onError: (e) => setActionError(e instanceof Error ? e.message : String(e)),
   });
 
-  if (isLoading) return <Loading />;
-  if (error != null) return <ErrorBox error={error} />;
-  if (data == null) return null;
-  const { resource, jobs } = data;
   const track = resource.track;
+  const checkHint = checkBlockedHint(resource);
+  const parentResourceId =
+    resource.kind === 'service_application' ? resource.parentResourceId : null;
 
   return (
     <div className="flex flex-col gap-4">
@@ -82,7 +113,18 @@ export function ResourceDetailPage({ id }: { id: number }) {
           <h1 className="text-[18px] font-semibold">{resource.name}</h1>
           <div className="flex flex-wrap items-center gap-1.5 pt-1 text-[12px] text-[var(--color-text-secondary)]">
             <Mono>{resource.coolifyUuid}</Mono>
-            {resource.parentName != null && <span>· 父级 {resource.parentName}</span>}
+            {parentResourceId != null ? (
+              <button
+                type="button"
+                className="text-[var(--color-accent)] hover:underline"
+                title="打开父服务详情"
+                onClick={() => navigate({ page: 'resource', id: parentResourceId })}
+              >
+                · 父级 {resource.parentName ?? `#${parentResourceId}`}
+              </button>
+            ) : (
+              resource.parentName != null && <span>· 父级 {resource.parentName}</span>
+            )}
             {resource.serverName != null && <span>· {resource.serverName}</span>}
             {resource.projectName != null && <span>· {resource.projectName}</span>}
           </div>
@@ -180,10 +222,25 @@ export function ResourceDetailPage({ id }: { id: number }) {
               >
                 保存
               </Button>
-              <Button onClick={() => check.mutate(id)} disabled={check.isPending}>
-                检查更新
+              <Button
+                onClick={() => {
+                  setCheckFeedback(null);
+                  check.mutate(id);
+                }}
+                disabled={checkHint != null || check.isPending}
+                title={checkHint ?? '检查上游是否有新版本'}
+              >
+                {check.isPending ? '检查中…' : '检查更新'}
               </Button>
             </div>
+            {checkFeedback != null && (
+              <div
+                role="status"
+                className={`col-span-full text-[12px] ${FEEDBACK_TONE_CLASS[checkFeedback.tone]}`}
+              >
+                {checkFeedback.text}
+              </div>
+            )}
             <label
               htmlFor="edit-check-cron"
               className="col-span-full flex flex-col gap-1 text-[12px] text-[var(--color-text-secondary)]"
@@ -344,6 +401,14 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
     </div>
   );
 }
+
+const FEEDBACK_TONE_CLASS: Record<FeedbackTone, string> = {
+  success: 'text-[var(--color-success)]',
+  warning: 'text-[var(--color-warning)]',
+  info: 'text-[var(--color-info)]',
+  danger: 'text-[var(--color-danger)]',
+  neutral: 'text-[var(--color-text-secondary)]',
+};
 
 function fmtTime(iso: string | null | undefined): string {
   if (iso == null || iso === '') return '—';

@@ -2,6 +2,7 @@
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
 
+import { ResourceTabsBar } from '../components/ResourceTabsBar.js';
 import { JobStatusBadge, shortDigest } from '../components/status.js';
 import {
   Badge,
@@ -51,8 +52,8 @@ export function HistoryPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 className="text-[18px] font-semibold">更新历史</h1>
+      <ResourceTabsBar active="history" />
+      <div className="flex flex-wrap items-center justify-end gap-2">
         <Select
           value={status}
           onChange={(e) => {

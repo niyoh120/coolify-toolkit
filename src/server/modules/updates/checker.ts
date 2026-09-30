@@ -91,19 +91,32 @@ export class UpdateChecker {
     return results;
   }
 
+  /**
+   * 资格判断与阻塞提示共用同一逻辑：返回 null 表示可检查，否则给出明确的
+   * 阻塞原因。checkResource 与 checkAll 的过滤都经由这里，避免口径漂移。
+   */
+  private eligibilityMessage(
+    resource: typeof resources.$inferSelect,
+    track: typeof imageTracks.$inferSelect,
+  ): string | null {
+    if (resource.status !== 'active') return '资源已移除';
+    if (resource.excludedInfra) return '已排除（基础设施）';
+    // Ignored resources get no checks at all. manual 策略允许手动检查
+    // （定时扫描由 checkAll 的策略过滤负责排除）。
+    if (resource.policy === 'ignore') return '忽略策略的资源不检查更新';
+    if (resource.blockedReason === 'external_change') return '外部修改，需重新确认';
+    if (track.sourceTag === '') return '追踪 tag 待配置'; // tracking tag must be configured first
+    if (track.targetPlatform == null || track.targetPlatform === '') {
+      return '目标平台待配置'; // platform must be verifiable
+    }
+    return null;
+  }
+
   private eligible(
     resource: typeof resources.$inferSelect,
     track: typeof imageTracks.$inferSelect,
   ): boolean {
-    if (resource.status !== 'active') return false;
-    if (resource.excludedInfra) return false;
-    // Ignored resources get no checks at all. manual 策略允许手动检查
-    // （定时扫描由 checkAll 的策略过滤负责排除）。
-    if (resource.policy === 'ignore') return false;
-    if (resource.blockedReason === 'external_change') return false;
-    if (track.sourceTag === '') return false; // tracking tag must be configured first
-    if (track.targetPlatform == null || track.targetPlatform === '') return false; // platform must be verifiable
-    return true;
+    return this.eligibilityMessage(resource, track) == null;
   }
 
   async checkResource(resourceId: number, reason: 'scheduled' | 'manual'): Promise<CheckResult> {
@@ -122,13 +135,14 @@ export class UpdateChecker {
         message: 'resource/track missing',
       };
     }
-    if (!this.eligible(resource, track)) {
+    const blockedMessage = this.eligibilityMessage(resource, track);
+    if (blockedMessage != null) {
       return {
         resourceId,
         outcome: 'blocked',
         observedDigest: null,
         candidate: false,
-        message: resource.blockedReason ?? 'not eligible',
+        message: blockedMessage,
       };
     }
 

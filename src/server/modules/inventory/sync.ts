@@ -195,7 +195,16 @@ export class InventorySync {
       .from(imageTracks)
       .innerJoin(resources, eq(resources.id, imageTracks.resourceId))
       .all();
-    const byId = new Map(rows.map((r) => [r.resource.id, r.resource]));
+    // 父服务本身没有 image track，join 结果缺少父行；子容器继承父服务的
+    // 节点，因此父级查找映射必须覆盖 resources 全表，避免回填把子容器
+    // 继承到的平台清空（历史 null 平台也经由同一路径自愈）。
+    const byId = new Map(
+      this.db
+        .select({ id: resources.id, serverUuid: resources.serverUuid })
+        .from(resources)
+        .all()
+        .map((r) => [r.id, r]),
+    );
     const now = Date.now();
     let updated = 0;
     for (const { track, resource } of rows) {
@@ -408,12 +417,17 @@ export class InventorySync {
     const isStopped =
       (svc.status ?? '').includes('stopped') || (svc.status ?? '').includes('exited');
     if (existing != null) {
+      const resolvedServerUuid =
+        svc.destination?.id != null ? String(svc.destination.id) : existing.serverUuid;
       await this.db
         .update(resources)
         .set({
           name: svc.name ?? existing.name,
           projectUuid: svc.project?.uuid ?? existing.projectUuid,
           environmentUuid: svc.environment?.uuid ?? existing.environmentUuid,
+          // 拓扑归属由 Coolify 数据决定：历史行缺 serverUuid（创建时
+          // destination 缺失）或迁移服务器时在同步中补全/更新。
+          serverUuid: resolvedServerUuid,
           serverName: this.serverNameFor(
             svc.destination?.id != null ? String(svc.destination.id) : null,
             existing.serverName,
@@ -427,9 +441,10 @@ export class InventorySync {
           updatedAt: now,
         })
         .where(eq(resources.id, existing.id));
-      // Return the post-update values so children inherit the fresh server name.
+      // Return the post-update values so children inherit the fresh server.
       return {
         ...existing,
+        serverUuid: resolvedServerUuid,
         serverName: this.serverNameFor(
           svc.destination?.id != null ? String(svc.destination.id) : null,
           existing.serverName,
@@ -704,6 +719,8 @@ export class InventorySync {
         name: app.name ?? existing.name,
         projectUuid: app.projectUuid ?? existing.projectUuid,
         environmentUuid: app.environmentUuid ?? existing.environmentUuid,
+        // 与服务父行相同：历史行缺 serverUuid 或迁移时在同步中补全/更新。
+        serverUuid: app.serverUuid ?? existing.serverUuid,
         serverName: this.serverNameFor(app.serverUuid, existing.serverName),
         domains: app.domains,
         currentImage: app.image,

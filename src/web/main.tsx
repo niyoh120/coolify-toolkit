@@ -14,6 +14,12 @@ import './styles.css';
 import type { PageName } from './components/Layout.js';
 import { Layout } from './components/Layout.js';
 import { api } from './lib/api.js';
+import {
+  parseResourceTab,
+  type ResourceTab,
+  resourceDetailHash,
+  resourcesHash,
+} from './lib/resource-route.js';
 import { HistoryPage } from './pages/History.js';
 import { NotificationsPage } from './pages/Notifications.js';
 import { OverviewPage } from './pages/Overview.js';
@@ -29,7 +35,7 @@ const queryClient = new QueryClient({
 
 type Route =
   | { page: 'overview' }
-  | { page: 'resources' }
+  | { page: 'resources'; tab: ResourceTab }
   | { page: 'resource'; id: number }
   | { page: 'history' }
   | { page: 'notifications' }
@@ -51,15 +57,20 @@ export function useRouter(): RouterCtx {
 
 // Hash-based routing: refresh/back/forward stay inside the SPA and survive
 // reloads (works behind Traefik without server-side rewrites).
+// 先分离路径与查询参数：`#/resources?tab=services` 携带资源 Tab 状态。
 function routeFromHash(): Route {
-  const h = window.location.hash.replace(/^#/, '');
-  if (h.startsWith('/resources/')) {
-    const id = Number.parseInt(h.slice('/resources/'.length), 10);
+  const raw = window.location.hash.replace(/^#/, '');
+  const queryIndex = raw.indexOf('?');
+  const path = queryIndex === -1 ? raw : raw.slice(0, queryIndex);
+  const query = queryIndex === -1 ? undefined : raw.slice(queryIndex + 1);
+  if (path.startsWith('/resources/')) {
+    const id = Number.parseInt(path.slice('/resources/'.length), 10);
     if (Number.isInteger(id) && id > 0) return { page: 'resource', id };
   }
-  switch (h) {
+  switch (path) {
     case '/resources':
-      return { page: 'resources' };
+      // 缺省或非法 tab 回落到应用 Tab。
+      return { page: 'resources', tab: parseResourceTab(query) };
     case '/history':
       return { page: 'history' };
     case '/notifications':
@@ -72,7 +83,8 @@ function routeFromHash(): Route {
 }
 
 function hashFor(route: Route): string {
-  if (route.page === 'resource') return `#/resources/${route.id}`;
+  if (route.page === 'resource') return resourceDetailHash(route.id);
+  if (route.page === 'resources') return resourcesHash(route.tab);
   return route.page === 'overview' ? '#/' : `#/${route.page}`;
 }
 
@@ -96,8 +108,10 @@ function Shell(): ReactNode {
         typeof target === 'object'
           ? target
           : target === 'resource'
-            ? { page: 'resources' }
-            : { page: target },
+            ? { page: 'resources', tab: 'applications' }
+            : target === 'resources'
+              ? { page: 'resources', tab: 'applications' }
+              : { page: target },
       );
     },
     [navigate],
@@ -110,8 +124,9 @@ function Shell(): ReactNode {
         paused={overview.data?.globalPaused ?? false}
       >
         {route.page === 'overview' && <OverviewPage />}
-        {route.page === 'resources' && <ResourcesPage />}
-        {route.page === 'resource' && <ResourceDetailPage id={route.id} />}
+        {route.page === 'resources' && <ResourcesPage tab={route.tab} />}
+        {/* key 保证切换资源 id 时重置详情页内部的预览/错误/选择状态。 */}
+        {route.page === 'resource' && <ResourceDetailPage key={route.id} id={route.id} />}
         {route.page === 'history' && <HistoryPage />}
         {route.page === 'notifications' && <NotificationsPage />}
         {route.page === 'settings' && <SettingsPage />}

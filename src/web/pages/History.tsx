@@ -73,17 +73,17 @@ export function HistoryPage() {
         {jobs.length === 0 ? (
           <Empty>暂无任务记录。</Empty>
         ) : (
-          <Table>
+          <Table ariaLabel="更新历史">
             <thead>
               <tr>
-                <Th>资源</Th>
-                <Th>类型</Th>
-                <Th>变更</Th>
-                <Th>状态</Th>
-                <Th>部署</Th>
-                <Th>错误</Th>
-                <Th>时间</Th>
-                <Th>操作</Th>
+                <Th className="min-w-[8rem] max-w-[14rem]">资源</Th>
+                <Th className="min-w-[4rem]">类型</Th>
+                <Th className="min-w-[10rem]">变更</Th>
+                <Th className="min-w-[5rem]">状态</Th>
+                <Th className="min-w-[6rem]">部署</Th>
+                <Th className="min-w-[8rem] max-w-[14rem]">错误</Th>
+                <Th className="min-w-[9rem]">时间</Th>
+                <Th className="min-w-[9rem]">操作</Th>
               </tr>
             </thead>
             <tbody>
@@ -92,7 +92,7 @@ export function HistoryPage() {
                   <Td>
                     <button
                       type="button"
-                      className="text-[var(--color-accent)] hover:underline"
+                      className="break-words text-[var(--color-accent)] hover:underline"
                       onClick={() => navigate({ page: 'resource', id: j.resourceId })}
                     >
                       {j.resourceName}
@@ -106,7 +106,7 @@ export function HistoryPage() {
                         : '应用'}
                   </Td>
                   <Td>
-                    <span className="mono text-[12px]">
+                    <span className="mono break-all text-[12px]">
                       {shortDigest(j.priorDigest)} → {shortDigest(j.candidateDigest)}
                     </span>
                   </Td>
@@ -127,19 +127,24 @@ export function HistoryPage() {
                   </Td>
                   <Td>
                     {j.errorMessage != null ? (
-                      <span
-                        className="text-[var(--color-danger)]"
-                        title={`${j.errorCode}: ${j.errorMessage}`}
-                      >
-                        {j.errorCode}
-                      </span>
+                      <details data-full-text className="min-w-0">
+                        <summary
+                          className="cursor-pointer text-[var(--color-danger)]"
+                          title={`${j.errorCode}: ${j.errorMessage}`}
+                        >
+                          {j.errorCode}
+                        </summary>
+                        <div className="pt-1 break-all text-[11px] text-[var(--color-danger)]">
+                          {j.errorCode}: {j.errorMessage}
+                        </div>
+                      </details>
                     ) : (
                       '—'
                     )}
                   </Td>
                   <Td>{new Date(j.createdAt).toLocaleString('zh-CN', { hour12: false })}</Td>
                   <Td>
-                    <div className="flex gap-1">
+                    <div className="flex flex-wrap gap-1">
                       {['failed', 'conflict', 'blocked'].includes(j.status) && (
                         <Button
                           variant="ghost"

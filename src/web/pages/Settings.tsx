@@ -42,7 +42,7 @@ export function SettingsPage() {
       <Card>
         <CardHeader title="扫描计划" />
         <CardBody className="flex flex-col gap-3">
-          <div className="grid items-end gap-3 sm:grid-cols-4">
+          <div className="grid items-end gap-3 sm:grid-cols-2 lg:grid-cols-3">
             <label
               htmlFor="set-sync-cron"
               className="flex flex-col gap-1 text-[12px] text-[var(--color-text-secondary)]"
@@ -116,7 +116,7 @@ export function SettingsPage() {
               <Badge tone="danger">连接失败</Badge>
             )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             地址：<span className="mono">{data.coolifyBaseUrlHost || '—'}</span>
           </div>
         </CardBody>
@@ -147,9 +147,11 @@ export function SettingsPage() {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             地址：<span className="mono">{data.apprise.apiUrlHost || '—'}</span>
-            {data.apprise.tag != null && <span>tag: {data.apprise.tag}</span>}
+            {data.apprise.tag != null && (
+              <span className="break-words">tag: {data.apprise.tag}</span>
+            )}
           </div>
-          <div>
+          <div className="break-words">
             上次测试：
             {data.apprise.lastTestOk == null
               ? '未测试'

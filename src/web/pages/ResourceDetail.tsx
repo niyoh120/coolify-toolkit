@@ -297,6 +297,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
             {preview != null && (
               <Button
                 variant="accent"
+                className="whitespace-normal"
                 onClick={() => updateMut.mutate()}
                 disabled={updateMut.isPending}
               >
@@ -310,7 +311,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
             </div>
           )}
           {preview != null && (
-            <div className="rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] px-3 py-2 text-[12px]">
+            <div className="break-words rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] px-3 py-2 text-[12px]">
               <div>
                 目标引用：<Mono copyable>{preview.candidateReference}</Mono>（
                 {preview.referenceKind === 'index' ? '多架构 index 摘要' : '单 manifest 摘要'}）
@@ -372,14 +373,19 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
             </Button>
           )}
           {job.stage === 'awaiting_confirmation' && (
-            <Button variant="accent" onClick={() => confirm.mutate()} disabled={confirm.isPending}>
+            <Button
+              variant="accent"
+              className="whitespace-normal"
+              onClick={() => confirm.mutate()}
+              disabled={confirm.isPending}
+            >
               我已确认容器正常，记录人工确认
             </Button>
           )}
         </span>
       </div>
       {job.errorMessage != null && (
-        <div className="pt-1 text-[var(--color-danger)]">
+        <div className="pt-1 break-all text-[var(--color-danger)]">
           {job.errorCode}: {job.errorMessage}
         </div>
       )}
@@ -388,7 +394,7 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
           <summary className="cursor-pointer text-[var(--color-text-muted)]">执行日志</summary>
           <div className="mt-1 flex flex-col gap-0.5 text-[11px] text-[var(--color-text-secondary)]">
             {job.log.map((entry) => (
-              <div key={`${entry.at}:${entry.stage}:${entry.message}`}>
+              <div key={`${entry.at}:${entry.stage}:${entry.message}`} className="break-all">
                 <span className="mono">
                   {new Date(entry.at).toLocaleTimeString('zh-CN', { hour12: false })}
                 </span>{' '}

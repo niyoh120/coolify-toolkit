@@ -10,6 +10,8 @@ import { Badge, Button, Empty, Table, Td, Th } from '../ui.js';
 export interface ChildResourcesTableProps {
   /** 子容器行（调用方负责筛选后的集合）。 */
   rows: ResourceDTO[];
+  /** 滚动 region 的可访问名称，用于区分多个同时存在的子容器表。 */
+  ariaLabel: string;
   /** When provided, renders a selection column bound to these ids. */
   selected?: number[];
   onToggleSelected?: (id: number, checked: boolean) => void;
@@ -24,6 +26,7 @@ export interface ChildResourcesTableProps {
 
 export function ChildResourcesTable({
   rows,
+  ariaLabel,
   selected,
   onToggleSelected,
   onOpen,
@@ -35,7 +38,7 @@ export function ChildResourcesTable({
 }: ChildResourcesTableProps) {
   if (rows.length === 0) return <Empty>{emptyText}</Empty>;
   return (
-    <Table>
+    <Table ariaLabel={ariaLabel}>
       <thead>
         <tr>
           {selected != null && onToggleSelected != null && (
@@ -43,15 +46,15 @@ export function ChildResourcesTable({
               <span aria-hidden="true" />
             </Th>
           )}
-          <Th>名称</Th>
-          <Th>镜像 / 追踪来源</Th>
-          <Th>配置摘要</Th>
-          <Th>上游摘要</Th>
-          <Th>是否有更新</Th>
-          <Th>部署</Th>
-          <Th>状态</Th>
-          <Th>策略</Th>
-          <Th>操作</Th>
+          <Th className="min-w-[10rem] max-w-[16rem]">名称</Th>
+          <Th className="min-w-[10rem] max-w-[15rem]">镜像 / 追踪来源</Th>
+          <Th className="min-w-[6.5rem]">配置摘要</Th>
+          <Th className="min-w-[6.5rem]">上游摘要</Th>
+          <Th className="min-w-[5rem]">是否有更新</Th>
+          <Th className="min-w-[5rem]">部署</Th>
+          <Th className="min-w-[4.5rem]">状态</Th>
+          <Th className="min-w-[4.5rem]">策略</Th>
+          <Th className="min-w-[11rem]">操作</Th>
         </tr>
       </thead>
       <tbody>
@@ -73,13 +76,13 @@ export function ChildResourcesTable({
               <Td>
                 <button
                   type="button"
-                  className="text-left font-medium whitespace-nowrap text-[var(--color-accent)] hover:underline"
+                  className="text-left font-medium break-words text-[var(--color-accent)] hover:underline"
                   onClick={() => onOpen(r.id)}
                 >
                   {r.name}
                 </button>
                 {r.composeServiceName != null && r.composeServiceName !== r.name && (
-                  <div className="text-[11px] whitespace-nowrap text-[var(--color-text-muted)]">
+                  <div className="text-[11px] break-words text-[var(--color-text-muted)]">
                     {r.composeServiceName}
                   </div>
                 )}
@@ -92,7 +95,7 @@ export function ChildResourcesTable({
                 {r.track == null ? (
                   <span className="text-[12px] text-[var(--color-text-muted)]">无追踪</span>
                 ) : (
-                  <span className="mono text-[12px]">
+                  <span className="mono break-all text-[12px]">
                     {r.currentImage ?? '—'}
                     <div className="text-[var(--color-text-secondary)]">
                       tag:{' '}
@@ -122,7 +125,7 @@ export function ChildResourcesTable({
                 <Badge tone={policyTone(r.policy)}>{POLICY_LABEL[r.policy]}</Badge>
               </Td>
               <Td>
-                <div className="flex items-center gap-1">
+                <div className="flex flex-wrap items-center gap-1">
                   <Button
                     variant="ghost"
                     disabled={checkHint != null || checkingId === r.id}

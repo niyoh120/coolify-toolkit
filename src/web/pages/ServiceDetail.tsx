@@ -255,6 +255,7 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
               )}
               <ChildResourcesTable
                 rows={children}
+                ariaLabel="服务子容器"
                 selected={selected}
                 onToggleSelected={(id, checked) =>
                   setSelected((prev) => (checked ? [...prev, id] : prev.filter((x) => x !== id)))

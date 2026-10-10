@@ -6,7 +6,7 @@ import type {
   ReactNode,
   SelectHTMLAttributes,
 } from 'react';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 export function cn(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(' ');
@@ -20,7 +20,7 @@ export function Button({
   ...props
 }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: ButtonVariant }) {
   const base =
-    'inline-flex items-center justify-center gap-1.5 rounded border px-2.5 py-1.5 text-[13px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50';
+    'inline-flex items-center justify-center gap-1.5 rounded border px-2.5 py-1.5 text-[13px] font-medium whitespace-nowrap transition-colors disabled:cursor-not-allowed disabled:opacity-50';
   const styles: Record<ButtonVariant, string> = {
     default:
       'border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] text-[var(--color-text-primary)] hover:bg-[var(--color-border-base)]',
@@ -52,10 +52,12 @@ export function Card({ children, className }: { children: ReactNode; className?:
 export function CardHeader({ title, actions }: { title: ReactNode; actions?: ReactNode }) {
   return (
     <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--color-border-base)] px-4 py-2.5">
-      <h2 className="text-[13px] font-semibold uppercase tracking-wide text-[var(--color-text-secondary)]">
+      <h2 className="min-w-0 text-[13px] font-semibold uppercase tracking-wide text-[var(--color-text-secondary)]">
         {title}
       </h2>
-      {actions != null && <div className="flex items-center gap-2">{actions}</div>}
+      {actions != null && (
+        <div className="flex min-w-0 flex-wrap items-center gap-2">{actions}</div>
+      )}
     </div>
   );
 }
@@ -79,13 +81,16 @@ export function Badge({
   tone = 'neutral',
   children,
   title,
+  className,
 }: {
   tone?: BadgeTone;
   children: ReactNode;
   title?: string;
+  /** 受控换行等场景追加的类；默认保持单行紧凑。 */
+  className?: string;
 }) {
   return (
-    <span className={cn('badge', badgeTones[tone])} title={title}>
+    <span className={cn('badge', badgeTones[tone], className)} title={title}>
       {children}
     </span>
   );
@@ -95,7 +100,7 @@ export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElem
   return (
     <input
       className={cn(
-        'w-full rounded border border-[var(--color-border-base)] bg-[var(--color-bg-input)] px-2.5 py-1.5 text-[13px] text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)]',
+        'w-full min-w-0 rounded border border-[var(--color-border-base)] bg-[var(--color-bg-input)] px-2.5 py-1.5 text-[13px] text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)]',
         className,
       )}
       {...props}
@@ -107,7 +112,7 @@ export function Select({ className, children, ...props }: SelectHTMLAttributes<H
   return (
     <select
       className={cn(
-        'rounded border border-[var(--color-border-base)] bg-[var(--color-bg-input)] px-2 py-1.5 text-[13px] text-[var(--color-text-primary)]',
+        'max-w-full min-w-0 rounded border border-[var(--color-border-base)] bg-[var(--color-bg-input)] px-2 py-1.5 text-[13px] text-[var(--color-text-primary)]',
         className,
       )}
       {...props}
@@ -117,10 +122,110 @@ export function Select({ className, children, ...props }: SelectHTMLAttributes<H
   );
 }
 
-export function Table({ children }: { children: ReactNode }) {
+export function Table({ children, ariaLabel }: { children: ReactNode; ariaLabel: string }) {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const [edge, setEdge] = useState({ overflow: false, atStart: true, atEnd: true });
+
+  // 溢出/边界状态：数据、窗口与内容尺寸变化后重算；状态不变时不触发重渲染。
+  const syncEdge = useCallback(() => {
+    const el = scrollRef.current;
+    if (el == null) return;
+    const overflow = el.scrollWidth - el.clientWidth > 1;
+    const atStart = el.scrollLeft <= 1;
+    const atEnd = el.scrollLeft + el.clientWidth >= el.scrollWidth - 1;
+    setEdge((prev) =>
+      prev.overflow === overflow && prev.atStart === atStart && prev.atEnd === atEnd
+        ? prev
+        : { overflow, atStart, atEnd },
+    );
+  }, []);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el == null) return;
+    syncEdge();
+    const observer = new ResizeObserver(syncEdge);
+    observer.observe(el);
+    const table = el.querySelector('table');
+    if (table != null) observer.observe(table);
+    el.addEventListener('scroll', syncEdge, { passive: true });
+    window.addEventListener('resize', syncEdge);
+    return () => {
+      observer.disconnect();
+      el.removeEventListener('scroll', syncEdge);
+      window.removeEventListener('resize', syncEdge);
+    };
+  }, [syncEdge]);
+
+  const nudge = (direction: -1 | 1): void => {
+    const el = scrollRef.current;
+    if (el == null) return;
+    el.scrollBy({ left: direction * Math.round(el.clientWidth * 0.9), behavior: 'smooth' });
+  };
+
+  const arrowClass =
+    'inline-flex h-6 w-6 items-center justify-center rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)] disabled:cursor-not-allowed disabled:opacity-40';
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full min-w-[720px] border-collapse text-[13px]">{children}</table>
+    <div>
+      {edge.overflow && (
+        <div className="flex items-center justify-between gap-2 px-3 pt-2 text-[12px] text-[var(--color-text-muted)]">
+          <span data-table-hint>内容较宽，可左右滚动查看全部列</span>
+          <span className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              data-table-scroll="left"
+              aria-label="向左滚动表格"
+              title="向左滚动表格"
+              disabled={edge.atStart}
+              className={arrowClass}
+              onClick={() => nudge(-1)}
+            >
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                className="h-3.5 w-3.5"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+              >
+                <path d="m15 18-6-6 6-6" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              data-table-scroll="right"
+              aria-label="向右滚动表格"
+              title="向右滚动表格"
+              disabled={edge.atEnd}
+              className={arrowClass}
+              onClick={() => nudge(1)}
+            >
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                className="h-3.5 w-3.5"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+              >
+                <path d="m9 6 6 6-6 6" />
+              </svg>
+            </button>
+          </span>
+        </div>
+      )}
+      {/* biome-ignore lint/a11y/useSemanticElements: 滚动容器无对应语义元素，region+名称是可访问滚动区的标准模式 */}
+      <div
+        ref={scrollRef}
+        role="region"
+        aria-label={ariaLabel}
+        // biome-ignore lint/a11y/noNoninteractiveTabindex: 键盘用户需要焦点入口才能滚动表格区域（WCAG 2.1）
+        tabIndex={0}
+        data-allowed-scroll="true"
+        className="table-scroll"
+      >
+        <table className="w-full border-separate border-spacing-0 text-[13px]">{children}</table>
+      </div>
     </div>
   );
 }
@@ -129,7 +234,7 @@ export function Th({ children, className }: { children?: ReactNode; className?: 
   return (
     <th
       className={cn(
-        'border-b border-[var(--color-border-base)] px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]',
+        'sticky top-0 z-10 border-b border-[var(--color-border-base)] bg-[var(--color-bg-raised)] px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]',
         className,
       )}
     >
@@ -222,7 +327,7 @@ export function Pagination({
   // 数据收缩（保留裁剪、过滤、刷新）后页码可能越界：收敛到有效范围。
   const current = Math.min(page, pages);
   return (
-    <div className="flex items-center justify-between gap-2 border-t border-[var(--color-border-base)] px-3 py-2 text-[12px] text-[var(--color-text-secondary)]">
+    <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 border-t border-[var(--color-border-base)] px-3 py-2 text-[12px] text-[var(--color-text-secondary)]">
       <span>
         共 {total} {unit} · 第 {current} / {pages} 页
       </span>
@@ -252,7 +357,7 @@ export function HeadingTab({
     <button
       type="button"
       onClick={onClick}
-      className={`border-b-2 pb-1.5 text-[15px] font-medium transition-colors ${
+      className={`border-b-2 pb-1.5 text-[15px] font-medium whitespace-nowrap transition-colors ${
         active
           ? 'border-[var(--color-accent)] text-[var(--color-text-primary)]'
           : 'border-transparent text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
@@ -372,30 +477,46 @@ export function Modal({
   children: ReactNode;
   footer: ReactNode;
 }) {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  // onClose 通常是内联箭头，身份随父渲染变化；用 ref 保存最新回调，
+  // 避免父组件在弹窗打开期间重渲染时反复重置焦点。
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') onCloseRef.current();
     };
     window.addEventListener('keydown', onKey);
+    // 打开时把焦点移入弹窗：Tab 循环从这里开始，标题/操作可达。
+    dialogRef.current?.focus();
     return () => window.removeEventListener('keydown', onKey);
-  }, [open, onClose]);
+  }, [open]);
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label={title}
-        className="w-full max-w-md rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-bg-raised)] p-4 shadow-xl"
+        tabIndex={-1}
+        className="flex max-h-full w-full max-w-md flex-col rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-bg-raised)] p-4 shadow-xl outline-none focus-visible:outline-none"
       >
-        <div className="pb-2 text-[14px] font-semibold text-[var(--color-text-primary)]">
+        <div
+          data-modal-title
+          className="shrink-0 pb-2 text-[14px] font-semibold text-[var(--color-text-primary)]"
+        >
           {title}
         </div>
-        <div className="flex flex-col gap-2 py-2 text-[13px] text-[var(--color-text-secondary)]">
+        <div
+          data-modal-body
+          className="flex min-h-0 flex-col gap-2 overflow-y-auto py-2 text-[13px] text-[var(--color-text-secondary)]"
+        >
           {children}
         </div>
-        <div className="flex items-center justify-end gap-2 pt-3">{footer}</div>
+        <div className="flex flex-wrap items-center justify-end gap-2 pt-3">{footer}</div>
       </div>
     </div>
   );
@@ -429,7 +550,7 @@ export function TimezoneSelect({
   const [query, setQuery] = useState('');
   const zones = allTimezones().filter((z) => z.toLowerCase().includes(query.toLowerCase()));
   return (
-    <div className="relative w-full max-w-[280px]">
+    <div className="relative w-full max-w-full sm:max-w-[280px]">
       <Input
         id={id}
         value={open ? query : value}

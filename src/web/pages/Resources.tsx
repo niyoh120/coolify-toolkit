@@ -70,7 +70,7 @@ type PendingBatch =
 function FeedbackArea({ batch, lines }: { batch: BatchLines | null; lines: FeedbackLine[] }) {
   if (batch == null && lines.length === 0) return null;
   return (
-    <div className="rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] px-3 py-2 text-[12px] text-[var(--color-text-secondary)]">
+    <div className="break-words rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] px-3 py-2 text-[12px] text-[var(--color-text-secondary)]">
       {batch != null && (
         <>
           <div className="font-medium text-[var(--color-text-primary)]">{batch.summary}</div>
@@ -399,7 +399,7 @@ function ApplicationsView() {
               : '没有匹配的应用，请调整搜索或筛选条件。'}
           </Empty>
         ) : (
-          <Table>
+          <Table ariaLabel="应用列表">
             <thead>
               <tr>
                 <Th className="w-8">
@@ -412,16 +412,16 @@ function ApplicationsView() {
                     onChange={(e) => toggleAll(e.target.checked)}
                   />
                 </Th>
-                <Th>名称</Th>
-                <Th>服务器</Th>
-                <Th>追踪来源</Th>
-                <Th>配置摘要</Th>
-                <Th>上游摘要</Th>
-                <Th>是否有更新</Th>
-                <Th>部署</Th>
-                <Th>状态</Th>
-                <Th>策略</Th>
-                <Th>操作</Th>
+                <Th className="min-w-[10rem] max-w-[16rem]">名称</Th>
+                <Th className="min-w-[6rem] max-w-[10rem]">服务器</Th>
+                <Th className="min-w-[10rem] max-w-[15rem]">追踪来源</Th>
+                <Th className="min-w-[6.5rem]">配置摘要</Th>
+                <Th className="min-w-[6.5rem]">上游摘要</Th>
+                <Th className="min-w-[5rem]">是否有更新</Th>
+                <Th className="min-w-[5rem]">部署</Th>
+                <Th className="min-w-[4.5rem]">状态</Th>
+                <Th className="min-w-[4.5rem]">策略</Th>
+                <Th className="min-w-[11rem]">操作</Th>
               </tr>
             </thead>
             <tbody>
@@ -438,7 +438,7 @@ function ApplicationsView() {
                   <Td>
                     <button
                       type="button"
-                      className="text-left font-medium whitespace-nowrap text-[var(--color-accent)] hover:underline"
+                      className="text-left font-medium break-words text-[var(--color-accent)] hover:underline"
                       onClick={() => navigate({ page: 'resource', id: r.id })}
                     >
                       {r.name}
@@ -448,14 +448,14 @@ function ApplicationsView() {
                       {r.excludedInfra && <Badge>已排除</Badge>}
                     </div>
                   </Td>
-                  <Td className="text-[12px] whitespace-nowrap text-[var(--color-text-secondary)]">
+                  <Td className="break-words text-[12px] text-[var(--color-text-secondary)]">
                     {r.serverName ?? '—'}
                   </Td>
                   <Td>
                     {r.track == null ? (
                       '—'
                     ) : (
-                      <span className="mono text-[12px]">
+                      <span className="mono break-all text-[12px]">
                         {r.track.sourceRegistry}/{r.track.sourceRepository}:
                         {r.track.sourceTag === '' ? (
                           <Badge tone="warning">待配置</Badge>
@@ -482,28 +482,32 @@ function ApplicationsView() {
                     <Badge tone={policyTone(r.policy)}>{POLICY_LABEL[r.policy]}</Badge>
                   </Td>
                   <Td>
-                    <Button
-                      variant="ghost"
-                      disabled={
-                        checkBlockedHint(r) != null ||
-                        (checkOne.isPending && checkOne.variables === r.id)
-                      }
-                      title={checkBlockedHint(r) ?? '检查上游是否有新版本'}
-                      onClick={() => checkOne.mutate(r.id)}
-                    >
-                      {checkOne.isPending && checkOne.variables === r.id ? '检查中…' : '检查更新'}
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      disabled={
-                        updateBlockedHint(r) != null ||
-                        (updateOne.isPending && updateOne.variables === r.id)
-                      }
-                      title={updateBlockedHint(r) ?? '跳过预览，直接按最新观察到的摘要提交更新'}
-                      onClick={() => updateOne.mutate(r.id)}
-                    >
-                      {updateOne.isPending && updateOne.variables === r.id ? '提交中…' : '执行更新'}
-                    </Button>
+                    <div className="flex flex-wrap items-center gap-1">
+                      <Button
+                        variant="ghost"
+                        disabled={
+                          checkBlockedHint(r) != null ||
+                          (checkOne.isPending && checkOne.variables === r.id)
+                        }
+                        title={checkBlockedHint(r) ?? '检查上游是否有新版本'}
+                        onClick={() => checkOne.mutate(r.id)}
+                      >
+                        {checkOne.isPending && checkOne.variables === r.id ? '检查中…' : '检查更新'}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        disabled={
+                          updateBlockedHint(r) != null ||
+                          (updateOne.isPending && updateOne.variables === r.id)
+                        }
+                        title={updateBlockedHint(r) ?? '跳过预览，直接按最新观察到的摘要提交更新'}
+                        onClick={() => updateOne.mutate(r.id)}
+                      >
+                        {updateOne.isPending && updateOne.variables === r.id
+                          ? '提交中…'
+                          : '执行更新'}
+                      </Button>
+                    </div>
                   </Td>
                 </tr>
               ))}
@@ -937,14 +941,14 @@ function ServiceGroupSection({
         )}
         {group.orphan && <Badge tone="warning">父服务未在当前列表中</Badge>}
         {parent != null && (
-          <span className="flex items-center gap-1 text-[12px] whitespace-nowrap text-[var(--color-text-secondary)]">
+          <span className="flex items-center gap-1 text-[12px] text-[var(--color-text-secondary)]">
             父级
             <StatusPill tone={parent.isStopped ? 'danger' : 'success'}>
               {parent.isStopped ? '已停止' : '运行中'}
             </StatusPill>
           </span>
         )}
-        <span className="text-[12px] whitespace-nowrap text-[var(--color-text-secondary)]">
+        <span className="break-words text-[12px] text-[var(--color-text-secondary)]">
           {parent?.serverName ?? '—'}
           {parent?.projectName != null && ` · ${parent.projectName}`}
         </span>
@@ -975,6 +979,7 @@ function ServiceGroupSection({
         <div id={bodyId} className="border-t border-[var(--color-border-base)]">
           <ChildResourcesTable
             rows={visibleChildren}
+            ariaLabel={`${name} 子容器`}
             selected={selected}
             onToggleSelected={onToggleChild}
             onOpen={onOpen}

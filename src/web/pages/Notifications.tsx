@@ -73,26 +73,33 @@ export function NotificationsPage() {
           <Empty>暂无通知记录。</Empty>
         ) : (
           <>
-            <Table>
+            <Table ariaLabel="通知队列">
               <thead>
                 <tr>
-                  <Th>事件</Th>
-                  <Th>资源</Th>
-                  <Th>标题</Th>
-                  <Th>状态</Th>
-                  <Th>尝试</Th>
-                  <Th>错误</Th>
-                  <Th>时间</Th>
-                  <Th>操作</Th>
+                  <Th className="min-w-[5rem]">事件</Th>
+                  <Th className="min-w-[8rem] max-w-[12rem]">资源</Th>
+                  <Th className="min-w-[10rem] max-w-[16rem]">标题</Th>
+                  <Th className="min-w-[6rem]">状态</Th>
+                  <Th className="min-w-[3.5rem]">尝试</Th>
+                  <Th className="min-w-[8rem] max-w-[12rem]">错误</Th>
+                  <Th className="min-w-[9rem]">时间</Th>
+                  <Th className="min-w-[5rem]">操作</Th>
                 </tr>
               </thead>
               <tbody>
                 {pagedItems.map((n) => (
                   <tr key={n.id} className="hover:bg-[var(--color-bg-overlay)]/40">
                     <Td>{EVENT_LABEL[n.eventType] ?? n.eventType}</Td>
-                    <Td>{n.resourceName ?? '—'}</Td>
-                    <Td className="max-w-[280px] truncate" title={n.body}>
-                      {n.title}
+                    <Td className="break-words text-[12px] text-[var(--color-text-secondary)]">
+                      {n.resourceName ?? '—'}
+                    </Td>
+                    <Td>
+                      <details data-full-text className="min-w-0">
+                        <summary className="cursor-pointer break-words">{n.title}</summary>
+                        <div className="pt-1 break-words text-[11px] text-[var(--color-text-secondary)]">
+                          {n.body}
+                        </div>
+                      </details>
                     </Td>
                     <Td>
                       <Badge tone={STATUS_TONE[n.status] ?? 'neutral'}>
@@ -100,11 +107,19 @@ export function NotificationsPage() {
                       </Badge>
                     </Td>
                     <Td>{n.attempts}</Td>
-                    <Td
-                      className="max-w-[220px] truncate text-[var(--color-warning)]"
-                      title={n.lastError ?? undefined}
-                    >
-                      {n.lastError ?? '—'}
+                    <Td>
+                      {n.lastError != null ? (
+                        <details data-full-text className="min-w-0">
+                          <summary className="cursor-pointer break-words text-[var(--color-warning)]">
+                            {n.lastError.length > 40 ? `${n.lastError.slice(0, 40)}…` : n.lastError}
+                          </summary>
+                          <div className="pt-1 break-all text-[11px] text-[var(--color-warning)]">
+                            {n.lastError}
+                          </div>
+                        </details>
+                      ) : (
+                        '—'
+                      )}
                     </Td>
                     <Td>{new Date(n.createdAt).toLocaleString('zh-CN', { hour12: false })}</Td>
                     <Td>

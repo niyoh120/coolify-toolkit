@@ -63,7 +63,12 @@ export function DeployBadge({ track }: { track: TrackDTO | null }) {
 
 export function BlockedBadge({ blockedReason }: { blockedReason: BlockReason }) {
   if (blockedReason == null) return null;
-  return <Badge tone="danger">{BLOCK_LABEL[blockedReason] ?? blockedReason}</Badge>;
+  // 阻塞原因可能较长：允许受控换行，保持完整标签可读。
+  return (
+    <Badge tone="danger" className="whitespace-normal">
+      {BLOCK_LABEL[blockedReason] ?? blockedReason}
+    </Badge>
+  );
 }
 
 const JOB_STATUS: Record<string, { text: string; tone: BadgeTone }> = {

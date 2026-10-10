@@ -484,7 +484,10 @@ function ApplicationsView() {
                   <Td>
                     <Button
                       variant="ghost"
-                      disabled={checkBlockedHint(r) != null || checkOne.isPending}
+                      disabled={
+                        checkBlockedHint(r) != null ||
+                        (checkOne.isPending && checkOne.variables === r.id)
+                      }
                       title={checkBlockedHint(r) ?? '检查上游是否有新版本'}
                       onClick={() => checkOne.mutate(r.id)}
                     >
@@ -492,7 +495,10 @@ function ApplicationsView() {
                     </Button>
                     <Button
                       variant="ghost"
-                      disabled={updateBlockedHint(r) != null || updateOne.isPending}
+                      disabled={
+                        updateBlockedHint(r) != null ||
+                        (updateOne.isPending && updateOne.variables === r.id)
+                      }
                       title={updateBlockedHint(r) ?? '跳过预览，直接按最新观察到的摘要提交更新'}
                       onClick={() => updateOne.mutate(r.id)}
                     >

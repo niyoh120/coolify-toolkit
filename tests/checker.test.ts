@@ -72,7 +72,7 @@ afterEach(() => {
 });
 
 interface SeedOptions {
-  policy?: 'ignore' | 'notify' | 'auto';
+  policy?: 'ignore' | 'notify' | 'manual' | 'auto';
   configuredDigest?: string | null;
   observedDigest?: string | null;
   platform?: string | null;
@@ -208,19 +208,6 @@ describe('checker policy rules', () => {
     expect(handle.db.select().from(notificationOutbox).all()).toHaveLength(0);
   });
 
-  it('notifies upstream drift once for unfixed tracks', async () => {
-    const id = await seed({ policy: 'notify', configuredDigest: null, observedDigest: D2 });
-    resolveValue = D1;
-    const r = await checker.checkResource(id, 'scheduled');
-    expect(r.outcome).toBe('unfixed');
-    const boxes = handle.db.select().from(notificationOutbox).all();
-    expect(boxes).toHaveLength(1);
-    expect(boxes[0]?.eventType).toBe('upstream_changed');
-    // Repeat scan: no duplicate.
-    await checker.checkResource(id, 'scheduled');
-    expect(handle.db.select().from(notificationOutbox).all()).toHaveLength(1);
-  });
-
   it('detects candidates, dedupes notifications and keeps matching quiet', async () => {
     const id = await seed({ policy: 'notify', configuredDigest: D2 });
     resolveValue = D1;
@@ -304,5 +291,91 @@ describe('checker policy rules', () => {
     expect(r.outcome).toBe('blocked');
     expect(r.message).toBe('追踪 tag 待配置');
     expect(resolveCalls).toBe(0);
+  });
+});
+
+describe('auto initialization for uninitialized resources', () => {
+  it('creates an initial pin job on any check for non-ignore policies', async () => {
+    const scheduledId = await seed({ policy: 'notify', configuredDigest: null, uuid: 'u-n' });
+    const manualId = await seed({ policy: 'manual', configuredDigest: null, uuid: 'u-m' });
+    const autoId = await seed({ policy: 'auto', configuredDigest: null, uuid: 'u-a' });
+    await checker.checkResource(scheduledId, 'scheduled');
+    await checker.checkResource(manualId, 'manual');
+    // auto 资源的手动检查同样初始化（初始化与候选更新的 reason 门槛不同）。
+    await checker.checkResource(autoId, 'manual');
+    const rows = handle.db.select().from(updateJobs).all();
+    expect(rows).toHaveLength(3);
+    const byResource = new Map(rows.map((j) => [j.resourceId, j]));
+    expect(byResource.get(scheduledId)).toMatchObject({
+      kind: 'initial_pin',
+      trigger: 'auto',
+      status: 'pending',
+      candidateDigest: D1,
+    });
+    expect(byResource.get(manualId)).toMatchObject({ kind: 'initial_pin', trigger: 'manual' });
+    expect(byResource.get(autoId)).toMatchObject({ kind: 'initial_pin', trigger: 'manual' });
+    // 配置摘要由部署成功证据推进，检查本身只观察。
+    const track = handle.db
+      .select()
+      .from(imageTracks)
+      .where(eq(imageTracks.resourceId, scheduledId))
+      .get();
+    expect(track?.configuredDigest).toBeNull();
+  });
+
+  it('skips initialization under guards and keeps the resource unfixed', async () => {
+    const stoppedId = await seed({ policy: 'auto', configuredDigest: null, stopped: true });
+    const blockedId = await seed({
+      policy: 'notify',
+      configuredDigest: null,
+      blockedReason: 'compose_confirmation_pending',
+      uuid: 'u-b',
+    });
+    const stopped = await checker.checkResource(stoppedId, 'scheduled');
+    const blocked = await checker.checkResource(blockedId, 'scheduled');
+    expect(stopped.outcome).toBe('unfixed');
+    expect(blocked.outcome).toBe('unfixed');
+    expect(handle.db.select().from(updateJobs).all()).toHaveLength(0);
+
+    settings.patch({ globalPaused: true });
+    const pausedId = await seed({ policy: 'auto', configuredDigest: null, uuid: 'u-p' });
+    const paused = await checker.checkResource(pausedId, 'scheduled');
+    expect(paused.outcome).toBe('unfixed');
+    expect(handle.db.select().from(updateJobs).all()).toHaveLength(0);
+  });
+
+  it('suppresses the drift notification when an initial pin job was created', async () => {
+    const id = await seed({ policy: 'notify', configuredDigest: null, observedDigest: D2 });
+    resolveValue = D1;
+    const r = await checker.checkResource(id, 'scheduled');
+    expect(r.outcome).toBe('unfixed');
+    expect(handle.db.select().from(updateJobs).all()).toHaveLength(1);
+    // 初始化已接管在途，部署完成另有 update_success 通知，漂移通知是噪音。
+    expect(handle.db.select().from(notificationOutbox).all()).toHaveLength(0);
+  });
+
+  it('notifies upstream drift once when initialization is skipped', async () => {
+    const id = await seed({ policy: 'notify', configuredDigest: null, observedDigest: D2 });
+    resolveValue = D1;
+    settings.patch({ globalPaused: true });
+    const r = await checker.checkResource(id, 'scheduled');
+    expect(r.outcome).toBe('unfixed');
+    expect(handle.db.select().from(updateJobs).all()).toHaveLength(0);
+    const boxes = handle.db.select().from(notificationOutbox).all();
+    expect(boxes).toHaveLength(1);
+    expect(boxes[0]?.eventType).toBe('upstream_changed');
+    // Repeat scan: dedupe key identical.
+    await checker.checkResource(id, 'scheduled');
+    expect(handle.db.select().from(notificationOutbox).all()).toHaveLength(1);
+  });
+
+  it('does not re-create the initial pin job while the previous attempt failed', async () => {
+    const id = await seed({ policy: 'auto', configuredDigest: null });
+    await checker.checkResource(id, 'scheduled');
+    expect(handle.db.select().from(updateJobs).all()).toHaveLength(1);
+    handle.db.update(updateJobs).set({ status: 'failed' }).run();
+    await checker.checkResource(id, 'scheduled');
+    // 同 digest 失败任务阻塞重建：等上游变化或人工重试，避免每轮扫描反复部署。
+    expect(handle.db.select().from(updateJobs).all()).toHaveLength(1);
   });
 });

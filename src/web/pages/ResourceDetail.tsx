@@ -277,7 +277,8 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
           )}
           {track?.view.checkOutcome === 'unfixed' && (
             <div className="rounded border border-[var(--color-info)]/40 bg-[var(--color-info)]/5 px-3 py-2 text-[12px] text-[var(--color-info)]">
-              该资源尚未初始化，通过「预览更新 → 确认更新」执行初始化。
+              该资源尚未初始化，下次检查（定时或手动「检查更新」）将自动创建初始化任务；也可通过
+              「预览更新 → 确认更新」立即执行。
             </div>
           )}
         </CardBody>

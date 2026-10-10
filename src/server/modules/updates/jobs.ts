@@ -154,12 +154,42 @@ export class JobsService {
     this.assertUpdatable(resource, track);
     if (track == null) return null; // assertUpdatable throws first; narrows for TS
     if (resource.policy !== 'auto') return null;
+    // 候选路径仅在已接管时可达，这里恒为普通更新任务。
+    return this.createGuardedJob(resourceId, digest, track, resource, 'auto', false);
+  }
+
+  /**
+   * 首次初始化（固定摘要）：所有非 ignore 策略在检查时未接管即建任务，
+   * 定时扫描与手动检查一致；守卫与自动更新相同。返回 null 表示被守卫跳过。
+   */
+  createInitialPinJob(
+    resourceId: number,
+    observedDigest: string,
+    trigger: 'manual' | 'auto',
+  ): UpdateJobRow | null {
+    const digest = digestSchema.parse(observedDigest);
+    const { resource, track } = this.loadPair(resourceId);
+    this.assertUpdatable(resource, track);
+    if (track == null) return null; // assertUpdatable throws first; narrows for TS
+    if (resource.policy === 'ignore') return null;
+    if (track.configuredDigest != null) return null; // 已接管：走候选更新路径
+    return this.createGuardedJob(resourceId, digest, track, resource, trigger, true);
+  }
+
+  /** 自动路径共用的守卫与落库；被守卫挡下时静默返回 null。 */
+  private createGuardedJob(
+    resourceId: number,
+    digest: string,
+    track: ImageTrackRow,
+    resource: ResourceRow,
+    trigger: 'manual' | 'auto',
+    isInitialPin: boolean,
+  ): UpdateJobRow | null {
     if (this.settings.get().globalPaused) return null;
     if (resource.isStopped) return null;
     if (resource.blockedReason != null) return null;
     if (this.blockingJob(resourceId, digest) != null) return null;
-    const isInitialPin = (track?.configuredDigest ?? null) == null;
-    return this.insertJob(resourceId, digest, track, resource, 'auto', isInitialPin);
+    return this.insertJob(resourceId, digest, track, resource, trigger, isInitialPin);
   }
 
   private insertJob(

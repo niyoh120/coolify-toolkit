@@ -12,7 +12,6 @@ export type BlockReason =
   | 'external_change' // user edited the image outside toolkit expectations
   | 'platform_missing' // no verifiable target platform
   | 'excluded' // matches infra exclusion list or unsupported type
-  | 'unfixed_requires_confirmation' // first takeover needs explicit user action
   | 'compose_confirmation_pending' // compose deployment lacks completion evidence
   | 'stopped' // resource is stopped; manual start required
   | 'update_failed' // last update failed; keep target config, require user action

@@ -3,10 +3,11 @@
 // only auto resources produce update jobs (§2/§3).
 
 import { eq } from 'drizzle-orm';
+import { ApiRequestError } from '../../../shared/errors.js';
 import type { CheckOutcome } from '../../../shared/types.js';
 import type { AppConfig } from '../../config.js';
 import type { Db } from '../../db/client.js';
-import { imageTracks, resources } from '../../db/schema.js';
+import { imageTracks, resources, type UpdateJobRow } from '../../db/schema.js';
 import type { SettingsRepo } from '../../db/settings-repo.js';
 import {
   credentialsFor,
@@ -230,8 +231,26 @@ export class UpdateChecker {
 
     const configured = track.configuredDigest;
     if (configured == null) {
-      // Not yet taken over: observation only; drift of the remote baseline is reportable.
-      if (priorObserved != null && priorObserved !== resolved.digest) {
+      // 未接管：任何一次检查（定时/手动）都自动初始化（首次固定摘要），
+      // 所有非 ignore 策略生效；守卫（全局暂停/停止/阻塞/在途任务）在 JobsService。
+      // 后台路径保持韧性：守卫拒绝或任务已存在（409）都留在未初始化态，下轮检查重试。
+      let initJob: UpdateJobRow | null = null;
+      try {
+        initJob = this.jobs.createInitialPinJob(
+          resourceId,
+          resolved.digest,
+          reason === 'scheduled' ? 'auto' : 'manual',
+        );
+      } catch (err) {
+        if (!(err instanceof ApiRequestError)) throw err;
+        // 罕见异常（资源不可更新或同目标任务竞态）：留痕便于排查「为何一直未初始化」。
+        console.error(
+          `[checker] initial pin job not created for resource ${resourceId}: ${err.message}`,
+        );
+      }
+      // 任务已建时漂移通知是噪音（部署完成另有 update_success）；
+      // 被守卫挡下时保留通知，让「未初始化且上游在漂」可见。
+      if (initJob == null && priorObserved != null && priorObserved !== resolved.digest) {
         this.outbox.enqueue({
           eventType: 'upstream_changed',
           resourceId,

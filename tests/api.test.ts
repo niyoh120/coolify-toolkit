@@ -154,7 +154,10 @@ describe('api', () => {
     expect(h.db.select().from(updateJobs).all()).toHaveLength(1);
   });
 
-  it('targeted check accepts resourceIds and rejects invalid bodies', async () => {
+  // 用例走真实 registry 网络调用，满载并行下可能变慢：显式放宽超时避免偶发抖动。
+  it('targeted check accepts resourceIds and rejects invalid bodies', {
+    timeout: 40_000,
+  }, async () => {
     const app = createApp(deps);
     const track = h.db.select().from(imageTracks).get();
     expect(track).toBeTruthy();

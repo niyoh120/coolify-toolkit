@@ -30,7 +30,6 @@ const BLOCK_LABEL: Record<Exclude<BlockReason, null>, string> = {
   external_change: '外部修改，需重新确认',
   platform_missing: '目标平台待配置',
   excluded: '已排除（基础设施）',
-  unfixed_requires_confirmation: '首次接管需确认',
   compose_confirmation_pending: 'Compose 提交待确认',
   stopped: '资源已停止',
   update_failed: '更新失败已暂停',

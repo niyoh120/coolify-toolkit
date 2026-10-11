@@ -4,7 +4,14 @@
 
 import type { ResourceDTO } from '../../../shared/types.js';
 import { checkBlockedHint, policyTone, updateBlockedHint } from '../../lib/resource-view.js';
-import { BlockedBadge, CheckBadge, DeployBadge, POLICY_LABEL, shortDigest } from '../status.js';
+import {
+  BlockedBadge,
+  CheckBadge,
+  DeployBadge,
+  ManagementBadge,
+  POLICY_LABEL,
+  shortDigest,
+} from '../status.js';
 import { Badge, Button, Empty, Table, Td, Th } from '../ui.js';
 
 export interface ChildResourcesTableProps {
@@ -88,12 +95,19 @@ export function ChildResourcesTable({
                 )}
                 <div className="flex flex-wrap gap-1 pt-1">
                   <BlockedBadge blockedReason={r.blockedReason} />
-                  {r.excludedInfra && <Badge>已排除</Badge>}
+                  <ManagementBadge resource={r} />
                 </div>
               </Td>
               <Td>
                 {r.track == null ? (
-                  <span className="text-[12px] text-[var(--color-text-muted)]">无追踪</span>
+                  <span className="text-[12px]">
+                    {r.currentImage != null ? (
+                      <span className="mono break-all">{r.currentImage}</span>
+                    ) : (
+                      <span className="text-[var(--color-text-muted)]">—</span>
+                    )}
+                    <div className="text-[var(--color-text-muted)]">尚未建立追踪</div>
+                  </span>
                 ) : (
                   <span className="mono break-all text-[12px]">
                     {r.currentImage ?? '—'}

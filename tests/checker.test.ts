@@ -82,6 +82,16 @@ interface SeedOptions {
   stopped?: boolean;
   checkCron?: string | null;
   uuid?: string;
+  /** 默认 true（已同步资源）；显式传 false 构造待同步确认记录。 */
+  managementClassified?: boolean;
+  imageIssue?:
+    | 'missing_image'
+    | 'unsupported_registry'
+    | 'unresolved_variable'
+    | 'invalid_reference'
+    | null;
+  /** 有意不创建 track 行（镜像异常资源无追踪）。 */
+  withoutTrack?: boolean;
 }
 
 async function seed(opts: SeedOptions = {}): Promise<number> {
@@ -95,6 +105,9 @@ async function seed(opts: SeedOptions = {}): Promise<number> {
       policy: opts.policy ?? 'notify',
       configFingerprint: 'fp',
       excludedInfra: opts.excluded ?? false,
+      // 测试 seed 代表「已同步资源」：显式已分类，默认值不掩盖真实状态。
+      managementClassified: opts.managementClassified ?? true,
+      imageIssue: opts.imageIssue ?? null,
       isStopped: opts.stopped ?? false,
       checkCron: opts.checkCron ?? null,
       blockedReason: opts.blockedReason ?? null,
@@ -104,22 +117,24 @@ async function seed(opts: SeedOptions = {}): Promise<number> {
     })
     .returning()
     .get();
-  handle.db
-    .insert(imageTracks)
-    .values({
-      resourceId: res.id,
-      sourceRegistry: 'docker.io',
-      sourceRepository: 'jellyfin/jellyfin',
-      sourceRepositoryAuthored: 'jellyfin/jellyfin',
-      sourceTag: opts.sourceTag ?? 'latest',
-      targetPlatform: opts.platform === undefined ? 'linux/amd64' : opts.platform,
-      platformSource: 'server_default',
-      configuredDigest: opts.configuredDigest ?? null,
-      observedDigest: opts.observedDigest ?? null,
-      createdAt: now,
-      updatedAt: now,
-    })
-    .run();
+  if (opts.withoutTrack !== true) {
+    handle.db
+      .insert(imageTracks)
+      .values({
+        resourceId: res.id,
+        sourceRegistry: 'docker.io',
+        sourceRepository: 'jellyfin/jellyfin',
+        sourceRepositoryAuthored: 'jellyfin/jellyfin',
+        sourceTag: opts.sourceTag ?? 'latest',
+        targetPlatform: opts.platform === undefined ? 'linux/amd64' : opts.platform,
+        platformSource: 'server_default',
+        configuredDigest: opts.configuredDigest ?? null,
+        observedDigest: opts.observedDigest ?? null,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+  }
   return res.id;
 }
 
@@ -194,7 +209,7 @@ describe('checker policy rules', () => {
     const excludedId = await seed({ policy: 'notify', excluded: true });
     const excluded = await checker.checkResource(excludedId, 'manual');
     expect(excluded.outcome).toBe('blocked');
-    expect(excluded.message).toBe('已排除（基础设施）');
+    expect(excluded.message).toBe('已排除（配置名单）');
     expect(resolveCalls).toBe(0);
   });
 
@@ -377,5 +392,43 @@ describe('auto initialization for uninitialized resources', () => {
     await checker.checkResource(id, 'scheduled');
     // 同 digest 失败任务阻塞重建：等上游变化或人工重试，避免每轮扫描反复部署。
     expect(handle.db.select().from(updateJobs).all()).toHaveLength(1);
+  });
+});
+
+describe('management readiness gates (upgrade transition)', () => {
+  it('blocks pending-sync resources before any registry call', async () => {
+    const id = await seed({ policy: 'notify', managementClassified: false });
+    const r = await checker.checkResource(id, 'manual');
+    expect(r.outcome).toBe('blocked');
+    expect(r.message).toContain('待同步确认');
+    expect(resolveCalls).toBe(0);
+  });
+
+  it('blocks image-issue resources without a track (business blocked, not error)', async () => {
+    const id = await seed({
+      policy: 'notify',
+      imageIssue: 'unsupported_registry',
+      withoutTrack: true,
+    });
+    // registry 提示来自 currentImage 的 host 段。
+    handle.db
+      .update(resources)
+      .set({ currentImage: 'gcr.io/proj/chrome:latest' })
+      .where(eq(resources.id, id))
+      .run();
+    const r = await checker.checkResource(id, 'manual');
+    expect(r.outcome).toBe('blocked');
+    expect(r.message).toContain('gcr.io');
+    expect(resolveCalls).toBe(0);
+
+    const missing = await seed({
+      policy: 'notify',
+      imageIssue: 'missing_image',
+      withoutTrack: true,
+      uuid: 'issue-missing',
+    });
+    const r2 = await checker.checkResource(missing, 'manual');
+    expect(r2.outcome).toBe('blocked');
+    expect(r2.message).toBe('镜像信息缺失');
   });
 });

@@ -4,6 +4,103 @@
 
 import type { CheckOutcome, Policy, ResourceDTO } from '../../shared/types.js';
 
+// --- management state (display mirror of the server-side gates) -------------------
+
+/**
+ * Three-tier resources view (plan §3):
+ *  - unexcluded (default): classified, config-excluded resources hidden;
+ *    pending-sync records stay visible with an explicit hint.
+ *  - managed: classified, config-excluded-free, no image issue, and a
+ *    notify/manual/auto policy on an image-bearing resource.
+ *  - excluded: classified + config-excluded; read-only.
+ */
+export type ExclusionView = 'unexcluded' | 'managed' | 'excluded';
+
+/** Legacy rows awaiting their first classified sync ("待同步确认"). */
+export function isPendingSync(r: ResourceDTO): boolean {
+  return !r.managementClassified;
+}
+
+/** Classified and config-excluded (own UUID or inherited from the parent). */
+export function isConfigExcluded(r: ResourceDTO): boolean {
+  return r.managementClassified && r.excludedInfra;
+}
+
+/** Classified with a structured image problem. */
+export function hasImageIssue(r: ResourceDTO): boolean {
+  return r.managementClassified && r.imageIssue != null;
+}
+
+/** Which tier the row belongs to (pending rows live in the default view). */
+export function belongsToView(r: ResourceDTO, view: ExclusionView): boolean {
+  switch (view) {
+    case 'unexcluded':
+      return !isConfigExcluded(r);
+    case 'managed':
+      return (
+        r.managementClassified &&
+        !r.excludedInfra &&
+        r.imageIssue == null &&
+        (r.policy === 'notify' || r.policy === 'manual' || r.policy === 'auto') &&
+        r.kind !== 'compose_service'
+      );
+    case 'excluded':
+      return isConfigExcluded(r);
+  }
+}
+
+/** Short badge reason; null when the resource is fully manageable. */
+export function managementReason(r: ResourceDTO): string | null {
+  if (isPendingSync(r)) return '待同步确认';
+  if (isConfigExcluded(r)) return '已排除';
+  if (r.imageIssue != null) {
+    switch (r.imageIssue.code) {
+      case 'unsupported_registry':
+        return r.imageIssue.registry != null
+          ? `暂不支持的镜像仓库：${r.imageIssue.registry}`
+          : '暂不支持的镜像仓库';
+      case 'unresolved_variable':
+        return '镜像变量未解析';
+      case 'missing_image':
+        return '镜像信息缺失';
+      case 'invalid_reference':
+        return '镜像引用无效';
+    }
+  }
+  return null;
+}
+
+/** Longer accessible explanation for tooltips/details; null when manageable. */
+export function managementReasonDetail(r: ResourceDTO): string | null {
+  if (isPendingSync(r)) {
+    return '该记录尚未经现行同步规则分类（历史数据）。完成一次资源同步后自动确认管理状态；在此之前配置只读、新管理操作暂停。';
+  }
+  if (isConfigExcluded(r)) {
+    if (r.exclusionSource === 'parent') {
+      return '继承父服务的配置排除（EXCLUDED_RESOURCE_UUIDS）。调整配置并重启、同步后解除。';
+    }
+    return '自身命中 EXCLUDED_RESOURCE_UUIDS 配置名单。调整配置并重启、同步后解除。';
+  }
+  if (r.imageIssue != null) {
+    switch (r.imageIssue.code) {
+      case 'unsupported_registry':
+        return '该镜像仓库在当前支持范围外（docker.io / ghcr.io / lscr.io）。核对 Coolify 镜像配置后同步。';
+      case 'unresolved_variable':
+        return '镜像引用含未展开的变量。请核对 Coolify 实际镜像配置，修复后同步。';
+      case 'missing_image':
+        return 'Coolify 未返回镜像信息。核对资源配置后同步。';
+      case 'invalid_reference':
+        return '镜像引用格式无效。核对 Coolify 镜像配置后同步。';
+    }
+  }
+  return null;
+}
+
+/** True when management config (policy/track/cron) must render read-only. */
+export function isConfigReadOnly(r: ResourceDTO): boolean {
+  return managementReason(r) != null;
+}
+
 // --- service grouping ---------------------------------------------------------
 
 /** One service group: a compose_service parent plus its active sub-containers. */
@@ -72,11 +169,65 @@ export function buildServiceGroups(resources: ResourceDTO[]): ServiceGroup[] {
   return [...normal, ...orphans];
 }
 
+/**
+ * Project full active groups onto one view tier (plan §3). Returns groups whose
+ * `children` are the view-projected set (search/condition filters then apply
+ * within it):
+ *  - unexcluded: hide config-excluded children; hide a group whose parent is
+ *    config-excluded (direct-link details remain available); hide a group
+ *    whose every active child is excluded; pending/image-issue children stay;
+ *    originally empty services keep their empty-group behavior.
+ *  - excluded: show excluded children; an excluded parent shows its full
+ *    active children as context (read-only).
+ *  - managed: only managed children; empty groups collapse.
+ *
+ * Group summaries should still be computed over the FULL active children —
+ * callers look the original group up by key (excluded/pending counts live
+ * there).
+ */
+export function projectGroupsForView(groups: ServiceGroup[], view: ExclusionView): ServiceGroup[] {
+  const result: ServiceGroup[] = [];
+  for (const group of groups) {
+    const parentExcluded = group.parent != null && isConfigExcluded(group.parent);
+    if (view === 'excluded') {
+      const visible = group.children.filter((c) => isConfigExcluded(c));
+      // 确认排除的父级展示全部子容器上下文；否则仅列出已排除子项。
+      const context = parentExcluded ? group.children : visible;
+      if (context.length === 0) continue;
+      result.push({ ...group, children: context });
+      continue;
+    }
+    if (view === 'managed') {
+      // managed 是子容器级条件：空组折叠。
+      const visible = group.children.filter((c) => belongsToView(c, 'managed'));
+      if (visible.length === 0) continue;
+      result.push({ ...group, children: visible });
+      continue;
+    }
+    // unexcluded（默认）：父级确认排除 → 整组隐藏；否则隐藏已排除子项。
+    if (parentExcluded) continue;
+    if (group.children.length === 0) {
+      // 原本无 active 子容器的服务保留空组行为。
+      result.push(group);
+      continue;
+    }
+    const visible = group.children.filter((c) => !isConfigExcluded(c));
+    if (visible.length === 0) {
+      // 父级未排除且全部子容器均已确认排除 → 默认隐藏该组。
+      continue;
+    }
+    result.push({ ...group, children: visible });
+  }
+  return result;
+}
+
 // --- filtering ------------------------------------------------------------------
 
 export interface ServiceFilters {
   search: string;
+  /** 子容器策略条件：视图模型保留维度，由单元测试覆盖；当前页面未提供入口。 */
   policy: '' | Policy;
+  /** 旧「受管」双轨条件：已被三档视图（ExclusionView.managed）取代，仅为兼容保留。 */
   managed: 'all' | 'managed';
   status: 'all' | 'running' | 'stopped';
   server: string;
@@ -202,15 +353,25 @@ export interface GroupSummary {
   total: number;
   /** Children with a candidate update. */
   candidates: number;
-  /** Children needing configuration/attention (blocked, excluded, untracked…). */
+  /**
+   * Children needing configuration/attention (blocked, untracked, image
+   * issues…). Config-excluded and pending-sync children are counted in their
+   * own buckets instead.
+   */
   attention: number;
+  /** Confirmed config-excluded children. */
+  excluded: number;
+  /** Legacy children awaiting their first classified sync. */
+  pendingSync: number;
 }
 
 /** Front-end mirror of the checker eligibility surface, for hints only. */
 export function childNeedsAttention(r: ResourceDTO): boolean {
+  // 待同步与排除各自单列，避免重复计数。
+  if (isPendingSync(r) || isConfigExcluded(r)) return false;
   return (
+    r.imageIssue != null ||
     r.blockedReason != null ||
-    r.excludedInfra ||
     r.track == null ||
     r.track.sourceTag === '' ||
     r.track.targetPlatform == null ||
@@ -224,6 +385,8 @@ export function groupSummary(children: ResourceDTO[]): GroupSummary {
     total: children.length,
     candidates: children.filter((r) => r.track?.view.hasCandidate === true).length,
     attention: children.filter(childNeedsAttention).length,
+    excluded: children.filter(isConfigExcluded).length,
+    pendingSync: children.filter(isPendingSync).length,
   };
 }
 
@@ -241,7 +404,11 @@ export function policyTone(policy: Policy): PolicyBadgeTone {
 /** Why the resource cannot run a check right now; null when checkable. */
 export function checkBlockedHint(r: ResourceDTO): string | null {
   if (r.status !== 'active') return '资源已移除';
-  if (r.excludedInfra) return '已排除（基础设施）';
+  // 顺序与服务端 managementGate 一致：待确认 → 配置排除 → 镜像问题。
+  const reason = managementReason(r);
+  if (reason != null) {
+    return isPendingSync(r) ? '待同步确认：完成一次资源同步后才能检查' : reason;
+  }
   if (r.policy === 'ignore') return '忽略策略的资源不检查更新';
   if (r.blockedReason === 'external_change') return '外部修改，需重新确认';
   if (r.track == null) return '无镜像追踪';

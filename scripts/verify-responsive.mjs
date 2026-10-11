@@ -100,14 +100,18 @@ async function goto(baseUrl, hash) {
   // 避免 scenarioAState 注入的筛选/选择残留到后续场景。
   await ab(['reload']);
   const ready = `({ ready: document.readyState === 'complete' && !!document.querySelector('main')?.children.length, loading: !!document.querySelector('main')?.textContent.includes('加载中') })`;
-  for (let t = 0; t < 60; t++) {
-    try {
-      const r = await evalJson(ready);
-      if (r.ready === true && r.loading === false) return;
-    } catch {
-      // page mid-navigation; poll again
+  // 轮询超时后再 reload 重试一轮：瞬时导航/挂载抖动（page not ready 假阳性）自愈。
+  for (let attempt = 0; attempt < 2; attempt++) {
+    for (let t = 0; t < 60; t++) {
+      try {
+        const r = await evalJson(ready);
+        if (r.ready === true && r.loading === false) return;
+      } catch {
+        // page mid-navigation; poll again
+      }
+      await sleep(250);
     }
-    await sleep(250);
+    if (attempt === 0) await ab(['reload']);
   }
   throw new Error(`page not ready: ${baseUrl}/${hash}`);
 }
@@ -610,11 +614,40 @@ async function scenarioB(baseUrl) {
         { label: 'history scroll' },
       );
     }
+    // 待同步确认资源的任务重试被拒绝：原任务保持原值且出现可见失败反馈。
+    const pendingRetry = await evalJson(`(() => {
+      const row = [...document.querySelectorAll('tbody tr')].find(
+        (r) =>
+          r.textContent.includes('edge-pending-sync') &&
+          [...r.querySelectorAll('button')].some((b) => b.textContent.trim() === '重试'),
+      );
+      const retryBtn = row == null ? null : [...row.querySelectorAll('button')].find((b) => b.textContent.trim() === '重试');
+      if (retryBtn == null) return { tried: false };
+      retryBtn.click();
+      return { tried: true, status: row.querySelector('td:nth-child(4)')?.textContent.trim() };
+    })()`);
+    if (pendingRetry.tried === false) {
+      throw new Error('前置条件缺失：fixture 未为 edge-pending-sync 提供可重试任务（死分支保护）');
+    }
+    await waitFor(`document.body.textContent.includes('本次重试未执行')`, {
+      label: 'pending-sync retry visible feedback',
+    });
+    // 表格状态列渲染中文标签（JobStatusBadge）。
+    check(
+      group,
+      '待同步资源的任务重试被拒绝且给出可见反馈',
+      ['失败', '冲突', '已阻塞'].includes(pendingRetry.status ?? ''),
+      pendingRetry,
+    );
+    // 合格资源的任务重试：任务转入排队中。
     const jobId = await evalJson(`(() => {
-      const btn = [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '重试' && !b.disabled);
-      if (btn == null) return null;
-      const row = btn.closest('tr');
-      btn.click();
+      const retryBtn = [...document.querySelectorAll('tbody tr')]
+        .filter((r) => !r.textContent.includes('edge-pending-sync'))
+        .map((r) => [...r.querySelectorAll('button')].find((b) => b.textContent.trim() === '重试' && !b.disabled))
+        .find((b) => b != null);
+      if (retryBtn == null) return null;
+      const row = retryBtn.closest('tr');
+      retryBtn.click();
       return { status: row.querySelector('td:nth-child(4)')?.textContent.trim() };
     })()`);
     assert(jobId != null, 'no enabled retry button');
@@ -890,6 +923,7 @@ async function main() {
     await scenarioAState(baseUrl);
     await scenarioB(baseUrl);
     await scenarioC(baseUrl);
+    await scenarioManagementViews(baseUrl);
 
     if (fixture.unknownHits.length > 0) {
       check('fixture', '页面未请求未实现的 API', false, fixture.unknownHits);
@@ -944,3 +978,96 @@ main().catch((err) => {
   console.error('环境阻塞：', err);
   process.exit(2);
 });
+
+/** 管理状态三档视图：待同步提示、已排除只读、受管范围（升级过渡验收）。 */
+async function scenarioManagementViews(baseUrl) {
+  const group = 'D 管理状态视图';
+  await setViewport(1024, HEIGHT);
+
+  // 1) 默认「未排除」视图：待同步与镜像问题行可见，提示条出现。
+  //    先把每页条数设为 100，保证 edge 行（排在列表后段）进入当前页。
+  await goto(baseUrl, '#/resources');
+  await evalJson(`(() => {
+    const select = document.querySelector('select[aria-label="每页条数"]');
+    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+    setter.call(select, '100');
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  })()`);
+  await waitFor(`document.body.textContent.includes('待同步确认资源')`, {
+    label: 'pending-sync hint',
+  });
+  const defView = await evalJson(`(() => {
+    const rows = [...document.querySelectorAll('tbody tr')].map((r) => r.textContent);
+    return {
+      pending: rows.some((t) => t.includes('edge-pending-sync') && t.includes('待同步确认')),
+      issue: rows.some((t) => t.includes('edge-image-issue') && t.includes('gcr.io')),
+      variable: rows.some((t) => t.includes('edge-var-image') && t.includes('镜像变量未解析')),
+      excluded: rows.some((t) => t.includes('edge-excluded')),
+      active: [...document.querySelectorAll('button')].some(
+        (b) => b.getAttribute('aria-pressed') === 'true' && b.textContent.trim() === '未排除',
+      ),
+    };
+  })()`);
+  check(
+    group,
+    '默认视图显示待同步与镜像问题行并给出提示，隐藏已排除',
+    defView.pending &&
+      defView.issue &&
+      defView.variable &&
+      defView.active &&
+      defView.excluded === false,
+    defView,
+  );
+
+  // 2) 「已排除」视图：edge-excluded 可见且操作列只读。
+  await clickInPage(
+    `[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '已排除' && b.closest('[role="group"], div'))`,
+    'excluded view tab',
+  );
+  await waitFor(`document.body.textContent.includes('已排除资源配置只读')`, {
+    label: 'excluded hint',
+  });
+  const exView = await evalJson(`(() => {
+    const rows = [...document.querySelectorAll('tbody tr')].map((r) => r.textContent);
+    return {
+      excludedRow: rows.some((t) => t.includes('edge-excluded') && t.includes('已排除')),
+      readOnly: rows.some((t) => t.includes('edge-excluded') && t.includes('只读')),
+      noCheckboxes: document.querySelectorAll('tbody input[type=checkbox]').length === 0,
+      pending: rows.some((t) => t.includes('edge-pending-sync')),
+    };
+  })()`);
+  check(
+    group,
+    '排除视图显示已排除行且无选择列/操作按钮',
+    exView.excludedRow && exView.readOnly && exView.noCheckboxes && exView.pending === false,
+    exView,
+  );
+
+  // 3) 「受管」视图：只含 notify/manual/auto 且无问题项。
+  await clickInPage(
+    `[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '受管')`,
+    'managed view tab',
+  );
+  const mgView = await evalJson(`(() => {
+    const rows = [...document.querySelectorAll('tbody tr')].map((r) => r.textContent);
+    return {
+      pending: rows.some((t) => t.includes('edge-pending-sync')),
+      issue: rows.some((t) => t.includes('edge-image-issue')),
+      variable: rows.some((t) => t.includes('edge-var-image')),
+      excluded: rows.some((t) => t.includes('edge-excluded')),
+      notify: rows.some((t) => t.includes('edge-unfixed')),
+    };
+  })()`);
+  check(
+    group,
+    '受管视图不含待同步/镜像问题/已排除行',
+    mgView.pending === false &&
+      mgView.issue === false &&
+      mgView.variable === false &&
+      mgView.excluded === false &&
+      mgView.notify,
+    mgView,
+  );
+  await ab(['screenshot', path.join(shotsDir, 'management-views.png')]);
+}

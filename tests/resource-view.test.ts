@@ -5,13 +5,17 @@ import { describe, expect, it } from 'vitest';
 import type { ResourceDTO, TrackDTO, TrackView } from '../src/shared/types.js';
 import {
   buildServiceGroups,
+  checkBlockedHint,
   checkOutcomeFeedback,
   childNeedsAttention,
   classifyCheckOutcome,
   filterServiceGroups,
   groupSummary,
+  managementReason,
+  managementReasonDetail,
   paginateGroups,
   policyTone,
+  projectGroupsForView,
   type ServiceFilters,
   selectableChildIds,
   selectionState,
@@ -81,6 +85,9 @@ function dto(over: Partial<ResourceDTO> & Pick<ResourceDTO, 'id' | 'name'>): Res
     blockedReason: null,
     excludedInfra: false,
     isStopped: false,
+    managementClassified: true,
+    imageIssue: null,
+    exclusionSource: null,
     lastSyncedAt: null,
     updatedAt: null,
     track: null,
@@ -246,9 +253,21 @@ describe('service group view model', () => {
   it('summarizes group totals, candidates and attention from children', () => {
     const groups = buildServiceGroups(fixture());
     const first = groupSummary(groups[0]!.children);
-    expect(first).toEqual({ total: 3, candidates: 1, attention: 2 });
+    expect(first).toEqual({
+      total: 3,
+      candidates: 1,
+      attention: 2,
+      excluded: 0,
+      pendingSync: 0,
+    });
     expect(childNeedsAttention(groups[0]!.children[1]!)).toBe(true); // ignore policy + no track
-    expect(groupSummary(groups[1]!.children)).toEqual({ total: 1, candidates: 1, attention: 0 });
+    expect(groupSummary(groups[1]!.children)).toEqual({
+      total: 1,
+      candidates: 1,
+      attention: 0,
+      excluded: 0,
+      pendingSync: 0,
+    });
   });
 
   it('classifies check outcomes by business result and renders feedback text', () => {
@@ -288,5 +307,195 @@ describe('service group view model', () => {
       }),
     });
     expect(updateBlockedHint(noObservation)).toBe('暂无上游观察结果，先检查更新');
+  });
+});
+
+// --- 三档筛选与管理状态展示（plan §3/§4） -------------------------------------
+
+describe('three-tier view projection', () => {
+  /** 组：未排除父级 + 全部子排除；组：排除父级；含待同步/镜像问题的组。 */
+  function exclusionFixture(): ResourceDTO[] {
+    const svcOk = dto({ id: 1, name: 'ok-svc', kind: 'compose_service' });
+    const okChild = dto({ id: 11, name: 'web', parentResourceId: 1, parentName: 'ok-svc' });
+    const excludedChild = dto({
+      id: 12,
+      name: 'db',
+      parentResourceId: 1,
+      parentName: 'ok-svc',
+      excludedInfra: true,
+      exclusionSource: 'self',
+    });
+    const svcExcluded = dto({
+      id: 2,
+      name: 'ex-svc',
+      kind: 'compose_service',
+      excludedInfra: true,
+      exclusionSource: 'self',
+    });
+    const ctxChildA = dto({
+      id: 21,
+      name: 'a',
+      parentResourceId: 2,
+      parentName: 'ex-svc',
+      excludedInfra: true,
+      exclusionSource: 'parent',
+    });
+    const ctxChildB = dto({ id: 22, name: 'b', parentResourceId: 2, parentName: 'ex-svc' });
+    const svcPending = dto({ id: 3, name: 'pending-svc', kind: 'compose_service' });
+    const pendingChild = dto({
+      id: 31,
+      name: 'p',
+      parentResourceId: 3,
+      parentName: 'pending-svc',
+      managementClassified: false,
+    });
+    const issueChild = dto({
+      id: 32,
+      name: 'i',
+      parentResourceId: 3,
+      parentName: 'pending-svc',
+      imageIssue: { code: 'unsupported_registry', registry: 'gcr.io' },
+    });
+    return [
+      svcOk,
+      okChild,
+      excludedChild,
+      svcExcluded,
+      ctxChildA,
+      ctxChildB,
+      svcPending,
+      pendingChild,
+      issueChild,
+    ];
+  }
+
+  it('unexcluded view: excluded children hidden, pending/image-issue stay, excluded parents hide their group', () => {
+    const groups = buildServiceGroups(exclusionFixture());
+    const projected = projectGroupsForView(groups, 'unexcluded');
+    const keys = projected.map((g) => g.key);
+    expect(keys).toContain('svc-1');
+    expect(keys).toContain('svc-3'); // 待同步 + 镜像问题保持可见
+    expect(keys).not.toContain('svc-2'); // 父级排除 → 整组隐藏
+    const g1 = projected.find((g) => g.key === 'svc-1')!;
+    expect(g1.children.map((c) => c.name)).toEqual(['web']); // 已排除子项隐藏
+  });
+
+  it('unexcluded view hides a group whose every active child is excluded', () => {
+    const svc = dto({ id: 1, name: 'all-ex', kind: 'compose_service' });
+    const a = dto({
+      id: 11,
+      name: 'a',
+      parentResourceId: 1,
+      parentName: 'all-ex',
+      excludedInfra: true,
+      exclusionSource: 'self',
+    });
+    const b = dto({
+      id: 12,
+      name: 'b',
+      parentResourceId: 1,
+      parentName: 'all-ex',
+      excludedInfra: true,
+      exclusionSource: 'self',
+    });
+    const projected = projectGroupsForView(buildServiceGroups([svc, a, b]), 'unexcluded');
+    expect(projected).toHaveLength(0);
+  });
+
+  it('empty services keep their empty-group behavior in the default view', () => {
+    const svc = dto({ id: 1, name: 'empty', kind: 'compose_service' });
+    const projected = projectGroupsForView(buildServiceGroups([svc]), 'unexcluded');
+    expect(projected).toHaveLength(1);
+    expect(projectGroupsForView(buildServiceGroups([svc]), 'managed')).toHaveLength(0);
+  });
+
+  it('excluded view: excluded children visible with unexcluded parent header; excluded parent shows full context', () => {
+    const groups = buildServiceGroups(exclusionFixture());
+    const projected = projectGroupsForView(groups, 'excluded');
+    const g1 = projected.find((g) => g.key === 'svc-1')!;
+    expect(g1.parent?.id).toBe(1); // 未排除父级作组头
+    expect(g1.children.map((c) => c.name)).toEqual(['db']);
+    const g2 = projected.find((g) => g.key === 'svc-2')!;
+    expect(g2.parent?.id).toBe(2);
+    expect(g2.children.map((c) => c.name)).toEqual(['a', 'b']); // 全部子容器上下文
+    expect(projected.find((g) => g.key === 'svc-3')).toBeUndefined();
+  });
+
+  it('managed view keeps only classified, non-excluded, issue-free notify/manual/auto children', () => {
+    const svc = dto({ id: 1, name: 'svc', kind: 'compose_service' });
+    const rows = [
+      svc,
+      dto({ id: 11, name: 'auto', parentResourceId: 1, parentName: 'svc', policy: 'auto' }),
+      dto({ id: 12, name: 'ign', parentResourceId: 1, parentName: 'svc', policy: 'ignore' }),
+      dto({
+        id: 13,
+        name: 'iss',
+        parentResourceId: 1,
+        parentName: 'svc',
+        imageIssue: { code: 'missing_image', registry: null },
+      }),
+      dto({
+        id: 14,
+        name: 'pend',
+        parentResourceId: 1,
+        parentName: 'svc',
+        managementClassified: false,
+      }),
+    ];
+    const projected = projectGroupsForView(buildServiceGroups(rows), 'managed');
+    expect(projected).toHaveLength(1);
+    expect(projected[0]!.children.map((c) => c.name)).toEqual(['auto']);
+  });
+});
+
+describe('management reason display', () => {
+  it('renders precise reasons per image issue code', () => {
+    expect(
+      managementReason(
+        dto({ id: 1, name: 'x', imageIssue: { code: 'unsupported_registry', registry: 'gcr.io' } }),
+      ),
+    ).toBe('暂不支持的镜像仓库：gcr.io');
+    expect(
+      managementReason(
+        dto({ id: 2, name: 'x', imageIssue: { code: 'unresolved_variable', registry: null } }),
+      ),
+    ).toBe('镜像变量未解析');
+    expect(
+      managementReason(
+        dto({ id: 3, name: 'x', imageIssue: { code: 'missing_image', registry: null } }),
+      ),
+    ).toBe('镜像信息缺失');
+    expect(
+      managementReason(
+        dto({ id: 4, name: 'x', imageIssue: { code: 'invalid_reference', registry: null } }),
+      ),
+    ).toBe('镜像引用无效');
+  });
+
+  it('renders pending-sync and exclusion reasons with attribution', () => {
+    expect(managementReason(dto({ id: 5, name: 'x', managementClassified: false }))).toBe(
+      '待同步确认',
+    );
+    expect(managementReason(dto({ id: 6, name: 'x', excludedInfra: true }))).toBe('已排除');
+    expect(
+      managementReasonDetail(
+        dto({ id: 7, name: 'x', excludedInfra: true, exclusionSource: 'parent' }),
+      ),
+    ).toContain('继承父服务');
+    expect(
+      managementReasonDetail(dto({ id: 8, name: 'x', managementClassified: false })),
+    ).toContain('只读');
+  });
+
+  it('checkBlockedHint follows the server gate order', () => {
+    expect(checkBlockedHint(dto({ id: 9, name: 'x', managementClassified: false }))).toContain(
+      '待同步确认',
+    );
+    expect(checkBlockedHint(dto({ id: 10, name: 'x', excludedInfra: true }))).toBe('已排除');
+    expect(
+      checkBlockedHint(
+        dto({ id: 11, name: 'x', imageIssue: { code: 'unsupported_registry', registry: null } }),
+      ),
+    ).toBe('暂不支持的镜像仓库');
   });
 });

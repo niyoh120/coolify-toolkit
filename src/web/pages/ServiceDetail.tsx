@@ -17,6 +17,7 @@ import {
 import {
   BlockedBadge,
   CoolifyLinkButton,
+  ManagementBadge,
   POLICY_LABEL,
   shortDigest,
 } from '../components/status.js';
@@ -36,6 +37,9 @@ import { api } from '../lib/api.js';
 import {
   checkBlockedHint,
   groupSummary,
+  isConfigExcluded,
+  isConfigReadOnly,
+  isPendingSync,
   policyTone,
   updateBlockedHint,
 } from '../lib/resource-view.js';
@@ -58,6 +62,7 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
   const [selected, setSelected] = useState<number[]>([]);
   const [pendingAction, setPendingAction] = useState<GroupAction>(null);
   const [pendingPolicy, setPendingPolicy] = useState<Policy>('manual');
+  const [showExcluded, setShowExcluded] = useState(false);
   const [feedbackLines] = useFeedbackLines();
   const batchRunner = useBatchRunner();
   const settingsQ = useQuery({ queryKey: ['settings'], queryFn: api.settings });
@@ -78,8 +83,18 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
   const awaitingChildren = children.filter(
     (r) => r.track?.view.deployState === 'pending_confirmation',
   );
+  // 已确认排除的父服务：整组只读；父级待同步确认：整组新管理动作暂停。
+  const parentExcluded = isConfigExcluded(parent);
+  const parentPending = isPendingSync(parent);
+  const groupOpsPaused = parentExcluded || parentPending;
+  // 默认只显示未确认排除的 active 子容器；提供「显示已排除」开关。
+  const excludedChildren = children.filter((r) => isConfigExcluded(r));
+  const visibleChildren = showExcluded ? children : children.filter((r) => !isConfigExcluded(r));
   const groupOpsDisabled =
-    parent.status !== 'active' || children.length === 0 || childrenQ.error != null;
+    parent.status !== 'active' ||
+    children.length === 0 ||
+    groupOpsPaused ||
+    childrenQ.error != null;
 
   const confirmAction = (): void => {
     const action = pendingAction;
@@ -96,8 +111,9 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
         nameOf,
       );
     } else {
+      // 受限子项（待同步/排除/镜像问题）提交前过滤；后端整组原子预检兜底。
       void batchRunner.runPolicy(
-        children.map((r) => r.id),
+        children.filter((r) => !isConfigReadOnly(r)).map((r) => r.id),
         pendingPolicy,
       );
     }
@@ -139,8 +155,11 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <BlockedBadge blockedReason={parent.blockedReason} />
+            <ManagementBadge resource={parent} />
             <Badge tone={policyTone(parent.policy)} title="父服务的策略保持现状，不随整组操作变更">
-              {POLICY_LABEL[parent.policy]}
+              {groupOpsPaused
+                ? `已保存策略：${POLICY_LABEL[parent.policy]}（当前暂停）`
+                : POLICY_LABEL[parent.policy]}
             </Badge>
             <CoolifyLinkButton
               kind="compose_service"
@@ -159,6 +178,25 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
           该服务在最近一次同步中已被标记为移除，整组操作已禁用。
         </div>
       )}
+      {parentExcluded && (
+        <div
+          role="note"
+          className="rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] px-3 py-2 text-[12px] text-[var(--color-text-secondary)]"
+        >
+          {parent.exclusionSource === 'parent'
+            ? '该服务继承配置排除。'
+            : '该服务命中 EXCLUDED_RESOURCE_UUIDS 配置名单。'}
+          整组配置只读、新管理操作已停用；调整配置并重启、同步后解除。
+        </div>
+      )}
+      {parentPending && (
+        <div
+          role="note"
+          className="rounded border border-[var(--color-info)]/40 bg-[var(--color-info)]/5 px-3 py-2 text-[12px] text-[var(--color-info)]"
+        >
+          该服务待同步确认（历史数据尚未分类）。整组新管理操作已暂停；完成一次资源同步后自动确认并重新计算范围。
+        </div>
+      )}
 
       <Card>
         <CardHeader
@@ -172,6 +210,10 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
               <Badge tone={summary.attention > 0 ? 'danger' : 'neutral'}>
                 待配置/受阻 {summary.attention}
               </Badge>
+              {summary.excluded > 0 && <Badge>已排除 {summary.excluded}</Badge>}
+              {summary.pendingSync > 0 && (
+                <Badge tone="warning">待同步 {summary.pendingSync}</Badge>
+              )}
             </span>
           }
           actions={
@@ -253,8 +295,18 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
                     `：提交 ${nameOf(batchRunner.activeUpdateId)}`}
                 </div>
               )}
+              {excludedChildren.length > 0 && (
+                <label className="flex items-center gap-1.5 text-[12px] text-[var(--color-text-secondary)]">
+                  <input
+                    type="checkbox"
+                    checked={showExcluded}
+                    onChange={(e) => setShowExcluded(e.target.checked)}
+                  />
+                  显示已排除（{excludedChildren.length}）
+                </label>
+              )}
               <ChildResourcesTable
-                rows={children}
+                rows={visibleChildren}
                 ariaLabel="服务子容器"
                 selected={selected}
                 onToggleSelected={(id, checked) =>
@@ -269,7 +321,7 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
                 }}
                 checkingId={batchRunner.activeCheckId}
                 updatingId={batchRunner.activeUpdateId}
-                emptyText="该服务暂无 active 子容器。"
+                emptyText="该服务暂无可显示的 active 子容器。"
               />
               <GroupFeedback batch={batchRunner.result} lines={feedbackLines} />
               {children.length > 0 && (
@@ -292,7 +344,15 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
             <Button variant="ghost" onClick={() => setPendingAction(null)}>
               取消
             </Button>
-            <Button variant="accent" disabled={batchRunner.busy} onClick={confirmAction}>
+            <Button
+              variant="accent"
+              disabled={
+                batchRunner.busy ||
+                (pendingAction === 'check' && checkable.length === 0) ||
+                (pendingAction === 'update' && updatable.length === 0)
+              }
+              onClick={confirmAction}
+            >
               确认执行
             </Button>
           </>
@@ -345,11 +405,20 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
         {pendingAction === 'policy' && (
           <>
             <p>
-              将把该服务全部 {children.length} 项 active 子容器的策略设置为「
+              将把该服务 {children.filter((r) => !isConfigReadOnly(r)).length} 项 active
+              子容器的策略设置为「
               {POLICY_LABEL[pendingPolicy]}
               」。
             </p>
-            <p className="text-[12px]">{previewNames(children)}</p>
+            <p className="text-[12px]">
+              {previewNames(children.filter((r) => !isConfigReadOnly(r)))}
+            </p>
+            {children.some((r) => isConfigReadOnly(r)) && (
+              <p className="text-[12px]">
+                跳过 {children.filter((r) => isConfigReadOnly(r)).length}{' '}
+                项受限子容器（待同步确认/已排除/镜像问题，配置只读）。
+              </p>
+            )}
             <p className="text-[12px]">
               父服务策略保持现状；被排除或外部修改的子容器安全状态由既有约束保护。
             </p>

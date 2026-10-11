@@ -43,6 +43,8 @@ class StubCoolify {
     docker_image_tag: TAG_A,
     status: 'running',
   };
+  /** 其他 uuid 的应用状态（队列/升级过渡场景需要多资源）。 */
+  extraApps = new Map<string, { docker_image: string; docker_image_tag: string; status: string }>();
   patchCalls = 0;
   startCalls = 0;
   startBehavior: 'ok' | 'timeout' = 'ok';
@@ -53,12 +55,24 @@ class StubCoolify {
     const self = this;
     return {
       async getApplication(uuid: string) {
-        if (uuid !== 'app-1') throw new CoolifyApiError('missing', 404);
-        return { ...self.appState } as unknown as CoolifyApplication;
+        if (uuid === 'app-1') return { ...self.appState } as unknown as CoolifyApplication;
+        const extra = self.extraApps.get(uuid);
+        if (extra == null) throw new CoolifyApiError('missing', 404);
+        return {
+          uuid,
+          docker_image: extra.docker_image,
+          docker_image_tag: extra.docker_image_tag,
+          status: extra.status,
+        } as unknown as CoolifyApplication;
       },
-      async patchApplication(_uuid: string, patch: Record<string, unknown>) {
+      async patchApplication(uuid: string, patch: Record<string, unknown>) {
         self.patchCalls += 1;
-        self.appState.docker_image_tag = patch.docker_image_tag as string;
+        if (uuid === 'app-1') {
+          self.appState.docker_image_tag = patch.docker_image_tag as string;
+        } else {
+          const extra = self.extraApps.get(uuid);
+          if (extra != null) extra.docker_image_tag = patch.docker_image_tag as string;
+        }
         return {};
       },
       async startApplication() {
@@ -122,6 +136,7 @@ beforeEach(async () => {
       policy: 'notify',
       configFingerprint: 'fp',
       currentImage: `jellyfin/jellyfin:${TAG_A}`,
+      managementClassified: true,
       lastSyncedAt: now,
       createdAt: now,
       updatedAt: now,
@@ -386,6 +401,7 @@ describe('compose child executor', () => {
         kind: 'compose_service',
         coolifyUuid: 'svc-1',
         name: 'stack',
+        managementClassified: true,
         lastSyncedAt: now,
         createdAt: now,
         updatedAt: now,
@@ -403,6 +419,7 @@ describe('compose child executor', () => {
         currentImage: 'nginx:1.27',
         configFingerprint: 'fp',
         policy: 'notify',
+        managementClassified: true,
         lastSyncedAt: now,
         createdAt: now,
         updatedAt: now,
@@ -420,6 +437,7 @@ describe('compose child executor', () => {
         composeServiceName: 'db',
         currentImage: 'postgres:16',
         configFingerprint: 'fp2',
+        managementClassified: true,
         lastSyncedAt: now,
         createdAt: now,
         updatedAt: now,
@@ -528,6 +546,7 @@ describe('review round 1 regressions', () => {
         name: 'navidrome',
         policy: 'notify',
         configFingerprint: 'fp',
+        managementClassified: true,
         lastSyncedAt: now,
         createdAt: now,
         updatedAt: now,
@@ -572,5 +591,213 @@ describe('review round 1 regressions', () => {
     const track = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get();
     expect(track?.configuredDigest).toBe(D_B);
     expect(track?.lastSuccessfulDigest).toBe(D_B);
+  });
+});
+
+// --- 升级过渡：队列与证据安全（plan §5 T3） ---------------------------------
+
+describe('queue safety across the upgrade transition', () => {
+  interface PendingSeed {
+    uuid: string;
+    managementClassified?: boolean;
+    excludedInfra?: boolean;
+    imageIssue?: 'unsupported_registry' | null;
+  }
+  const seedApp = (o: PendingSeed): number => {
+    const now = Date.now();
+    return h.db
+      .insert(resources)
+      .values({
+        kind: 'application',
+        coolifyUuid: o.uuid,
+        name: o.uuid,
+        policy: 'notify',
+        configFingerprint: 'fp',
+        currentImage: `jellyfin/jellyfin:${TAG_A}`,
+        managementClassified: o.managementClassified ?? true,
+        excludedInfra: o.excludedInfra ?? false,
+        imageIssue: o.imageIssue ?? null,
+        lastSyncedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning()
+      .get()!.id;
+  };
+  const trackFor = (id: number): void => {
+    const now = Date.now();
+    h.db
+      .insert(imageTracks)
+      .values({
+        resourceId: id,
+        sourceRegistry: 'docker.io',
+        sourceRepository: 'jellyfin/jellyfin',
+        sourceRepositoryAuthored: 'jellyfin/jellyfin',
+        sourceTag: 'latest',
+        targetPlatform: 'linux/amd64',
+        platformSource: 'server_default',
+        configuredDigest: D_A,
+        configuredReference: `jellyfin/jellyfin:${TAG_A}`,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+  };
+  const rawPendingJob = (resourceId: number, digest: string, key: string): number => {
+    const now = Date.now();
+    return h.db
+      .insert(updateJobs)
+      .values({
+        resourceId,
+        kind: 'update',
+        trigger: 'auto',
+        candidateDigest: digest,
+        candidateReference: `jellyfin/jellyfin:sha256-${digest.slice(7, 19)}`,
+        priorDigest: D_A,
+        expectedFingerprint: 'fp',
+        status: 'pending',
+        stage: 'queued',
+        attempts: 0,
+        log: [],
+        idempotencyKey: key,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning()
+      .get()!.id;
+  };
+
+  it('keeps pending-sync jobs pending and still claims later eligible jobs (no starvation)', async () => {
+    // 前 3 条属于待同步确认资源；第 4 条属于已分类合格资源。
+    const p1 = seedApp({ uuid: 'q-p1', managementClassified: false });
+    const p2 = seedApp({ uuid: 'q-p2', managementClassified: false });
+    const p3 = seedApp({ uuid: 'q-p3', managementClassified: false });
+    trackFor(p1);
+    trackFor(p2);
+    trackFor(p3);
+    const okId = seedApp({ uuid: 'q-ok' });
+    trackFor(okId);
+    for (const u of ['q-p1', 'q-p2', 'q-p3', 'q-ok']) {
+      coolify.extraApps.set(u, {
+        docker_image: 'jellyfin/jellyfin',
+        docker_image_tag: TAG_A,
+        status: 'running',
+      });
+    }
+    const digestOf = (i: number) => `sha256:${String(i).padStart(64, '0')}`;
+    const j1 = rawPendingJob(p1, digestOf(1), 'q:1');
+    const j2 = rawPendingJob(p2, digestOf(2), 'q:2');
+    const j3 = rawPendingJob(p3, digestOf(3), 'q:3');
+    const jOk = rawPendingJob(okId, D_B, 'q:ok');
+
+    const processed = await executor.processQueue();
+    expect(processed).toBe(1);
+    // 等待项保持 pending；合格任务被领取并完成。
+    expect(h.db.select().from(updateJobs).where(eq(updateJobs.id, j1)).get()?.status).toBe(
+      'pending',
+    );
+    expect(h.db.select().from(updateJobs).where(eq(updateJobs.id, j2)).get()?.status).toBe(
+      'pending',
+    );
+    expect(h.db.select().from(updateJobs).where(eq(updateJobs.id, j3)).get()?.status).toBe(
+      'pending',
+    );
+    expect(h.db.select().from(updateJobs).where(eq(updateJobs.id, jOk)).get()?.status).toBe(
+      'success',
+    );
+    // 等待项的资源没有产生任何 Coolify 写入。
+    expect(coolify.patchCalls).toBe(1); // 仅 q-ok 的一次 PATCH
+    expect(coolify.startCalls).toBe(1);
+
+    // 同步完成分类后：原等待项可重新判定并执行。
+    for (const id of [p1, p2, p3]) {
+      h.db.update(resources).set({ managementClassified: true }).where(eq(resources.id, id)).run();
+    }
+    await executor.processQueue();
+    const after = h.db.select().from(updateJobs).all();
+    expect(after.find((j) => j.id === j1)?.status).toBe('success');
+    expect(after.find((j) => j.id === j2)?.status).toBe('success');
+    expect(after.find((j) => j.id === j3)?.status).toBe('success');
+  });
+
+  it('marks queued jobs blocked when the classified resource is excluded or has an image issue', async () => {
+    const exId = seedApp({ uuid: 'q-ex', excludedInfra: true });
+    const isId = seedApp({ uuid: 'q-is', imageIssue: 'unsupported_registry' });
+    trackFor(exId);
+    trackFor(isId);
+    const jEx = rawPendingJob(exId, D_B, 'q:ex');
+    const jIs = rawPendingJob(isId, D_B, 'q:is');
+
+    const processed = await executor.processQueue();
+    expect(processed).toBe(0);
+    const ex = h.db.select().from(updateJobs).where(eq(updateJobs.id, jEx)).get();
+    expect(ex).toMatchObject({ status: 'blocked' });
+    expect(ex?.errorMessage).toContain('已排除');
+    const is = h.db.select().from(updateJobs).where(eq(updateJobs.id, jIs)).get();
+    expect(is).toMatchObject({ status: 'blocked' });
+    expect(is?.errorCode).toBe('image_issue');
+    expect(coolify.patchCalls).toBe(0);
+    expect(coolify.startCalls).toBe(0);
+  });
+
+  it('refuses new manual jobs and retries for ineligible resources (zero side effects)', async () => {
+    const exId = seedApp({ uuid: 'q-guard', excludedInfra: true });
+    trackFor(exId);
+    const token = jobs.issuePreviewToken(exId, D_B);
+    expect(() => jobs.createManualJob(exId, D_B, token)).toThrow(/已排除/);
+    // 建一条终态任务再重试：资格不满足时原任务保持原值。
+    const j = rawPendingJob(exId, D_B, 'q:guard');
+    h.db
+      .update(updateJobs)
+      .set({ status: 'failed', errorCode: 'x', errorMessage: 'y', finishedAt: Date.now() })
+      .where(eq(updateJobs.id, j))
+      .run();
+    expect(() => jobs.retryJob(j)).toThrow(/已排除/);
+    expect(h.db.select().from(updateJobs).where(eq(updateJobs.id, j)).get()?.status).toBe('failed');
+  });
+
+  it('resumes already-submitted deployments query-only, even while unclassified', async () => {
+    // 已提交部署（deploymentUuid 存在）：升级/重启后继续证据恢复，零 PATCH/start。
+    const id = seedApp({ uuid: 'q-resume', managementClassified: false });
+    trackFor(id);
+    coolify.extraApps.set('q-resume', {
+      docker_image: 'jellyfin/jellyfin',
+      docker_image_tag: `sha256-${'b'.repeat(64)}`, // 提交时已写入
+      status: 'running',
+    });
+    const now = Date.now();
+    const j = h.db
+      .insert(updateJobs)
+      .values({
+        resourceId: id,
+        kind: 'update',
+        trigger: 'auto',
+        candidateDigest: D_B,
+        candidateReference: `jellyfin/jellyfin:sha256-${'b'.repeat(64)}`,
+        priorDigest: D_A,
+        priorReference: `jellyfin/jellyfin:${TAG_A}`,
+        status: 'pending',
+        stage: 'deploy_submitted',
+        deploymentUuid: 'dep-resume-1',
+        attempts: 1,
+        log: [],
+        idempotencyKey: 'q:resume',
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning()
+      .get()!.id;
+
+    const processed = await executor.processQueue();
+    expect(processed).toBe(1);
+    const job = h.db.select().from(updateJobs).where(eq(updateJobs.id, j)).get();
+    expect(job).toMatchObject({ status: 'success' });
+    expect(coolify.patchCalls).toBe(0);
+    expect(coolify.startCalls).toBe(0);
+    // 证据推进：追踪成功摘要更新，分类字段保持原值。
+    const track = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get();
+    expect(track?.lastSuccessfulDigest).toBe(D_B);
+    const res = h.db.select().from(resources).where(eq(resources.id, id)).get();
+    expect(res?.managementClassified).toBe(false);
   });
 });

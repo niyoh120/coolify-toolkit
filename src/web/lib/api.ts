@@ -17,6 +17,8 @@ export class ApiError extends Error {
     public readonly code: string,
     message: string,
     public readonly status: number,
+    /** 结构化错误详情（如整批拒绝的逐项原因）。 */
+    public readonly details?: unknown,
   ) {
     super(message);
     this.name = 'ApiError';
@@ -32,12 +34,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   });
   const body = (await res.json().catch(() => null)) as
-    | { error?: { code: string; message: string } }
+    | { error?: { code?: string; message?: string; details?: unknown } }
     | T
     | null;
   if (!res.ok) {
-    const err = (body as { error?: { code: string; message: string } } | null)?.error;
-    throw new ApiError(err?.code ?? 'http_error', err?.message ?? `HTTP ${res.status}`, res.status);
+    const err = (body as { error?: { code?: string; message?: string; details?: unknown } } | null)
+      ?.error;
+    throw new ApiError(
+      err?.code ?? 'http_error',
+      err?.message ?? `HTTP ${res.status}`,
+      res.status,
+      err?.details,
+    );
   }
   return body as T;
 }

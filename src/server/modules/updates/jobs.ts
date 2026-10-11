@@ -10,6 +10,8 @@ import type { ImageTrackRow, ResourceRow, UpdateJobRow } from '../../db/schema.j
 import { imageTracks, resources, updateJobs } from '../../db/schema.js';
 import type { SettingsRepo } from '../../db/settings-repo.js';
 import { coolifyDigestTag } from '../../integrations/registry/reference.js';
+import { effectiveManagementGate } from '../inventory/management-state.js';
+import { parentRowOf } from '../inventory/parent-row.js';
 
 const ACTIVE_STATUSES = ['pending', 'running'] as const;
 
@@ -96,8 +98,14 @@ export class JobsService {
     if (resource.status !== 'active') {
       throw new ApiRequestError(errorCodes.blocked, 'Resource is not active', 409);
     }
-    if (resource.excludedInfra) {
-      throw new ApiRequestError(errorCodes.blocked, 'Resource is excluded from management', 409);
+    // 统一资格：分类待确认 → 配置排除（含父级继承） → 镜像问题，全部 409。
+    const gate = effectiveManagementGate(
+      resource,
+      parentRowOf(this.db, resource),
+      resource.currentImage,
+    );
+    if (!gate.ok) {
+      throw new ApiRequestError(errorCodes.blocked, gate.reason, 409);
     }
     if (track == null) {
       throw new ApiRequestError(errorCodes.blocked, 'No image track for this resource', 409);
@@ -249,6 +257,20 @@ export class JobsService {
         'Only failed, conflicting or blocked tasks can be retried; unknown submits must be reconciled or confirmed first',
         409,
       );
+    }
+    // 重试即新管理动作：当前资格不满足（待确认/排除/镜像问题/父级继承受限）
+    // 时拒绝，原任务保持原值。
+    const resource = this.db.select().from(resources).where(eq(resources.id, job.resourceId)).get();
+    if (resource == null) {
+      throw new ApiRequestError(errorCodes.notFound, 'Resource not found', 404);
+    }
+    const gate = effectiveManagementGate(
+      resource,
+      parentRowOf(this.db, resource),
+      resource.currentImage,
+    );
+    if (!gate.ok) {
+      throw new ApiRequestError(errorCodes.blocked, gate.reason, 409);
     }
     const now = Date.now();
     const updated = this.db

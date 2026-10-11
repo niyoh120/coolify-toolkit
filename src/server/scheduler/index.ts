@@ -56,7 +56,16 @@ export class Scheduler {
     if (this.stopped) return;
     const { db, checker } = this.deps;
     const rows = db
-      .select({ id: resources.id, checkCron: resources.checkCron, status: resources.status })
+      .select({
+        id: resources.id,
+        checkCron: resources.checkCron,
+        status: resources.status,
+        managementClassified: resources.managementClassified,
+        excludedInfra: resources.excludedInfra,
+        imageIssue: resources.imageIssue,
+        isStopped: resources.isStopped,
+        policy: resources.policy,
+      })
       .from(resources)
       .all();
     const timezone = this.deps.settings.get().cronTimezone;
@@ -68,7 +77,19 @@ export class Scheduler {
     this.resourceJobsTimezone = timezone;
     const wanted = new Map<number, string>();
     for (const r of rows) {
-      if (r.checkCron != null && r.checkCron !== '' && r.status === 'active') {
+      // 自定义 cron 只注册 active、已分类、未排除、无镜像问题、非 ignore 的
+      // 资源；原 cron 配置保留，资格恢复后由同步/重启重新注册。
+      // checker 触发时仍有守卫（双保险）。
+      if (
+        r.checkCron != null &&
+        r.checkCron !== '' &&
+        r.status === 'active' &&
+        r.managementClassified &&
+        !r.excludedInfra &&
+        r.imageIssue == null &&
+        !r.isStopped &&
+        r.policy !== 'ignore'
+      ) {
         wanted.set(r.id, r.checkCron);
       }
     }
@@ -117,6 +138,8 @@ export class Scheduler {
     this.syncRunning = true;
     try {
       await this.deps.sync.run();
+      // 定时同步后刷新资源级调度：新分类资源恢复 cron，受限资源摘除。
+      this.reloadResourceSchedules();
     } catch {
       // Isolation: a failed round leaves existing rows intact; next cron retries.
     } finally {

@@ -19,6 +19,7 @@ import {
   BlockedBadge,
   CheckBadge,
   DeployBadge,
+  ManagementBadge,
   POLICY_LABEL,
   shortDigest,
 } from '../components/status.js';
@@ -41,14 +42,20 @@ import {
 } from '../components/ui.js';
 import { api } from '../lib/api.js';
 import {
+  belongsToView,
   buildServiceGroups,
   checkBlockedHint,
   DEFAULT_SERVICE_FILTERS,
+  type ExclusionView,
   type FilteredServiceGroup,
   filterServiceGroups,
   groupSummary,
+  isConfigExcluded,
+  isConfigReadOnly,
+  isPendingSync,
   paginateGroups,
   policyTone,
+  projectGroupsForView,
   type ServiceFilters,
   selectableChildIds,
   selectionState,
@@ -59,13 +66,50 @@ import { useRouter } from '../main.js';
 
 const PAGE_SIZES = [10, 20, 50, 100];
 
-type ManagedFilter = 'all' | 'managed';
 type StatusFilter = 'all' | 'running' | 'stopped';
 type PendingBatch =
   | { kind: 'check' }
   | { kind: 'update' }
   | { kind: 'policy'; policy: Policy }
   | null;
+
+/** 三档筛选的选择器（应用/服务列表共用）。 */
+function ViewSegmented({
+  value,
+  onChange,
+  ariaLabel,
+}: {
+  value: ExclusionView;
+  onChange: (v: ExclusionView) => void;
+  ariaLabel: string;
+}) {
+  return (
+    <Segmented<ExclusionView>
+      ariaLabel={ariaLabel}
+      value={value}
+      onChange={onChange}
+      options={[
+        { value: 'unexcluded', label: '未排除' },
+        { value: 'managed', label: '受管' },
+        { value: 'excluded', label: '已排除' },
+      ]}
+    />
+  );
+}
+
+/** 默认视图下的待同步说明条。 */
+function PendingSyncHint({ count }: { count: number }) {
+  if (count === 0) return null;
+  return (
+    <div
+      role="note"
+      className="rounded border border-[var(--color-info)]/40 bg-[var(--color-info)]/5 px-3 py-2 text-[12px] text-[var(--color-info)]"
+    >
+      含待同步确认资源 {count}{' '}
+      项：这些记录尚未经现行同步规则分类（历史数据），配置只读、新管理操作已暂停。点击「同步资源」完成一次资源同步后自动确认。
+    </div>
+  );
+}
 
 function FeedbackArea({ batch, lines }: { batch: BatchLines | null; lines: FeedbackLine[] }) {
   if (batch == null && lines.length === 0) return null;
@@ -113,8 +157,7 @@ function previewNames(list: ResourceDTO[]): string {
 
 function ApplicationsView() {
   const { navigate } = useRouter();
-  const [policy, setPolicy] = useState('');
-  const [managed, setManaged] = useState<ManagedFilter>('all');
+  const [view, setView] = useState<ExclusionView>('unexcluded');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [server, setServer] = useState('');
   const [search, setSearch] = useState('');
@@ -126,12 +169,8 @@ function ApplicationsView() {
   const batchRunner = useBatchRunner();
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ['resources', 'applications', policy],
-    queryFn: () =>
-      api.resources({
-        kind: 'application',
-        policy: policy === '' ? undefined : (policy as Policy),
-      }),
+    queryKey: ['resources', 'applications'],
+    queryFn: () => api.resources({ kind: 'application' }),
   });
   const resources = data?.resources ?? [];
   const nameOf = (id: number): string => resources.find((r) => r.id === id)?.name ?? `资源 #${id}`;
@@ -140,11 +179,24 @@ function ApplicationsView() {
   // 筛选/分页/每页变化在各自处理器里清空选择，避免隐藏资源混入批量操作。
   const clearSelection = (): void => setSelected([]);
 
+  // 轮询/视图切换后清理失效选择：只保留未排除且仍存在的 id。
+  // （hooks 规则：早退 return 之前调用。）
+  const resourceKey = resources.map((r) => r.id).join(',');
+  useEffect(() => {
+    setSelected((prev) => {
+      if (prev.length === 0) return prev;
+      const present = new Set(resourceKey.split(',').filter(Boolean));
+      const next = prev.filter((id) => present.has(String(id)));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [resourceKey]);
+
   if (isLoading) return <Loading />;
   if (error != null) return <ErrorBox error={error} />;
 
+  // 三档视图先投影；再叠加状态/服务器/搜索条件。
   const rows = resources
-    .filter((r) => (managed === 'managed' ? r.policy !== 'ignore' : true))
+    .filter((r) => belongsToView(r, view))
     .filter((r) =>
       statusFilter === 'all' ? true : statusFilter === 'stopped' ? r.isStopped : !r.isStopped,
     )
@@ -158,6 +210,9 @@ function ApplicationsView() {
       )
     : rows;
   const pagedRows = filtered.slice((page - 1) * pageSize, page * pageSize);
+  // 排除视图只读：不提供选择与操作。
+  const readOnly = view === 'excluded';
+  const pendingSyncTotal = resources.filter(isPendingSync).length;
 
   // 受影响数量：检查更新/执行更新只统计真正会执行的资源。
   const selectedRows = filtered.filter((r) => selected.includes(r.id));
@@ -188,8 +243,9 @@ function ApplicationsView() {
         nameOf,
       );
     } else {
+      // 受限项（待同步/排除/镜像问题）提交前过滤，弹窗列出跳过原因；后端仍整批原子预检兜底。
       void batchRunner.runPolicy(
-        selectedRows.map((r) => r.id),
+        selectedRows.filter((r) => !isConfigReadOnly(r)).map((r) => r.id),
         pending.policy,
       );
     }
@@ -198,7 +254,7 @@ function ApplicationsView() {
 
   return (
     <>
-      {/* 工具栏：搜索 + 受管/状态/策略/服务器 + 每页条数 */}
+      {/* 工具栏：搜索 + 三档视图/状态/服务器 + 每页条数 */}
       <div className="flex flex-wrap items-center gap-2">
         <SearchInput
           value={search}
@@ -210,18 +266,14 @@ function ApplicationsView() {
           placeholder="按名称搜索应用"
           ariaLabel="搜索应用"
         />
-        <Segmented<ManagedFilter>
-          ariaLabel="受管筛选"
-          value={managed}
+        <ViewSegmented
+          ariaLabel="按管理范围筛选"
+          value={view}
           onChange={(v) => {
-            setManaged(v);
+            setView(v);
             setPage(1);
             clearSelection();
           }}
-          options={[
-            { value: 'managed', label: '受管' },
-            { value: 'all', label: '全部' },
-          ]}
         />
         <Segmented<StatusFilter>
           ariaLabel="按运行状态筛选"
@@ -237,21 +289,6 @@ function ApplicationsView() {
             { value: 'stopped', label: '已停止' },
           ]}
         />
-        <Select
-          value={policy}
-          onChange={(e) => {
-            setPolicy(e.target.value);
-            setPage(1);
-            clearSelection();
-          }}
-          aria-label="按策略筛选"
-        >
-          <option value="">全部策略</option>
-          <option value="ignore">忽略</option>
-          <option value="notify">通知</option>
-          <option value="manual">手动</option>
-          <option value="auto">自动</option>
-        </Select>
         <Select
           value={server}
           onChange={(e) => {
@@ -291,9 +328,17 @@ function ApplicationsView() {
         </span>
       </div>
 
+      {view === 'unexcluded' && <PendingSyncHint count={pendingSyncTotal} />}
+      {view === 'excluded' && (
+        <div className="rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] px-3 py-2 text-[12px] text-[var(--color-text-secondary)]">
+          已排除资源配置只读：命中 EXCLUDED_RESOURCE_UUIDS
+          名单（自身或父服务）。调整配置并重启、同步后解除。
+        </div>
+      )}
+
       <FeedbackArea batch={batchRunner.result} lines={feedbackLines} />
 
-      {selected.length > 0 && (
+      {selected.length > 0 && !readOnly && (
         <div className="flex flex-wrap items-center gap-2 rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] px-3 py-2 text-[13px]">
           已选 {selected.length} 项：
           <Button
@@ -340,7 +385,15 @@ function ApplicationsView() {
             <Button variant="ghost" onClick={() => setPendingBatch(null)}>
               取消
             </Button>
-            <Button variant="accent" disabled={batchRunner.busy} onClick={confirmBatch}>
+            <Button
+              variant="accent"
+              disabled={
+                batchRunner.busy ||
+                (pendingBatch?.kind === 'policy' &&
+                  selectedRows.filter((r) => !isConfigReadOnly(r)).length === 0)
+              }
+              onClick={confirmBatch}
+            >
               确认执行
             </Button>
           </>
@@ -382,11 +435,20 @@ function ApplicationsView() {
         {pendingBatch?.kind === 'policy' && (
           <>
             <p>
-              将把 {selectedRows.length} 项资源的策略设置为「
+              将把 {selectedRows.filter((r) => !isConfigReadOnly(r)).length}
+              项资源的策略设置为「
               {POLICY_LABEL[pendingBatch.policy]}
               」。
             </p>
-            <p className="text-[12px]">{previewNames(selectedRows)}</p>
+            <p className="text-[12px]">
+              {previewNames(selectedRows.filter((r) => !isConfigReadOnly(r)))}
+            </p>
+            {selectedRows.some((r) => isConfigReadOnly(r)) && (
+              <p className="text-[12px]">
+                跳过 {selectedRows.filter((r) => isConfigReadOnly(r)).length}{' '}
+                项受限资源（待同步确认/已排除/镜像问题，配置只读）。
+              </p>
+            )}
           </>
         )}
       </Modal>
@@ -402,16 +464,18 @@ function ApplicationsView() {
           <Table ariaLabel="应用列表">
             <thead>
               <tr>
-                <Th className="w-8">
-                  <input
-                    type="checkbox"
-                    aria-label="全选当前页"
-                    checked={
-                      pagedRows.length > 0 && pagedRows.every((r) => selected.includes(r.id))
-                    }
-                    onChange={(e) => toggleAll(e.target.checked)}
-                  />
-                </Th>
+                {!readOnly && (
+                  <Th className="w-8">
+                    <input
+                      type="checkbox"
+                      aria-label="全选当前页"
+                      checked={
+                        pagedRows.length > 0 && pagedRows.every((r) => selected.includes(r.id))
+                      }
+                      onChange={(e) => toggleAll(e.target.checked)}
+                    />
+                  </Th>
+                )}
                 <Th className="min-w-[10rem] max-w-[16rem]">名称</Th>
                 <Th className="min-w-[6rem] max-w-[10rem]">服务器</Th>
                 <Th className="min-w-[10rem] max-w-[15rem]">追踪来源</Th>
@@ -427,14 +491,16 @@ function ApplicationsView() {
             <tbody>
               {pagedRows.map((r) => (
                 <tr key={r.id} className="hover:bg-[var(--color-bg-overlay)]/40">
-                  <Td>
-                    <input
-                      type="checkbox"
-                      aria-label={`选择 ${r.name}`}
-                      checked={selected.includes(r.id)}
-                      onChange={(e) => toggle(r.id, e.target.checked)}
-                    />
-                  </Td>
+                  {!readOnly && (
+                    <Td>
+                      <input
+                        type="checkbox"
+                        aria-label={`选择 ${r.name}`}
+                        checked={selected.includes(r.id)}
+                        onChange={(e) => toggle(r.id, e.target.checked)}
+                      />
+                    </Td>
+                  )}
                   <Td>
                     <button
                       type="button"
@@ -445,7 +511,7 @@ function ApplicationsView() {
                     </button>
                     <div className="flex flex-wrap gap-1 pt-1">
                       <BlockedBadge blockedReason={r.blockedReason} />
-                      {r.excludedInfra && <Badge>已排除</Badge>}
+                      <ManagementBadge resource={r} />
                     </div>
                   </Td>
                   <Td className="break-words text-[12px] text-[var(--color-text-secondary)]">
@@ -482,32 +548,43 @@ function ApplicationsView() {
                     <Badge tone={policyTone(r.policy)}>{POLICY_LABEL[r.policy]}</Badge>
                   </Td>
                   <Td>
-                    <div className="flex flex-wrap items-center gap-1">
-                      <Button
-                        variant="ghost"
-                        disabled={
-                          checkBlockedHint(r) != null ||
-                          (checkOne.isPending && checkOne.variables === r.id)
-                        }
-                        title={checkBlockedHint(r) ?? '检查上游是否有新版本'}
-                        onClick={() => checkOne.mutate(r.id)}
+                    {readOnly ? (
+                      <span
+                        className="text-[12px] text-[var(--color-text-muted)]"
+                        title="已排除资源只读"
                       >
-                        {checkOne.isPending && checkOne.variables === r.id ? '检查中…' : '检查更新'}
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        disabled={
-                          updateBlockedHint(r) != null ||
-                          (updateOne.isPending && updateOne.variables === r.id)
-                        }
-                        title={updateBlockedHint(r) ?? '跳过预览，直接按最新观察到的摘要提交更新'}
-                        onClick={() => updateOne.mutate(r.id)}
-                      >
-                        {updateOne.isPending && updateOne.variables === r.id
-                          ? '提交中…'
-                          : '执行更新'}
-                      </Button>
-                    </div>
+                        只读
+                      </span>
+                    ) : (
+                      <div className="flex flex-wrap items-center gap-1">
+                        <Button
+                          variant="ghost"
+                          disabled={
+                            checkBlockedHint(r) != null ||
+                            (checkOne.isPending && checkOne.variables === r.id)
+                          }
+                          title={checkBlockedHint(r) ?? '检查上游是否有新版本'}
+                          onClick={() => checkOne.mutate(r.id)}
+                        >
+                          {checkOne.isPending && checkOne.variables === r.id
+                            ? '检查中…'
+                            : '检查更新'}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          disabled={
+                            updateBlockedHint(r) != null ||
+                            (updateOne.isPending && updateOne.variables === r.id)
+                          }
+                          title={updateBlockedHint(r) ?? '跳过预览，直接按最新观察到的摘要提交更新'}
+                          onClick={() => updateOne.mutate(r.id)}
+                        >
+                          {updateOne.isPending && updateOne.variables === r.id
+                            ? '提交中…'
+                            : '执行更新'}
+                        </Button>
+                      </div>
+                    )}
                   </Td>
                 </tr>
               ))}
@@ -532,6 +609,7 @@ function ApplicationsView() {
 
 function ServicesView() {
   const { navigate } = useRouter();
+  const [view, setView] = useState<ExclusionView>('unexcluded');
   const [filters, setFilters] = useState<ServiceFilters>(DEFAULT_SERVICE_FILTERS);
   const [pageSize, setPageSize] = useState(20);
   const [page, setPage] = useState(1);
@@ -547,14 +625,33 @@ function ServicesView() {
   });
   const resources = data?.resources ?? [];
   const nameOf = (id: number): string => resources.find((r) => r.id === id)?.name ?? `资源 #${id}`;
+  const readOnly = view === 'excluded';
 
+  // 先基于完整 active 列表构建真实父子组，再投影到当前视图，
+  // 避免先过滤父记录产生虚假孤儿。
   const groups = useMemo(() => buildServiceGroups(resources), [resources]);
-  const filtered = useMemo(() => filterServiceGroups(groups, filters), [groups, filters]);
+  const projected = useMemo(() => projectGroupsForView(groups, view), [groups, view]);
+  const filtered = useMemo(() => filterServiceGroups(projected, filters), [projected, filters]);
+  // 组摘要按搜索/普通条件筛选前的完整 active 子容器统计（含已排除与待同步数量）。
+  const fullChildrenByKey = useMemo(
+    () => new Map(groups.map((g) => [g.key, g.children])),
+    [groups],
+  );
   const serverOptions = useMemo(() => serviceServerNames(groups), [groups]);
   const paged = paginateGroups(filtered, page, pageSize);
+  const pendingSyncTotal = resources.filter(isPendingSync).length;
 
   // 筛选/分页/每页变化在各自处理器里清空选择；轮询缩减数据时把越界页码修正回有效范围。
   const clearSelection = (): void => setSelected([]);
+  const resourceKey = resources.map((r) => r.id).join(',');
+  useEffect(() => {
+    setSelected((prev) => {
+      if (prev.length === 0) return prev;
+      const present = new Set(resourceKey.split(',').filter(Boolean));
+      const next = prev.filter((id) => present.has(String(id)));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [resourceKey]);
   useEffect(() => {
     const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
     if (page > pages) setPage(pages);
@@ -600,7 +697,7 @@ function ServicesView() {
       );
     } else {
       void batchRunner.runPolicy(
-        selectedRows.map((r) => r.id),
+        selectedRows.filter((r) => !isConfigReadOnly(r)).map((r) => r.id),
         pending.policy,
       );
     }
@@ -620,18 +717,14 @@ function ServicesView() {
           placeholder="按服务或子容器名称搜索"
           ariaLabel="搜索服务"
         />
-        <Segmented<ManagedFilter>
-          ariaLabel="受管筛选"
-          value={filters.managed}
+        <ViewSegmented
+          ariaLabel="按管理范围筛选"
+          value={view}
           onChange={(v) => {
-            setFilters((f) => ({ ...f, managed: v }));
+            setView(v);
             setPage(1);
             clearSelection();
           }}
-          options={[
-            { value: 'managed', label: '受管' },
-            { value: 'all', label: '全部' },
-          ]}
         />
         <Segmented<StatusFilter>
           ariaLabel="按子容器运行状态筛选"
@@ -647,21 +740,6 @@ function ServicesView() {
             { value: 'stopped', label: '已停止' },
           ]}
         />
-        <Select
-          value={filters.policy}
-          onChange={(e) => {
-            setFilters((f) => ({ ...f, policy: e.target.value as ServiceFilters['policy'] }));
-            setPage(1);
-            clearSelection();
-          }}
-          aria-label="按子容器策略筛选"
-        >
-          <option value="">全部策略</option>
-          <option value="ignore">忽略</option>
-          <option value="notify">通知</option>
-          <option value="manual">手动</option>
-          <option value="auto">自动</option>
-        </Select>
         <Select
           value={filters.server}
           onChange={(e) => {
@@ -699,56 +777,72 @@ function ServicesView() {
         </span>
       </div>
 
+      {view === 'unexcluded' && <PendingSyncHint count={pendingSyncTotal} />}
+      {view === 'excluded' && (
+        <div className="rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] px-3 py-2 text-[12px] text-[var(--color-text-secondary)]">
+          已排除子容器只读；确认排除的父服务展示全部子容器上下文。调整配置并重启、同步后解除。
+        </div>
+      )}
+
       <FeedbackArea batch={batchRunner.result} lines={feedbackLines} />
 
       <div className="flex flex-wrap items-center gap-3 text-[13px]">
-        <label className="flex items-center gap-1.5">
-          <input
-            type="checkbox"
-            aria-label="全选当前页子容器"
-            checked={pageSelection === 'all'}
-            ref={(el) => {
-              if (el != null) el.indeterminate = pageSelection === 'some';
-            }}
-            onChange={(e) => togglePageAll(e.target.checked)}
-          />
-          全选本页（{pageSelectable.length} 项）
-        </label>
-        {selected.length > 0 && (
-          <span className="flex flex-wrap items-center gap-2">
-            已选 {selected.length} 项子容器：
-            <Button
-              variant="ghost"
-              disabled={batchRunner.busy}
-              onClick={() => setPendingBatch({ kind: 'check' })}
-            >
-              检查更新
-            </Button>
-            <Button
-              variant="outline"
-              disabled={batchRunner.busy}
-              title="跳过预览，直接按最新观察到的摘要提交更新"
-              onClick={() => setPendingBatch({ kind: 'update' })}
-            >
-              执行更新
-            </Button>
-            <Select
-              value=""
-              aria-label="批量设置策略"
-              className="!w-auto"
-              disabled={batchRunner.busy}
-              onChange={(e) => {
-                const v = e.target.value as Policy | '';
-                if (v !== '') setPendingBatch({ kind: 'policy', policy: v });
-              }}
-            >
-              <option value="">设置策略…</option>
-              <option value="ignore">忽略</option>
-              <option value="notify">通知</option>
-              <option value="manual">手动</option>
-              <option value="auto">自动</option>
-            </Select>
-          </span>
+        {!readOnly && (
+          <>
+            <label className="flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                aria-label="全选当前页子容器"
+                checked={pageSelection === 'all'}
+                ref={(el) => {
+                  if (el != null) el.indeterminate = pageSelection === 'some';
+                }}
+                onChange={(e) => togglePageAll(e.target.checked)}
+              />
+              全选本页（{pageSelectable.length} 项）
+            </label>
+            {selected.length > 0 && (
+              <span className="flex flex-wrap items-center gap-2">
+                已选 {selected.length} 项子容器：
+                <Button
+                  variant="ghost"
+                  disabled={batchRunner.busy}
+                  onClick={() => setPendingBatch({ kind: 'check' })}
+                >
+                  检查更新
+                </Button>
+                <Button
+                  variant="outline"
+                  disabled={batchRunner.busy}
+                  title="跳过预览，直接按最新观察到的摘要提交更新"
+                  onClick={() => setPendingBatch({ kind: 'update' })}
+                >
+                  执行更新
+                </Button>
+                <Select
+                  value=""
+                  aria-label="批量设置策略"
+                  className="!w-auto"
+                  disabled={batchRunner.busy}
+                  onChange={(e) => {
+                    const v = e.target.value as Policy | '';
+                    if (v !== '') setPendingBatch({ kind: 'policy', policy: v });
+                  }}
+                >
+                  <option value="">设置策略…</option>
+                  <option value="ignore">忽略</option>
+                  <option value="notify">通知</option>
+                  <option value="manual">手动</option>
+                  <option value="auto">自动</option>
+                </Select>
+              </span>
+            )}
+          </>
+        )}
+        {readOnly && selected.length > 0 && (
+          <Button variant="ghost" onClick={clearSelection}>
+            清除选择
+          </Button>
         )}
       </div>
 
@@ -766,6 +860,8 @@ function ServicesView() {
             <ServiceGroupSection
               key={fg.group.key}
               filtered={fg}
+              view={view}
+              summaryChildren={fullChildrenByKey.get(fg.group.key) ?? fg.group.children}
               expanded={expanded.has(fg.group.key)}
               onToggleExpand={toggleExpand}
               selected={selected}
@@ -805,7 +901,15 @@ function ServicesView() {
             <Button variant="ghost" onClick={() => setPendingBatch(null)}>
               取消
             </Button>
-            <Button variant="accent" disabled={batchRunner.busy} onClick={confirmBatch}>
+            <Button
+              variant="accent"
+              disabled={
+                batchRunner.busy ||
+                (pendingBatch?.kind === 'policy' &&
+                  selectedRows.filter((r) => !isConfigReadOnly(r)).length === 0)
+              }
+              onClick={confirmBatch}
+            >
               确认执行
             </Button>
           </>
@@ -847,11 +951,20 @@ function ServicesView() {
         {pendingBatch?.kind === 'policy' && (
           <>
             <p>
-              将把 {selectedRows.length} 项子容器的策略设置为「
+              将把 {selectedRows.filter((r) => !isConfigReadOnly(r)).length}
+              项子容器的策略设置为「
               {POLICY_LABEL[pendingBatch.policy]}
               」。
             </p>
-            <p className="text-[12px]">{previewNames(selectedRows)}</p>
+            <p className="text-[12px]">
+              {previewNames(selectedRows.filter((r) => !isConfigReadOnly(r)))}
+            </p>
+            {selectedRows.some((r) => isConfigReadOnly(r)) && (
+              <p className="text-[12px]">
+                跳过 {selectedRows.filter((r) => isConfigReadOnly(r)).length}{' '}
+                项受限子容器（待同步确认/已排除/镜像问题，配置只读）。
+              </p>
+            )}
           </>
         )}
       </Modal>
@@ -861,6 +974,9 @@ function ServicesView() {
 
 interface ServiceGroupSectionProps {
   filtered: FilteredServiceGroup;
+  view: ExclusionView;
+  /** 完整 active 子容器（未投影），用于组摘要。 */
+  summaryChildren: ResourceDTO[];
   expanded: boolean;
   onToggleExpand: (key: string) => void;
   selected: number[];
@@ -874,6 +990,8 @@ interface ServiceGroupSectionProps {
 
 function ServiceGroupSection({
   filtered,
+  view,
+  summaryChildren,
   expanded,
   onToggleExpand,
   selected,
@@ -886,8 +1004,12 @@ function ServiceGroupSection({
 }: ServiceGroupSectionProps) {
   const { group, visibleChildren } = filtered;
   const parent = group.parent;
-  const summary = groupSummary(group.children);
-  const groupSelectableIds = group.orphan ? [] : visibleChildren.map((c) => c.id);
+  const summary = groupSummary(summaryChildren);
+  // 选择集只用当前页可见且可操作集合：排除视图/排除子项不参与。
+  const groupSelectableIds =
+    group.orphan || view === 'excluded'
+      ? []
+      : visibleChildren.filter((c) => !isConfigExcluded(c)).map((c) => c.id);
   const groupSelection = selectionState(groupSelectableIds, selected);
   const bodyId = `svc-body-${group.key}`;
   const name = parent?.name ?? group.parentName ?? '未知服务';
@@ -918,7 +1040,7 @@ function ServiceGroupSection({
         <input
           type="checkbox"
           aria-label={`选择服务 ${name} 的全部子容器`}
-          disabled={group.orphan}
+          disabled={group.orphan || groupSelectableIds.length === 0}
           checked={groupSelection === 'all'}
           ref={(el) => {
             if (el != null) el.indeterminate = groupSelection === 'some';
@@ -952,6 +1074,10 @@ function ServiceGroupSection({
           {parent?.serverName ?? '—'}
           {parent?.projectName != null && ` · ${parent.projectName}`}
         </span>
+        {view === 'excluded' &&
+          parent != null &&
+          !isConfigExcluded(parent) &&
+          visibleChildren.length > 0 && <Badge tone="neutral">部分子容器已排除</Badge>}
         <span className="ml-auto flex flex-wrap items-center gap-1 text-[12px]">
           <span className="text-[var(--color-text-muted)]">子容器</span>
           <Badge>
@@ -964,6 +1090,8 @@ function ServiceGroupSection({
           <Badge tone={summary.attention > 0 ? 'danger' : 'neutral'}>
             待配置/受阻 {summary.attention}
           </Badge>
+          {summary.excluded > 0 && <Badge>已排除 {summary.excluded}</Badge>}
+          {summary.pendingSync > 0 && <Badge tone="warning">待同步 {summary.pendingSync}</Badge>}
           {group.orphan && orphanParentId != null && (
             <Button
               variant="ghost"

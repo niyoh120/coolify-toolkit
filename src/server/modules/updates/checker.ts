@@ -17,6 +17,8 @@ import {
   type tagLastPushedAt,
 } from '../../integrations/registry/adapter.js';
 import { shortDigest } from '../fingerprint.js';
+import { effectiveManagementGate } from '../inventory/management-state.js';
+import { parentRowOf } from '../inventory/parent-row.js';
 import type { Outbox } from '../notifications/outbox.js';
 import type { JobsService } from './jobs.js';
 
@@ -94,23 +96,40 @@ export class UpdateChecker {
 
   /**
    * 资格判断与阻塞提示共用同一逻辑：返回 null 表示可检查，否则给出明确的
-   * 阻塞原因。checkResource 与 checkAll 的过滤都经由这里，避免口径漂移。
+   * 阻塞原因。顺序：分类待确认 → 配置排除（含父级继承） → 镜像问题 →
+   * 策略/外部修改 → track 级约束（tag/平台）。checkResource 与 checkAll
+   * 的过滤都经由这里，避免口径漂移。
    */
-  private eligibilityMessage(
-    resource: typeof resources.$inferSelect,
-    track: typeof imageTracks.$inferSelect,
-  ): string | null {
+  private coreBlockMessage(resource: typeof resources.$inferSelect): string | null {
     if (resource.status !== 'active') return '资源已移除';
-    if (resource.excludedInfra) return '已排除（基础设施）';
+    // 父级已确认排除同样视为继承受限，防止部分同步时子项资格落后。
+    const gate = effectiveManagementGate(
+      resource,
+      parentRowOf(this.db, resource),
+      resource.currentImage,
+    );
+    if (!gate.ok) return gate.reason;
     // Ignored resources get no checks at all. manual 策略允许手动检查
     // （定时扫描由 checkAll 的策略过滤负责排除）。
     if (resource.policy === 'ignore') return '忽略策略的资源不检查更新';
     if (resource.blockedReason === 'external_change') return '外部修改，需重新确认';
+    return null;
+  }
+
+  /** track 级约束：仅在有追踪行时才有意义。 */
+  private trackBlockMessage(track: typeof imageTracks.$inferSelect): string | null {
     if (track.sourceTag === '') return '追踪 tag 待配置'; // tracking tag must be configured first
     if (track.targetPlatform == null || track.targetPlatform === '') {
       return '目标平台待配置'; // platform must be verifiable
     }
     return null;
+  }
+
+  private eligibilityMessage(
+    resource: typeof resources.$inferSelect,
+    track: typeof imageTracks.$inferSelect,
+  ): string | null {
+    return this.coreBlockMessage(resource) ?? this.trackBlockMessage(track);
   }
 
   private eligible(
@@ -122,12 +141,7 @@ export class UpdateChecker {
 
   async checkResource(resourceId: number, reason: 'scheduled' | 'manual'): Promise<CheckResult> {
     const resource = this.db.select().from(resources).where(eq(resources.id, resourceId)).get();
-    const track = this.db
-      .select()
-      .from(imageTracks)
-      .where(eq(imageTracks.resourceId, resourceId))
-      .get();
-    if (resource == null || track == null) {
+    if (resource == null) {
       return {
         resourceId,
         outcome: 'error',
@@ -136,7 +150,33 @@ export class UpdateChecker {
         message: 'resource/track missing',
       };
     }
-    const blockedMessage = this.eligibilityMessage(resource, track);
+    // 明确业务阻塞（待确认/排除/镜像问题/策略）优先于 track 缺失：
+    // 镜像异常时本就无追踪，保持 HTTP 200 + outcome=blocked 协议。
+    const coreBlocked = this.coreBlockMessage(resource);
+    if (coreBlocked != null) {
+      return {
+        resourceId,
+        outcome: 'blocked',
+        observedDigest: null,
+        candidate: false,
+        message: coreBlocked,
+      };
+    }
+    const track = this.db
+      .select()
+      .from(imageTracks)
+      .where(eq(imageTracks.resourceId, resourceId))
+      .get();
+    if (track == null) {
+      return {
+        resourceId,
+        outcome: 'error',
+        observedDigest: null,
+        candidate: false,
+        message: 'resource/track missing',
+      };
+    }
+    const blockedMessage = this.trackBlockMessage(track);
     if (blockedMessage != null) {
       return {
         resourceId,

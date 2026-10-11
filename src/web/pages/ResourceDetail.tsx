@@ -10,6 +10,7 @@ import {
   CoolifyLinkButton,
   DeployBadge,
   JobStatusBadge,
+  ManagementBadge,
   POLICY_LABEL,
   registryTagsUrl,
   shortDigest,
@@ -28,7 +29,14 @@ import {
   Select,
 } from '../components/ui.js';
 import { api, type Policy, type PreviewResult } from '../lib/api.js';
-import { checkBlockedHint, checkOutcomeFeedback, type FeedbackTone } from '../lib/resource-view.js';
+import {
+  checkBlockedHint,
+  checkOutcomeFeedback,
+  type FeedbackTone,
+  isConfigReadOnly,
+  managementReason,
+  managementReasonDetail,
+} from '../lib/resource-view.js';
 import { useRefresh, useRouter } from '../main.js';
 import { ServiceDetail } from './ServiceDetail.js';
 
@@ -103,6 +111,9 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
 
   const track = resource.track;
   const checkHint = checkBlockedHint(resource);
+  const readOnly = isConfigReadOnly(resource);
+  const reason = managementReason(resource);
+  const reasonDetail = managementReasonDetail(resource);
   const parentResourceId =
     resource.kind === 'service_application' ? resource.parentResourceId : null;
 
@@ -133,6 +144,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
           <CheckBadge track={track} />
           <DeployBadge track={track} />
           <BlockedBadge blockedReason={resource.blockedReason} />
+          <ManagementBadge resource={resource} />
           <Badge
             tone={
               resource.policy === 'auto'
@@ -141,11 +153,28 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
                   ? 'info'
                   : 'neutral'
             }
+            title={readOnly ? '当前管理受限，已保存策略暂停生效' : undefined}
           >
-            {POLICY_LABEL[resource.policy]}
+            {readOnly
+              ? `已保存策略：${POLICY_LABEL[resource.policy]}（当前暂停）`
+              : POLICY_LABEL[resource.policy]}
           </Badge>
         </div>
       </div>
+
+      {reason != null && reasonDetail != null && (
+        <div
+          role="note"
+          className={`rounded border px-3 py-2 text-[12px] ${
+            resource.blockedReason === 'external_change'
+              ? 'border-[var(--color-warning)]/40 bg-[var(--color-warning)]/5 text-[var(--color-warning)]'
+              : 'border-[var(--color-info)]/40 bg-[var(--color-info)]/5 text-[var(--color-info)]'
+          }`}
+        >
+          <div className="font-medium">{reason}</div>
+          <div className="pt-0.5">{reasonDetail}</div>
+        </div>
+      )}
 
       <Card>
         <CardHeader
@@ -180,7 +209,18 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
           <div className="grid gap-x-4 gap-y-3 sm:grid-cols-2 lg:grid-cols-4">
             <div className="sm:col-span-2 lg:col-span-4">
               <span className="text-[11px] text-[var(--color-text-muted)]">镜像</span>
-              <div className="mono break-all text-[12px]">{resource.currentImage ?? '—'}</div>
+              <div className="mono break-all text-[12px]">
+                {resource.currentImage != null ? (
+                  <Mono copyable>{resource.currentImage}</Mono>
+                ) : (
+                  '—'
+                )}
+              </div>
+              {track == null && (
+                <div className="pt-1 text-[11px] text-[var(--color-text-muted)]">
+                  尚未建立追踪{reason != null && `（${reason}）`}；镜像修复并同步后自动建立。
+                </div>
+              )}
             </div>
             <div className="flex flex-col">
               <span className="text-[11px] text-[var(--color-text-muted)]">目标平台</span>
@@ -205,6 +245,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
                 id="edit-source-tag"
                 value={sourceTag ?? track?.sourceTag ?? ''}
                 placeholder="latest / main / 4"
+                disabled={readOnly}
                 onChange={(e) => setSourceTag(e.target.value)}
               />
             </label>
@@ -218,7 +259,8 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
                     p.checkCron = checkCron === '' ? null : checkCron;
                   if (Object.keys(p).length > 0) patch.mutate(p);
                 }}
-                disabled={patch.isPending}
+                disabled={readOnly || patch.isPending}
+                title={readOnly ? '当前管理受限，配置只读' : undefined}
               >
                 保存
               </Button>
@@ -251,31 +293,42 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
                 value={checkCron ?? resource.checkCron ?? ''}
                 placeholder="全局默认"
                 className="mono max-w-[280px]"
+                disabled={readOnly}
                 onChange={(e) => setCheckCron(e.target.value)}
               />
             </label>
             <div className="col-span-full flex flex-col gap-1 text-[12px] text-[var(--color-text-secondary)]">
               <span className="text-[11px] text-[var(--color-text-muted)]">策略</span>
-              <Select
-                value={resource.policy}
-                aria-label="策略"
-                className="!w-40"
-                onChange={(e) => patch.mutate({ policy: e.target.value as Policy })}
-              >
-                <option value="ignore">忽略</option>
-                <option value="notify">通知</option>
-                <option value="manual">手动</option>
-                <option value="auto">自动</option>
-              </Select>
+              {readOnly ? (
+                <span title="当前管理受限，策略只读">{POLICY_LABEL[resource.policy]}（只读）</span>
+              ) : (
+                <Select
+                  value={resource.policy}
+                  aria-label="策略"
+                  className="!w-40"
+                  onChange={(e) => patch.mutate({ policy: e.target.value as Policy })}
+                >
+                  <option value="ignore">忽略</option>
+                  <option value="notify">通知</option>
+                  <option value="manual">手动</option>
+                  <option value="auto">自动</option>
+                </Select>
+              )}
             </div>
           </div>
-          {resource.blockedReason === 'external_change' && (
+          {patch.isError && (
+            <div role="alert" className="text-[12px] text-[var(--color-danger)]">
+              本次保存未完成：{patch.error instanceof Error ? patch.error.message : '请求错误'}。
+              状态已刷新，请核对后重试。
+            </div>
+          )}
+          {resource.blockedReason === 'external_change' && !readOnly && (
             <div className="rounded border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/5 px-3 py-2 text-[12px] text-[var(--color-warning)]">
               检测到 Coolify
               中的镜像引用被外部修改。核对上方当前镜像与追踪来源，修正后点击「保存」解除阻塞。
             </div>
           )}
-          {track?.view.checkOutcome === 'unfixed' && (
+          {track?.view.checkOutcome === 'unfixed' && !readOnly && (
             <div className="rounded border border-[var(--color-info)]/40 bg-[var(--color-info)]/5 px-3 py-2 text-[12px] text-[var(--color-info)]">
               该资源尚未初始化，下次检查（定时或手动「检查更新」）将自动创建初始化任务；也可通过
               「预览更新 → 确认更新」立即执行。
@@ -287,11 +340,17 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
       <Card>
         <CardHeader title="更新" />
         <CardBody className="flex flex-col gap-3">
+          {readOnly && (
+            <div className="text-[12px] text-[var(--color-text-muted)]">
+              当前资源管理受限（{reason}），更新操作已停用；核对 Coolify 配置并同步后恢复。
+            </div>
+          )}
           <div className="flex flex-wrap gap-2">
             <Button
               variant="outline"
               onClick={() => previewMut.mutate()}
-              disabled={previewMut.isPending}
+              disabled={readOnly || previewMut.isPending}
+              title={readOnly ? '当前管理受限' : undefined}
             >
               预览更新
             </Button>
@@ -343,10 +402,24 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
 
 function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): ReactNode {
   const refresh = useRefresh();
-  const retry = useMutation({ mutationFn: () => api.retryJob(job.id), onSuccess: refresh });
+  const [actionError, setActionError] = useState<string | null>(null);
+  const retry = useMutation({
+    mutationFn: () => api.retryJob(job.id),
+    onSuccess: () => {
+      setActionError(null);
+      refresh();
+    },
+    onError: (e) =>
+      setActionError(`本次重试未执行：${e instanceof Error ? e.message : '请求错误'}`),
+  });
   const confirm = useMutation({
     mutationFn: () => api.confirmJob(job.id, job.candidateDigest),
-    onSuccess: refresh,
+    onSuccess: () => {
+      setActionError(null);
+      refresh();
+    },
+    onError: (e) =>
+      setActionError(`本次确认未完成：${e instanceof Error ? e.message : '请求错误'}`),
   });
   return (
     <div className="rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)]/40 px-3 py-2 text-[12px]">
@@ -388,6 +461,11 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
       {job.errorMessage != null && (
         <div className="pt-1 break-all text-[var(--color-danger)]">
           {job.errorCode}: {job.errorMessage}
+        </div>
+      )}
+      {actionError != null && (
+        <div role="alert" className="pt-1 text-[var(--color-danger)]">
+          {actionError}
         </div>
       )}
       {job.log.length > 0 && (

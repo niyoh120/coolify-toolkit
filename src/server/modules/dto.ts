@@ -3,12 +3,40 @@
 import type {
   CheckOutcome,
   DeployState,
+  ImageIssue,
+  ImageIssueCode,
   ResourceDTO,
   TrackDTO,
   TrackView,
 } from '../../shared/types.js';
 import type { ImageTrackRow, ResourceRow, UpdateJobRow } from '../db/schema.js';
 import { shortDigest } from './fingerprint.js';
+import { registryHintOf } from './inventory/management-state.js';
+
+/** Caller-supplied context for exclusion attribution and parent explanation. */
+export interface ResourceDTOContext {
+  /** Config UUID exclusion list; used to attribute self vs inherited exclusion. */
+  excludedUuids?: string[];
+  /** Parent row's excludedInfra when the resource has a local parent row. */
+  parentExcluded?: boolean | null;
+}
+
+/**
+ * Why the resource is config-excluded, per plan §1:
+ * unclassified rows have no confirmed source (null); classified rows use the
+ * config UUID list and the local parent row to explain inheritance.
+ */
+function exclusionSourceOf(
+  resource: ResourceRow,
+  ctx: ResourceDTOContext,
+): 'self' | 'parent' | null {
+  if (!resource.managementClassified || !resource.excludedInfra) return null;
+  if (ctx.excludedUuids?.includes(resource.coolifyUuid) === true) return 'self';
+  if (ctx.parentExcluded === true) return 'parent';
+  // Excluded without an identifiable source: attribute to the UUID list
+  // (parent rows may be gone) — the conservative display choice.
+  return 'self';
+}
 
 export function deriveTrackView(
   track: ImageTrackRow,
@@ -78,8 +106,16 @@ export function resourceToDTO(
   track: ImageTrackRow | null,
   latestJob: UpdateJobRow | null,
   awaitingJob: UpdateJobRow | null,
+  ctx: ResourceDTOContext = {},
 ): ResourceDTO {
   const view = track != null ? deriveTrackView(track, latestJob, awaitingJob) : null;
+  const imageIssue: ImageIssue | null =
+    resource.imageIssue != null
+      ? {
+          code: resource.imageIssue as ImageIssueCode,
+          registry: registryHintOf(resource.currentImage),
+        }
+      : null;
   return {
     id: resource.id,
     kind: resource.kind,
@@ -103,6 +139,9 @@ export function resourceToDTO(
     blockedReason: (resource.blockedReason ?? null) as ResourceDTO['blockedReason'],
     excludedInfra: resource.excludedInfra,
     isStopped: resource.isStopped,
+    managementClassified: resource.managementClassified,
+    imageIssue,
+    exclusionSource: exclusionSourceOf(resource, ctx),
     lastSyncedAt:
       resource.lastSyncedAt != null ? new Date(resource.lastSyncedAt).toISOString() : null,
     updatedAt: resource.updatedAt != null ? new Date(resource.updatedAt).toISOString() : null,

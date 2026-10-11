@@ -20,6 +20,23 @@ export type BlockReason =
 /** Kind of the top-level reference a digest was computed from. */
 export type ReferenceKind = 'index' | 'manifest';
 
+/**
+ * Structured image classification problems, written exclusively by the normal
+ * inventory sync. null = the reference parsed cleanly (or none was expected).
+ */
+export type ImageIssueCode =
+  | 'missing_image' // resource carries no image reference at all
+  | 'unsupported_registry' // registry host outside the supported set
+  | 'unresolved_variable' // compose variable ($VAR / ${VAR...}) never expanded
+  | 'invalid_reference'; // present but structurally invalid
+
+/** Safe diagnostic info for an image problem; never carries credentials. */
+export interface ImageIssue {
+  code: ImageIssueCode;
+  /** Registry host embedded in the raw reference (e.g. "gcr.io"); else null. */
+  registry: string | null;
+}
+
 export type CheckOutcome = 'matching' | 'candidate' | 'unfixed' | 'error' | 'blocked';
 
 export type JobStatus =
@@ -92,6 +109,20 @@ export interface ResourceDTO {
   blockedReason: BlockReason;
   excludedInfra: boolean;
   isStopped: boolean;
+  /**
+   * true = the row has been classified by the normal sync rules; excludedInfra
+   * then means pure config exclusion (self UUID or parent service UUID).
+   * false = legacy row awaiting its first classified sync ("待同步确认");
+   * excludedInfra keeps historical information only.
+   */
+  managementClassified: boolean;
+  /** Structured image problem; null = parseable (or pending classification). */
+  imageIssue: ImageIssue | null;
+  /**
+   * Why the resource is excluded: own UUID hit, inherited from the parent
+   * service, or null when excluded is false / classification is pending.
+   */
+  exclusionSource: 'self' | 'parent' | null;
   lastSyncedAt: string | null;
   updatedAt: string | null;
   /** null when the resource cannot carry a track (compose_service parent). */

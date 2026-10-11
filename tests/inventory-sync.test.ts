@@ -384,7 +384,7 @@ describe('external_change hygiene (registry-field round)', () => {
     expect(track?.sourceTag).toBe('latest');
   });
 
-  it('leaves blocked_reason null when the image is unparseable at creation', async () => {
+  it('classifies a missing image as imageIssue, excludedInfra stays config-only', async () => {
     const app = APP({
       docker_image: null,
       docker_image_tag: null,
@@ -395,7 +395,10 @@ describe('external_change hygiene (registry-field round)', () => {
     await sync.run();
     const row = handle.db.select().from(resources).where(eq(resources.coolifyUuid, 'app-1')).get();
     expect(row?.blockedReason).toBeNull();
-    expect(row?.excludedInfra).toBe(true);
+    // 旧语义把无法解析的镜像合并进 excludedInfra；现在配置排除与镜像问题分离。
+    expect(row?.excludedInfra).toBe(false);
+    expect(row?.managementClassified).toBe(true);
+    expect(row?.imageIssue).toBe('missing_image');
   });
 
   it('heals a stale external_change once the reference matches the tracked tag again', async () => {
@@ -418,6 +421,150 @@ describe('external_change hygiene (registry-field round)', () => {
     expect(r.externalChanges).toBe(0);
     row = handle.db.select().from(resources).where(eq(resources.coolifyUuid, 'app-1')).get();
     expect(row?.blockedReason).toBeNull();
+  });
+});
+
+describe('management classification in sync', () => {
+  const cases: Array<{
+    name: string;
+    image: string | null;
+    expectedIssue: string | null;
+  }> = [
+    { name: 'valid docker hub ref', image: 'nginx:1.27', expectedIssue: null },
+    { name: 'valid digest ref', image: `nginx@sha256:${'a'.repeat(64)}`, expectedIssue: null },
+    {
+      name: 'unsupported registry',
+      image: 'gcr.io/proj/chrome:latest',
+      expectedIssue: 'unsupported_registry',
+    },
+    { name: 'unresolved $VAR', image: '$CHROME_IMAGE', expectedIssue: 'unresolved_variable' },
+    {
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: 字面量测试数据
+      name: 'unresolved ${VAR:-default}',
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: 字面量测试数据
+      image: '${HUGO_IMAGE:-hugo:latest}',
+      expectedIssue: 'unresolved_variable',
+    },
+    { name: 'missing image', image: null, expectedIssue: 'missing_image' },
+    {
+      name: 'invalid digest',
+      image: `nginx@sha256:${'zz'.repeat(32)}`,
+      expectedIssue: 'invalid_reference',
+    },
+  ];
+  for (const c of cases) {
+    it(`classifies application image: ${c.name}`, async () => {
+      const app = APP({
+        uuid: 'cls-app',
+        docker_image: null,
+        docker_image_tag: null,
+        docker_registry_image_name: c.image,
+        docker_registry_image_tag: c.image == null ? null : null,
+        ...(c.image != null && !c.image.includes('/')
+          ? { docker_registry_image_name: c.image }
+          : {}),
+      });
+      // 直接用 applicationImageRef 的经典字段构造镜像串。
+      const classic = APP({
+        uuid: 'cls-app',
+        docker_image: c.image,
+        docker_image_tag: c.image != null ? null : null,
+      });
+      void app;
+      sync = new InventorySync(handle.db, stubCoolify([classic], [], []), cfg, settings);
+      await sync.run();
+      const row = handle.db
+        .select()
+        .from(resources)
+        .where(eq(resources.coolifyUuid, 'cls-app'))
+        .get();
+      expect(row?.managementClassified).toBe(true);
+      expect(row?.imageIssue).toBe(c.expectedIssue);
+      expect(row?.excludedInfra).toBe(false);
+    });
+  }
+
+  it('tracks issues and exclusions independently (both present)', async () => {
+    cfg = { ...cfg, excludedUuids: ['cls-app'] };
+    const app = APP({
+      uuid: 'cls-app',
+      docker_image: 'gcr.io/proj/chrome',
+      docker_image_tag: 'latest',
+    });
+    sync = new InventorySync(handle.db, stubCoolify([app], [], []), cfg, settings);
+    await sync.run();
+    const row = handle.db
+      .select()
+      .from(resources)
+      .where(eq(resources.coolifyUuid, 'cls-app'))
+      .get();
+    expect(row?.excludedInfra).toBe(true);
+    expect(row?.imageIssue).toBe('unsupported_registry');
+    expect(row?.managementClassified).toBe(true);
+  });
+
+  it('parent services stay classified with no image issue; children inherit exclusions', async () => {
+    cfg = { ...cfg, excludedUuids: ['svc-cls'] };
+    const svc = SVC({ uuid: 'svc-cls' });
+    sync = new InventorySync(handle.db, stubCoolify([], [svc], [CHILD()]), cfg, settings);
+    await sync.run();
+    const parent = handle.db
+      .select()
+      .from(resources)
+      .where(eq(resources.coolifyUuid, 'svc-cls'))
+      .get();
+    expect(parent).toMatchObject({
+      kind: 'compose_service',
+      managementClassified: true,
+      imageIssue: null,
+      excludedInfra: true,
+    });
+    const child = handle.db
+      .select()
+      .from(resources)
+      .where(eq(resources.coolifyUuid, 'child-1'))
+      .get();
+    expect(child).toMatchObject({
+      managementClassified: true,
+      imageIssue: null,
+      excludedInfra: true, // inherited from the parent uuid
+    });
+  });
+
+  it('clears a healed image issue on the next sync and keeps the classified state', async () => {
+    sync = new InventorySync(
+      handle.db,
+      stubCoolify([APP({ docker_image: 'gcr.io/proj/chrome' })], [], []),
+      cfg,
+      settings,
+    );
+    await sync.run();
+    let row = handle.db.select().from(resources).where(eq(resources.coolifyUuid, 'app-1')).get();
+    expect(row?.imageIssue).toBe('unsupported_registry');
+
+    // Image fixed in Coolify: next sync resolves it and clears the issue.
+    sync = new InventorySync(handle.db, stubCoolify([APP()], [], []), cfg, settings);
+    await sync.run();
+    row = handle.db.select().from(resources).where(eq(resources.coolifyUuid, 'app-1')).get();
+    expect(row?.imageIssue).toBeNull();
+    expect(row?.managementClassified).toBe(true);
+    const track = handle.db
+      .select()
+      .from(imageTracks)
+      .where(eq(imageTracks.resourceId, row!.id))
+      .get();
+    expect(track?.sourceRepository).toBe('jellyfin/jellyfin');
+  });
+
+  it('keeps a daily restart from reclassifying classified rows', async () => {
+    sync = new InventorySync(handle.db, stubCoolify([APP()], [], []), cfg, settings);
+    await sync.run();
+    // Second sync sees the same image: classification stays stable.
+    sync = new InventorySync(handle.db, stubCoolify([APP()], [], []), cfg, settings);
+    await sync.run();
+    const row = handle.db.select().from(resources).where(eq(resources.coolifyUuid, 'app-1')).get();
+    expect(row?.managementClassified).toBe(true);
+    expect(row?.imageIssue).toBeNull();
   });
 });
 

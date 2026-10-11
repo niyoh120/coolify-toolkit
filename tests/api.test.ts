@@ -36,6 +36,7 @@ beforeEach(async () => {
       name: 'app',
       policy: 'notify',
       configFingerprint: 'fp',
+      managementClassified: true,
       lastSyncedAt: now,
       createdAt: now,
       updatedAt: now,
@@ -260,6 +261,7 @@ describe('api', () => {
             policy: row.policy ?? 'ignore',
             status: row.status ?? 'active',
             configFingerprint: 'fp',
+            managementClassified: true,
             lastSyncedAt: now,
             createdAt: now,
             updatedAt: now,
@@ -357,5 +359,230 @@ describe('api', () => {
       expect(names).toContain('web');
       expect(names).toContain('svc-a');
     });
+  });
+});
+
+describe('management guards (upgrade transition)', () => {
+  interface GuardSeed {
+    uuid: string;
+    kind?: 'application' | 'compose_service' | 'service_application';
+    parentId?: number;
+    managementClassified?: boolean;
+    excludedInfra?: boolean;
+    imageIssue?:
+      | 'missing_image'
+      | 'unsupported_registry'
+      | 'unresolved_variable'
+      | 'invalid_reference'
+      | null;
+    currentImage?: string | null;
+  }
+  const seedRow = (row: GuardSeed): number => {
+    const now = Date.now();
+    return h.db
+      .insert(resources)
+      .values({
+        kind: row.kind ?? 'application',
+        coolifyUuid: row.uuid,
+        name: row.uuid,
+        parentId: row.parentId ?? null,
+        policy: 'notify',
+        configFingerprint: 'fp',
+        managementClassified: row.managementClassified ?? true,
+        excludedInfra: row.excludedInfra ?? false,
+        imageIssue: row.imageIssue ?? null,
+        currentImage: row.currentImage ?? null,
+        lastSyncedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning()
+      .get()!.id;
+  };
+
+  it('PATCH rejects pending / excluded / image-issue resources before any write', async () => {
+    const app = createApp(deps);
+    const pendingId = seedRow({ uuid: 'g-pending', managementClassified: false });
+    const excludedId = seedRow({ uuid: 'g-excluded', excludedInfra: true });
+    const issueId = seedRow({
+      uuid: 'g-issue',
+      imageIssue: 'unsupported_registry',
+      currentImage: 'gcr.io/proj/chrome',
+    });
+
+    for (const id of [pendingId, excludedId, issueId]) {
+      const res = await app.request(`/api/resources/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ policy: 'auto' }),
+      });
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: { code: string; message: string } };
+      expect(body.error.code).toBe('blocked');
+      expect(body.error.message.length).toBeGreaterThan(0);
+    }
+    // 零写入：策略保持原值。
+    const rows = h.db.select().from(resources).all();
+    expect(rows.every((r) => r.policy === 'notify')).toBe(true);
+  });
+
+  it('PATCH inherits parent exclusion when the child row has not caught up', async () => {
+    const app = createApp(deps);
+    const parentId = seedRow({ uuid: 'g-parent', kind: 'compose_service', excludedInfra: true });
+    const childId = seedRow({ uuid: 'g-child', kind: 'service_application', parentId });
+    const res = await app.request(`/api/resources/${childId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ policy: 'auto' }),
+    });
+    expect(res.status).toBe(409);
+  });
+
+  it('batch-policy is atomic: mixed eligibility rejects the whole batch with reasons', async () => {
+    const app = createApp(deps);
+    const okId = seedRow({ uuid: 'b-ok' });
+    const pendingId = seedRow({ uuid: 'b-pending', managementClassified: false });
+    const excludedId = seedRow({ uuid: 'b-excluded', excludedInfra: true });
+
+    const res = await app.request('/api/resources/batch-policy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resourceIds: [okId, pendingId, excludedId], policy: 'manual' }),
+    });
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as {
+      error: { details: { rejected: Array<{ resourceId: number; code: string; reason: string }> } };
+    };
+    const rejectedIds = body.error.details.rejected.map((r) => r.resourceId).sort();
+    expect(rejectedIds).toEqual([pendingId, excludedId].sort((a, b) => a - b));
+    expect(body.error.details.rejected.every((r) => r.reason.length > 0)).toBe(true);
+    // 整批失败：合法目标也保持原值。
+    expect(h.db.select().from(resources).where(eq(resources.id, okId)).get()?.policy).toBe(
+      'notify',
+    );
+
+    // 去重 + 全部合法：updated 为去重后的实际目标数。
+    const ok2 = await app.request('/api/resources/batch-policy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resourceIds: [okId, okId], policy: 'manual' }),
+    });
+    expect(ok2.status).toBe(200);
+    const ok2Body = (await ok2.json()) as { updated: number };
+    expect(ok2Body.updated).toBe(1);
+
+    // 含不存在 ID：整批 404，已有目标不改写。
+    const missing = await app.request('/api/resources/batch-policy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resourceIds: [okId, 999999], policy: 'auto' }),
+    });
+    expect(missing.status).toBe(404);
+    expect(h.db.select().from(resources).where(eq(resources.id, okId)).get()?.policy).toBe(
+      'manual',
+    );
+  });
+
+  it('preview and skipPreview refuse ineligible resources without issuing tokens', async () => {
+    const app = createApp(deps);
+    const pendingId = seedRow({ uuid: 'p-pending', managementClassified: false });
+    const r1 = await app.request(`/api/resources/${pendingId}/preview`, {
+      method: 'POST',
+      body: '{}',
+    });
+    expect(r1.status).toBe(409);
+
+    const issueId = seedRow({
+      uuid: 'p-issue',
+      imageIssue: 'unresolved_variable',
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: 字面量测试数据，故意包含 ${VAR}
+      currentImage: '${WEB_IMAGE}',
+    });
+    const r2 = await app.request(`/api/resources/${issueId}/preview`, {
+      method: 'POST',
+      body: '{}',
+    });
+    expect(r2.status).toBe(409);
+    const b2 = (await r2.json()) as { error: { message: string } };
+    expect(b2.error.message).toContain('镜像变量未解析');
+
+    const r3 = await app.request(`/api/resources/${pendingId}/update`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ skipPreview: true }),
+    });
+    expect(r3.status).toBe(409);
+    // 没有预览 token 被签发。
+    const metaKeys = h.db
+      .select()
+      .from(settings)
+      .all()
+      .map((s) => s.key);
+    expect(metaKeys.some((k) => k.startsWith('preview.'))).toBe(false);
+  });
+
+  it('overview stats follow classified eligibility (managed + candidates)', async () => {
+    const app = createApp(deps);
+    seedRow({ uuid: 'o-managed' }); // notify, eligible
+    seedRow({ uuid: 'o-pending', managementClassified: false });
+    seedRow({ uuid: 'o-excluded', excludedInfra: true });
+    seedRow({ uuid: 'o-issue', imageIssue: 'missing_image' });
+    seedRow({ uuid: 'o-ignored' });
+    h.db
+      .update(resources)
+      .set({ policy: 'ignore' })
+      .where(eq(resources.coolifyUuid, 'o-ignored'))
+      .run();
+    // 资格资源带候选追踪；待配置资源的候选不计入。
+    const now = Date.now();
+    const managedId = h.db
+      .select()
+      .from(resources)
+      .where(eq(resources.coolifyUuid, 'o-managed'))
+      .get()!.id;
+    h.db
+      .insert(imageTracks)
+      .values({
+        resourceId: managedId,
+        sourceRegistry: 'docker.io',
+        sourceRepository: 'jellyfin/jellyfin',
+        sourceRepositoryAuthored: 'jellyfin/jellyfin',
+        sourceTag: 'latest',
+        configuredDigest: `sha256:${'a'.repeat(64)}`,
+        observedDigest: `sha256:${'b'.repeat(64)}`,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+    const pendingRes = h.db
+      .select()
+      .from(resources)
+      .where(eq(resources.coolifyUuid, 'o-pending'))
+      .get()!;
+    h.db
+      .insert(imageTracks)
+      .values({
+        resourceId: pendingRes.id,
+        sourceRegistry: 'docker.io',
+        sourceRepository: 'jellyfin/jellyfin',
+        sourceRepositoryAuthored: 'jellyfin/jellyfin',
+        sourceTag: 'latest',
+        configuredDigest: `sha256:${'a'.repeat(64)}`,
+        observedDigest: `sha256:${'c'.repeat(64)}`,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+
+    const res = await app.request('/api/overview');
+    const body = (await res.json()) as {
+      resourcesTotal: number;
+      resourcesManaged: number;
+      candidates: number;
+    };
+    // beforeEach 的 app-1（notify、有候选）+ o-managed。
+    expect(body.resourcesTotal).toBe(6);
+    expect(body.resourcesManaged).toBe(2);
+    expect(body.candidates).toBe(2);
   });
 });

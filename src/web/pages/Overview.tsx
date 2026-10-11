@@ -26,7 +26,11 @@ export function OverviewPage() {
   if (data == null) return null;
 
   const tiles = [
-    { label: '资源总数', value: data.resourcesTotal },
+    {
+      label: '资源总数',
+      value: data.resourcesTotal,
+      hint: '含服务父记录、已排除及待同步确认资源',
+    },
     { label: '受管理资源', value: data.resourcesManaged },
     { label: '候选更新', value: data.candidates },
     { label: '失败 / 待处理', value: data.failures },
@@ -59,7 +63,17 @@ export function OverviewPage() {
           <Card key={t.label}>
             <CardBody className="py-3">
               <div className="text-[22px] font-semibold">{t.value}</div>
-              <div className="text-[12px] text-[var(--color-text-secondary)]">{t.label}</div>
+              <div
+                className="text-[12px] text-[var(--color-text-secondary)]"
+                title={'hint' in t ? t.hint : undefined}
+              >
+                {t.label}
+              </div>
+              {'hint' in t && t.hint != null && (
+                <div className="pt-0.5 text-[10px] leading-tight text-[var(--color-text-muted)]">
+                  {t.hint}
+                </div>
+              )}
             </CardBody>
           </Card>
         ))}

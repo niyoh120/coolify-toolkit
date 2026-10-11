@@ -33,16 +33,30 @@ export function HistoryPage() {
   const { navigate } = useRouter();
   const [status, setStatus] = useState('all');
   const [page, setPage] = useState(1);
+  const [actionError, setActionError] = useState<string | null>(null);
   const PAGE_SIZE = 20;
   const { data, isLoading, error } = useQuery({
     queryKey: ['jobs', status],
     queryFn: () => api.jobs(status),
     refetchInterval: 5_000,
   });
-  const retry = useMutation({ mutationFn: (id: number) => api.retryJob(id), onSuccess: refresh });
+  const retry = useMutation({
+    mutationFn: (id: number) => api.retryJob(id),
+    onSuccess: () => {
+      setActionError(null);
+      refresh();
+    },
+    onError: (e) =>
+      setActionError(`本次重试未执行：${e instanceof Error ? e.message : '请求错误'}`),
+  });
   const confirm = useMutation({
     mutationFn: (job: (typeof jobs)[number]) => api.confirmJob(job.id, job.candidateDigest),
-    onSuccess: refresh,
+    onSuccess: () => {
+      setActionError(null);
+      refresh();
+    },
+    onError: (e) =>
+      setActionError(`本次确认未完成：${e instanceof Error ? e.message : '请求错误'}`),
   });
 
   if (isLoading) return <Loading />;
@@ -53,6 +67,14 @@ export function HistoryPage() {
   return (
     <div className="flex flex-col gap-4">
       <ResourceTabsBar active="history" />
+      {actionError != null && (
+        <div
+          role="alert"
+          className="rounded border border-[var(--color-danger)]/40 bg-[var(--color-danger)]/5 px-3 py-2 text-[12px] text-[var(--color-danger)]"
+        >
+          {actionError}
+        </div>
+      )}
       <div className="flex flex-wrap items-center justify-end gap-2">
         <Select
           value={status}

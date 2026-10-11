@@ -54,6 +54,10 @@ function makeResource(overrides = {}) {
     blockedReason: null,
     excludedInfra: false,
     isStopped: false,
+    // fixture 代表「已同步资源」：显式已分类，默认值不掩盖真实状态。
+    managementClassified: true,
+    imageIssue: null,
+    exclusionSource: null,
     lastSyncedAt: '2025-05-01T07:00:00.000Z',
     updatedAt: '2025-05-01T07:30:00.000Z',
     track: null,
@@ -228,6 +232,7 @@ function buildState() {
         id: rid,
         name: 'edge-excluded',
         excludedInfra: true,
+        exclusionSource: 'self',
         policy: 'ignore',
         track: makeTrack(rid),
       }),
@@ -300,6 +305,47 @@ function buildState() {
             deployState: 'unknown',
           },
         }),
+      }),
+    );
+  }
+  {
+    const rid = id();
+    resources.push(
+      makeResource({
+        id: rid,
+        name: 'edge-pending-sync',
+        // 待同步确认：历史记录尚未分类，配置只读、默认视图可见。
+        managementClassified: false,
+        policy: 'notify',
+        track: makeTrack(rid),
+      }),
+    );
+  }
+  const pendingSyncRow = resources.find((r) => r.name === 'edge-pending-sync');
+  {
+    const rid = id();
+    resources.push(
+      makeResource({
+        id: rid,
+        name: 'edge-image-issue',
+        currentImage: 'gcr.io/fictional/chrome:latest',
+        imageIssue: { code: 'unsupported_registry', registry: 'gcr.io' },
+        policy: 'manual',
+        track: null,
+      }),
+    );
+  }
+  {
+    const rid = id();
+    resources.push(
+      makeResource({
+        id: rid,
+        name: 'edge-var-image',
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: 字面量测试数据
+        currentImage: '${WEB_IMAGE}',
+        imageIssue: { code: 'unresolved_variable', registry: null },
+        policy: 'manual',
+        track: null,
       }),
     );
   }
@@ -470,6 +516,19 @@ function buildState() {
       jobs.push(makeJob(id(), { resourceId: rid.id, resourceName: rid.name }));
     }
   }
+  // 待同步确认资源的 failed 任务：验证升级过渡期重试被 409 拒绝且给出可见反馈。
+  if (pendingSyncRow != null) {
+    jobs.push(
+      makeJob(id(), {
+        resourceId: pendingSyncRow.id,
+        resourceName: pendingSyncRow.name,
+        status: 'failed',
+        stage: 'deploy_submitted',
+        errorCode: 'deploy_timeout',
+        errorMessage: LONG_ERROR,
+      }),
+    );
+  }
 
   // --- notifications: 25 rows (>1 page), long titles/bodies/errors --------------
   const events = [
@@ -541,6 +600,9 @@ function buildState() {
     };
   };
 
+  // 真实后端任务列表按 id 倒序返回（desc update_jobs.id）；fixture 保持一致，
+  // 让最新种子任务（含待同步资源的 failed 任务）落在历史页第一页。
+  jobs.sort((a, b) => b.id - a.id);
   return { nextIdRef: { value: nextId }, resources, jobs, notifications, settings, overview };
 }
 
@@ -753,6 +815,17 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
       if (job == null)
         return send(res, 404, { error: { code: 'not_found', message: `job ${seg[2]} not found` } });
       if (seg[3] === 'retry' && method === 'POST') {
+        // 升级过渡守卫：待同步确认（未分类）资源的重试拒绝并返回 409，
+        // 与服务端 JobsService.retryJob 行为一致。
+        const owner = state.resources.find((r) => r.id === job.resourceId);
+        if (owner != null && owner.managementClassified === false) {
+          return send(res, 409, {
+            error: {
+              code: 'blocked',
+              message: '待同步确认：完成一次资源同步后才能确定管理状态',
+            },
+          });
+        }
         job.status = 'pending';
         job.stage = 'queued';
         job.attempts += 1;

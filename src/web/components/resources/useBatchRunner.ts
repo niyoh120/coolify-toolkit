@@ -4,7 +4,7 @@
 import { useMutation } from '@tanstack/react-query';
 import { useState } from 'react';
 import type { Policy } from '../../../shared/types.js';
-import { api } from '../../lib/api.js';
+import { ApiError, api } from '../../lib/api.js';
 import {
   type BatchCheckStats,
   type BatchUpdateStats,
@@ -126,8 +126,31 @@ export function useBatchRunner() {
   const runPolicy = async (ids: number[], policy: Policy): Promise<void> => {
     setBusy(true);
     try {
-      await api.batchPolicy(ids, policy);
-      setResult({ summary: `已将 ${ids.length} 项资源策略设置完成。`, detail: [] });
+      const res = await api.batchPolicy(ids, policy);
+      // 成功数来自 API（去重后的实际目标数），与提交数可能不同。
+      setResult({ summary: `已将 ${res.updated} 项资源策略设置完成。`, detail: [] });
+      refresh();
+    } catch (err) {
+      // 整批原子失败：展示「整批未保存」与逐项原因，策略保持原值。
+      const detail: FeedbackLine[] = [];
+      if (err instanceof ApiError && err.status === 409) {
+        const rejected =
+          (
+            err.details as
+              | { rejected?: Array<{ resourceId: number; name: string; reason: string }> }
+              | undefined
+          )?.rejected ?? [];
+        for (const r of rejected) {
+          detail.push({
+            id: nextFeedbackId(),
+            text: `${r.name || `#${r.resourceId}`}：${r.reason}`,
+          });
+        }
+      }
+      setResult({
+        summary: `策略整批未保存：${err instanceof Error ? err.message : '请求错误'}`,
+        detail,
+      });
       refresh();
     } finally {
       setBusy(false);

@@ -5,7 +5,7 @@
 // Failure keeps the written target config, pauses auto updates and notifies.
 // Rollback is explicitly out of scope (phase 1).
 
-import { asc, eq } from 'drizzle-orm';
+import { and, asc, eq, isNotNull, or } from 'drizzle-orm';
 import type { AppConfig } from '../../config.js';
 import type { Db } from '../../db/client.js';
 import type { ImageTrackRow, ResourceRow, UpdateJobRow } from '../../db/schema.js';
@@ -15,6 +15,8 @@ import type { CoolifyClient } from '../../integrations/coolify/client.js';
 import { CoolifyApiError } from '../../integrations/coolify/client.js';
 import { applicationImageRef, applicationTagField } from '../../integrations/coolify/mapper.js';
 import { coolifyDigestTag, normalizeReference } from '../../integrations/registry/reference.js';
+import { effectiveManagementGate } from '../inventory/management-state.js';
+import { parentRowOf } from '../inventory/parent-row.js';
 import type { Outbox } from '../notifications/outbox.js';
 import type { JobsService } from './jobs.js';
 
@@ -89,12 +91,28 @@ export class UpdateExecutor {
     return processed;
   }
 
-  /** Pick the next pending job whose resource/parent has no active job. */
+  /**
+   * Pick the next pending job whose resource/parent has no active job.
+   *
+   * Queue safety over unclassified databases: pending jobs of not-yet-
+   * classified resources without a submitted deployment stay pending (the
+   * filter is in SQL so waiting items cannot starve later claimable ones);
+   * pending jobs whose resource classified into an ineligible state are
+   * marked blocked with the concrete reason instead of executing.
+   */
   private claimNext(): UpdateJobRow | null {
     const pending = this.db
-      .select()
+      .select({ job: updateJobs, res: resources })
       .from(updateJobs)
-      .where(eq(updateJobs.status, 'pending'))
+      .innerJoin(resources, eq(resources.id, updateJobs.resourceId))
+      .where(
+        and(
+          eq(updateJobs.status, 'pending'),
+          // 待同步确认且未提交部署的任务保持 pending，等同步后重判资格；
+          // 已提交部署的任务走证据恢复路径，与分类状态无关。
+          or(isNotNull(updateJobs.deploymentUuid), eq(resources.managementClassified, true)),
+        ),
+      )
       .orderBy(asc(updateJobs.id))
       .limit(50)
       .all();
@@ -111,10 +129,18 @@ export class UpdateExecutor {
     }
     const concurrency = this.cfg.deployConcurrency;
     if (executing.length >= concurrency) return null;
-    for (const job of pending) {
+    for (const { job, res } of pending) {
       if ((activeByResource.get(job.resourceId) ?? 0) > 0) continue;
-      const res = this.db.select().from(resources).where(eq(resources.id, job.resourceId)).get();
-      if (res?.parentId != null && activeParents.has(res.parentId)) continue;
+      if (res.parentId != null && activeParents.has(res.parentId)) continue;
+      // 已分类但确认为配置排除/镜像异常（或父级继承受限）的排队任务：
+      // 记录 blocked 与原因，继续扫描后续候选。
+      if (res.managementClassified) {
+        const gate = effectiveManagementGate(res, parentRowOf(this.db, res), res.currentImage);
+        if (!gate.ok) {
+          this.blockJob(job, gate.code, gate.reason);
+          continue;
+        }
+      }
       const now = Date.now();
       this.db
         .update(updateJobs)
@@ -182,6 +208,28 @@ export class UpdateExecutor {
     this.pauseWithNotification(job, code, message);
   }
 
+  /** 执行前阻塞：记录具体资格原因，无通知（无副作用发生）。 */
+  private blockJob(job: UpdateJobRow, code: string, message: string): void {
+    const current = this.db.select().from(updateJobs).where(eq(updateJobs.id, job.id)).get();
+    if (current == null) return;
+    const now = Date.now();
+    this.db
+      .update(updateJobs)
+      .set({
+        status: 'blocked',
+        errorCode: code,
+        errorMessage: message,
+        finishedAt: now,
+        updatedAt: now,
+        log: [
+          ...current.log,
+          { at: new Date(now).toISOString(), stage: current.stage, message: `阻塞：${message}` },
+        ],
+      })
+      .where(eq(updateJobs.id, job.id))
+      .run();
+  }
+
   /** Failure policy: keep target config, pause auto, notify (no rollback). */
   private pauseWithNotification(job: UpdateJobRow, code: string, message: string): void {
     const now = Date.now();
@@ -214,6 +262,31 @@ export class UpdateExecutor {
     if (resource == null || track == null) {
       this.finishJob(job, 'blocked', 'resource_missing', 'Resource or track disappeared');
       return;
+    }
+    // 执行入口边界复查（plan §5）：
+    //  - 未分类且未提交部署：绝不产生新副作用，保持现状等同步后重判。
+    //  - 已分类但受限（排除/镜像问题/父级继承）且未提交部署：blocked + 原因。
+    //  - 已提交部署（deploymentUuid 存在）：证据恢复路径继续，只 poll/readback。
+    if (job.deploymentUuid == null) {
+      if (!resource.managementClassified) {
+        // 防御路径（当前 claim 过滤不可达）：把已领取的任务显式放回队列，
+        // 避免滞留 running 等待重启 reconcile。
+        this.db
+          .update(updateJobs)
+          .set({ status: 'pending', updatedAt: Date.now() })
+          .where(eq(updateJobs.id, job.id))
+          .run();
+        return;
+      }
+      const gate = effectiveManagementGate(
+        resource,
+        parentRowOf(this.db, resource),
+        resource.currentImage,
+      );
+      if (!gate.ok) {
+        this.blockJob(job, gate.code, gate.reason);
+        return;
+      }
     }
     const log = this.logFor(job);
     log('revalidated', `开始执行 ${job.kind} 任务（attempt ${job.attempts}）`);

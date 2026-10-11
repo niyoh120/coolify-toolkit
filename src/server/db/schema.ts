@@ -38,6 +38,19 @@ export const resources = sqliteTable(
     blockedReason: text('blocked_reason'),
     /** Infrastructure exclusion (UUID list or unsupported type). */
     excludedInfra: integer('excluded_infra', { mode: 'boolean' }).notNull().default(false),
+    /**
+     * true = classified by the normal sync rules: excludedInfra means pure
+     * config exclusion and imageIssue is authoritative. false = legacy row
+     * awaiting its first classified sync; old excludedInfra values stay as
+     * historical information and management actions pause.
+     */
+    managementClassified: integer('management_classified', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    /** Structured image problem written by sync; null = parseable (or pending). */
+    imageIssue: text('image_issue', {
+      enum: ['missing_image', 'unsupported_registry', 'unresolved_variable', 'invalid_reference'],
+    }),
     /** true when the underlying Coolify resource reports stopped. */
     isStopped: integer('is_stopped', { mode: 'boolean' }).notNull().default(false),
     createdAt: integer('created_at').notNull().$defaultFn(now),

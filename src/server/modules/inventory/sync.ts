@@ -12,8 +12,9 @@ import { imageTracks, resources } from '../../db/schema.js';
 import type { SettingsRepo } from '../../db/settings-repo.js';
 import type { CoolifyClient } from '../../integrations/coolify/client.js';
 import { applicationImageRef } from '../../integrations/coolify/mapper.js';
-import { normalizeReference } from '../../integrations/registry/reference.js';
+import type { NormalizedRef } from '../../integrations/registry/reference.js';
 import { fingerprintObject, sha256Hex } from '../fingerprint.js';
+import { classifyImage } from './management-state.js';
 export interface SyncResult {
   resourcesSeen: number;
   created: number;
@@ -435,6 +436,9 @@ export class InventorySync {
           currentImage: null,
           configFingerprint: fingerprint,
           excludedInfra: excluded,
+          // 父服务不承载镜像：正常同步后永远是已分类、无镜像问题。
+          managementClassified: true,
+          imageIssue: null,
           isStopped,
           status: 'active',
           lastSyncedAt: now,
@@ -471,6 +475,8 @@ export class InventorySync {
         configFingerprint: fingerprint,
         policy: 'ignore',
         excludedInfra: excluded,
+        managementClassified: true,
+        imageIssue: null,
         isStopped,
         lastSyncedAt: now,
         createdAt: now,
@@ -501,12 +507,9 @@ export class InventorySync {
 
     const stopped =
       (child.status ?? '').includes('stopped') || (child.status ?? '').includes('exited');
-    let parsed: ReturnType<typeof normalizeReference> | null = null;
-    try {
-      parsed = image == null ? null : normalizeReference(image);
-    } catch {
-      parsed = null; // unparseable image: keep row, surface as needs-attention
-    }
+    const cls = classifyImage(image);
+    const parsed = cls.parsed;
+    const imageIssue = cls.issue; // expected resolution problems, else null
 
     if (existing == null) {
       const inserted = await this.db
@@ -526,10 +529,12 @@ export class InventorySync {
           currentImage: image,
           configFingerprint: fingerprint,
           policy: 'ignore',
-          excludedInfra: excluded || parsed == null,
+          excludedInfra: excluded,
+          managementClassified: true,
+          imageIssue,
           isStopped: stopped,
-          // First discovery is never an external change; unparseable images
-          // surface via track==null views instead of external_change.
+          // First discovery is never an external change; image problems
+          // surface via the structured imageIssue instead of external_change.
           blockedReason: null,
           lastSyncedAt: now,
           createdAt: now,
@@ -577,7 +582,9 @@ export class InventorySync {
         domains: child.fqdn,
         currentImage: image,
         configFingerprint: fingerprint,
-        excludedInfra: excluded || parsed == null,
+        excludedInfra: excluded,
+        managementClassified: true,
+        imageIssue,
         isStopped: stopped,
         status: 'active',
         blockedReason: resolveBlockedReason(
@@ -622,7 +629,7 @@ export class InventorySync {
    */
   private imageMatchesTrack(
     track: typeof imageTracks.$inferSelect | undefined,
-    parsed: ReturnType<typeof normalizeReference> | null,
+    parsed: NormalizedRef | null,
   ): boolean {
     if (track == null || parsed == null) return true;
     if (parsed.registry !== track.sourceRegistry || parsed.repository !== track.sourceRepository) {
@@ -648,12 +655,9 @@ export class InventorySync {
       .where(and(eq(resources.kind, 'application'), eq(resources.coolifyUuid, app.uuid)))
       .get();
 
-    let parsed: ReturnType<typeof normalizeReference> | null = null;
-    try {
-      parsed = app.image == null ? null : normalizeReference(app.image);
-    } catch {
-      parsed = null;
-    }
+    const cls = classifyImage(app.image);
+    const parsed = cls.parsed;
+    const imageIssue = cls.issue;
 
     if (existing == null) {
       const inserted = await this.db
@@ -672,10 +676,12 @@ export class InventorySync {
           currentImage: app.image,
           configFingerprint: app.fingerprint,
           policy: 'ignore',
-          excludedInfra: excluded || parsed == null,
+          excludedInfra: excluded,
+          managementClassified: true,
+          imageIssue,
           isStopped: app.stopped,
-          // First discovery is never an external change; unparseable images
-          // surface via track==null views instead of external_change.
+          // First discovery is never an external change; image problems
+          // surface via the structured imageIssue instead of external_change.
           blockedReason: null,
           lastSyncedAt: now,
           createdAt: now,
@@ -725,7 +731,9 @@ export class InventorySync {
         domains: app.domains,
         currentImage: app.image,
         configFingerprint: app.fingerprint,
-        excludedInfra: excluded || parsed == null,
+        excludedInfra: excluded,
+        managementClassified: true,
+        imageIssue,
         isStopped: app.stopped,
         status: 'active',
         blockedReason: resolveBlockedReason(
@@ -759,7 +767,7 @@ export class InventorySync {
   /** First sight of a resource: create its track from the current Coolify config. */
   private async ensureTrack(
     resource: Pick<ResourceRow, 'id'>,
-    parsed: ReturnType<typeof normalizeReference>,
+    parsed: NormalizedRef,
     platform: string | null,
     platformSource: string | null,
     configuredReference: string | null,

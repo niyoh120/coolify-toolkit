@@ -22,6 +22,11 @@ import { imageTracks, notificationOutbox, resources, updateJobs } from '../db/sc
 import type { Deps } from '../deps.js';
 import { normalizeReference } from '../integrations/registry/reference.js';
 import { resourceToDTO } from '../modules/dto.js';
+import {
+  effectiveManagementGate,
+  type ManagementGateCode,
+} from '../modules/inventory/management-state.js';
+import { parentRowOf } from '../modules/inventory/parent-row.js';
 import { assertCronValid } from '../scheduler/cron-validate.js';
 
 const BODY_LIMIT = 256 * 1024;
@@ -123,8 +128,16 @@ export function createApi(deps: Deps): Hono {
       const active = db.select().from(resources).where(eq(resources.status, 'active')).all();
       const tracks = db.select().from(imageTracks).all();
       const jobs = db.select().from(updateJobs).orderBy(desc(updateJobs.id)).all();
+      // 候选只统计 active、已分类、未配置排除、无镜像问题的镜像资源；
+      // ignore 的已观察候选保留既有语义（同样计入）。
+      const candidateEligible = new Set(
+        active
+          .filter((r) => r.managementClassified && !r.excludedInfra && r.imageIssue == null)
+          .map((r) => r.id),
+      );
       let candidates = 0;
       for (const t of tracks) {
+        if (!candidateEligible.has(t.resourceId)) continue;
         if (
           t.configuredDigest != null &&
           t.observedDigest != null &&
@@ -137,8 +150,14 @@ export function createApi(deps: Deps): Hono {
         ['failed', 'unknown_submit', 'conflict'].includes(j.status),
       ).length;
       const pendingConfirmations = jobs.filter((j) => j.stage === 'awaiting_confirmation').length;
+      // 受管 = 已分类、未配置排除、无镜像问题、非 compose_service 且非 ignore。
       const managed = active.filter(
-        (r) => r.policy !== 'ignore' && !r.excludedInfra && r.kind !== 'compose_service',
+        (r) =>
+          r.managementClassified &&
+          !r.excludedInfra &&
+          r.imageIssue == null &&
+          r.kind !== 'compose_service' &&
+          r.policy !== 'ignore',
       ).length;
       return c.json({
         resourcesTotal: active.length,
@@ -187,6 +206,7 @@ export function createApi(deps: Deps): Hono {
       }
       const parentNames = new Map(rows.map((r) => [r.id, r.name]));
       const parentUuids = new Map(rows.map((r) => [r.id, r.coolifyUuid]));
+      const parentExcluded = new Map(rows.map((r) => [r.id, r.excludedInfra]));
       const dtos = rows
         .filter((r) => (status === 'all' ? true : r.status === status))
         .filter((r) => (kind == null ? true : r.kind === kind))
@@ -198,6 +218,10 @@ export function createApi(deps: Deps): Hono {
             trackByResource.get(r.id) ?? null,
             latestJobByResource.get(r.id) ?? null,
             awaitingByResource.get(r.id) ?? null,
+            {
+              excludedUuids: deps.cfg.excludedUuids,
+              parentExcluded: r.parentId != null ? (parentExcluded.get(r.parentId) ?? null) : null,
+            },
           );
           dto.parentName = r.parentId != null ? (parentNames.get(r.parentId) ?? null) : null;
           dto.parentCoolifyUuid = r.parentId != null ? (parentUuids.get(r.parentId) ?? null) : null;
@@ -224,11 +248,17 @@ export function createApi(deps: Deps): Hono {
         .orderBy(desc(updateJobs.id))
         .all();
       const awaiting = jobRows.find((j) => j.stage === 'awaiting_confirmation') ?? null;
-      const dto = resourceToDTO(resource, track, jobRows[0] ?? null, awaiting);
-      if (resource.parentId != null) {
-        const parent = db.select().from(resources).where(eq(resources.id, resource.parentId)).get();
-        dto.parentName = parent?.name ?? null;
-        dto.parentCoolifyUuid = parent?.coolifyUuid ?? null;
+      const parentRow =
+        resource.parentId != null
+          ? (db.select().from(resources).where(eq(resources.id, resource.parentId)).get() ?? null)
+          : null;
+      const dto = resourceToDTO(resource, track, jobRows[0] ?? null, awaiting, {
+        excludedUuids: deps.cfg.excludedUuids,
+        parentExcluded: parentRow?.excludedInfra ?? null,
+      });
+      if (parentRow != null) {
+        dto.parentName = parentRow.name;
+        dto.parentCoolifyUuid = parentRow.coolifyUuid;
       }
       const jobDTOs = jobRows.slice(0, 50).map((j) => jobToDTO(j, resource.name, resource.kind));
       return c.json({ resource: dto, jobs: jobDTOs });
@@ -246,6 +276,15 @@ export function createApi(deps: Deps): Hono {
       const resource = db.select().from(resources).where(eq(resources.id, id)).get();
       if (resource == null)
         throw new ApiRequestError(errorCodes.notFound, 'Resource not found', 404);
+      // 统一资格守卫：待确认/配置排除/镜像问题（含父级继承）时，在任何写入
+      // 之前拒绝 —— 覆盖策略、来源、平台、cron 全部字段。
+      const parentRow = parentRowOf(db, resource);
+      const gate = effectiveManagementGate(resource, parentRow, resource.currentImage);
+      if (!gate.ok) {
+        throw new ApiRequestError(errorCodes.blocked, gate.reason, 409, {
+          code: gate.code,
+        });
+      }
       const track = db.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get();
       const now = Date.now();
 
@@ -323,7 +362,12 @@ export function createApi(deps: Deps): Hono {
         db.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get() ?? null;
       if (updated == null)
         throw new ApiRequestError(errorCodes.notFound, 'Resource not found', 404);
-      return c.json({ resource: resourceToDTO(updated, updatedTrack, null, null) });
+      return c.json({
+        resource: resourceToDTO(updated, updatedTrack, null, null, {
+          excludedUuids: deps.cfg.excludedUuids,
+          parentExcluded: parentRow?.excludedInfra ?? null,
+        }),
+      });
     } catch (err) {
       return errorResponse(c, err);
     }
@@ -334,14 +378,64 @@ export function createApi(deps: Deps): Hono {
       if (!originOk(c, deps.cfg.publicOrigin))
         throw new ApiRequestError(errorCodes.validation, 'Cross-origin write rejected', 403);
       const input = batchPolicySchema.parse(await c.req.json());
+      // ID 去重：重复提交同一资源只更新一次。
+      const ids = [...new Set(input.resourceIds)];
       const now = Date.now();
-      for (const id of input.resourceIds) {
-        db.update(resources)
-          .set({ policy: input.policy, updatedAt: now })
-          .where(eq(resources.id, id))
-          .run();
-      }
-      return c.json({ updated: input.resourceIds.length });
+      // 事务内统一读取与预检：任何目标不存在或资格不满足时整批拒绝，
+      // 策略与更新时间全保持原值；成功时 updated 为实际唯一目标数。
+      const updated = db.transaction((tx) => {
+        const targets: (typeof resources.$inferSelect)[] = [];
+        for (const id of ids) {
+          const row = tx.select().from(resources).where(eq(resources.id, id)).get();
+          if (row == null) {
+            throw new ApiRequestError(errorCodes.notFound, `Resource #${id} not found`, 404, {
+              resourceId: id,
+            });
+          }
+          targets.push(row);
+        }
+        type RejectedEntry = {
+          resourceId: number;
+          name: string;
+          code: 'removed' | ManagementGateCode;
+          reason: string;
+        };
+        const rejected = targets.flatMap<RejectedEntry>((row) => {
+          const gate = effectiveManagementGate(row, parentRowOf(tx, row), row.currentImage);
+          if (row.status !== 'active') {
+            return [
+              {
+                resourceId: row.id,
+                name: row.name,
+                code: 'removed' as const,
+                reason: '资源已移除',
+              },
+            ];
+          }
+          if (!gate.ok) {
+            return [{ resourceId: row.id, name: row.name, code: gate.code, reason: gate.reason }];
+          }
+          return [];
+        });
+        if (rejected.length > 0) {
+          throw new ApiRequestError(
+            errorCodes.blocked,
+            '整批未保存：部分资源不满足策略修改条件',
+            409,
+            {
+              rejected,
+            },
+          );
+        }
+        for (const row of targets) {
+          tx.update(resources)
+            .set({ policy: input.policy, updatedAt: now })
+            .where(eq(resources.id, row.id))
+            .run();
+        }
+        return targets.length;
+      });
+      return c.json({ updated });
     } catch (err) {
       return errorResponse(c, err);
     }
@@ -402,6 +496,13 @@ export function createApi(deps: Deps): Hono {
       const resource = db.select().from(resources).where(eq(resources.id, id)).get();
       if (resource == null)
         throw new ApiRequestError(errorCodes.notFound, 'Resource not found', 404);
+      // 资格校验在发 token 之前：待确认/排除/镜像问题时拒绝预览。
+      const gate = effectiveManagementGate(
+        resource,
+        parentRowOf(db, resource),
+        resource.currentImage,
+      );
+      if (!gate.ok) throw new ApiRequestError(errorCodes.blocked, gate.reason, 409);
       const track = db.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get();
       if (track == null) throw new ApiRequestError(errorCodes.blocked, 'No image track', 409);
       if (track.observedDigest == null) {
@@ -454,6 +555,16 @@ export function createApi(deps: Deps): Hono {
       let previewToken = input.previewToken;
       if (input.skipPreview === true) {
         // Server-side preview: the latest fresh observation becomes the candidate.
+        // 资格校验在发 token 或返回无候选之前：避免误报「无更新」。
+        const resource = db.select().from(resources).where(eq(resources.id, id)).get();
+        if (resource == null)
+          throw new ApiRequestError(errorCodes.notFound, 'Resource not found', 404);
+        const gate = effectiveManagementGate(
+          resource,
+          parentRowOf(db, resource),
+          resource.currentImage,
+        );
+        if (!gate.ok) throw new ApiRequestError(errorCodes.blocked, gate.reason, 409);
         const track = db.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get();
         if (track == null) throw new ApiRequestError(errorCodes.blocked, 'No image track', 409);
         if (track.observedDigest == null) {

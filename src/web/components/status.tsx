@@ -1,7 +1,12 @@
 // Shared status rendering rules for tracks and jobs.
 
-import type { BlockReason, TrackDTO } from '../../shared/types.js';
+import type { BlockReason, ResourceDTO, TrackDTO } from '../../shared/types.js';
 import { api } from '../lib/api.js';
+import {
+  isConfigExcluded,
+  managementReason,
+  managementReasonDetail,
+} from '../lib/resource-view.js';
 import { Badge, type BadgeTone, Button, Mono } from './ui.js';
 
 export function shortDigest(digest: string | null | undefined): string {
@@ -29,7 +34,7 @@ const DEPLOY_LABEL: Record<string, { text: string; tone: BadgeTone }> = {
 const BLOCK_LABEL: Record<Exclude<BlockReason, null>, string> = {
   external_change: '外部修改，需重新确认',
   platform_missing: '目标平台待配置',
-  excluded: '已排除（基础设施）',
+  excluded: '管理受限', // 通用兼容映射；明确分类原因由 ManagementBadge 呈现
   compose_confirmation_pending: 'Compose 提交待确认',
   stopped: '资源已停止',
   update_failed: '更新失败已暂停',
@@ -61,11 +66,27 @@ export function DeployBadge({ track }: { track: TrackDTO | null }) {
 }
 
 export function BlockedBadge({ blockedReason }: { blockedReason: BlockReason }) {
-  if (blockedReason == null) return null;
+  if (blockedReason == null || blockedReason === 'excluded') return null; // 兼容值由明确分类徽章呈现
   // 阻塞原因可能较长：允许受控换行，保持完整标签可读。
   return (
     <Badge tone="danger" className="whitespace-normal">
       {BLOCK_LABEL[blockedReason] ?? blockedReason}
+    </Badge>
+  );
+}
+
+/**
+ * Structured management-state badge (待同步确认 / 已排除 / 镜像问题)。
+ * 可见文字为主，tooltip 仅补充细节；排除为中性色，待同步与镜像问题为警告色。
+ */
+export function ManagementBadge({ resource }: { resource: ResourceDTO }) {
+  const reason = managementReason(resource);
+  if (reason == null) return null;
+  const tone: BadgeTone = isConfigExcluded(resource) ? 'neutral' : 'warning';
+  const detail = managementReasonDetail(resource) ?? undefined;
+  return (
+    <Badge tone={tone} className="whitespace-normal" title={detail}>
+      {reason}
     </Badge>
   );
 }

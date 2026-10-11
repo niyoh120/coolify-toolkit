@@ -629,6 +629,10 @@ function ApplicationsView() {
 
 // --- services tab -------------------------------------------------------------------
 
+// 折叠/展开是与筛选、翻页无关的显示模式：mode 为全局方向，overrides 记录被
+// 单组箭头手动切换过的组（相对当前模式取反）；切模式时清空 overrides。
+type ExpandMode = 'expanded' | 'collapsed';
+
 function ServicesView() {
   const { navigate } = useRouter();
   const [view, setView] = useState<ExclusionView>('unexcluded');
@@ -636,7 +640,8 @@ function ServicesView() {
   const [pageSize, setPageSize] = useState(20);
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<number[]>([]);
-  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const [expandMode, setExpandMode] = useState<ExpandMode>('expanded');
+  const [expandOverrides, setExpandOverrides] = useState<Set<string>>(() => new Set());
   const [pendingBatch, setPendingBatch] = useState<PendingBatch>(null);
   const [feedbackLines] = useFeedbackLines();
   const batchRunner = useBatchRunner();
@@ -709,8 +714,14 @@ function ServicesView() {
       if (checked) return [...new Set([...prev, ...pageSelectable])];
       return prev.filter((id) => !pageSelectable.includes(id));
     });
+  const isExpanded = (key: string): boolean =>
+    expandOverrides.has(key) ? expandMode === 'collapsed' : expandMode === 'expanded';
+  const setAllExpanded = (expanded: boolean): void => {
+    setExpandMode(expanded ? 'expanded' : 'collapsed');
+    setExpandOverrides(new Set());
+  };
   const toggleExpand = (key: string): void =>
-    setExpanded((prev) => {
+    setExpandOverrides((prev) => {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);
       else next.add(key);
@@ -794,6 +805,9 @@ function ServicesView() {
             </option>
           ))}
         </Select>
+        <Button variant="outline" onClick={() => setAllExpanded(expandMode !== 'expanded')}>
+          {expandMode === 'expanded' ? '折叠全部' : '展开全部'}
+        </Button>
         <span className="ml-auto flex items-center gap-1.5 text-[12px] text-[var(--color-text-secondary)]">
           每页
           <Select
@@ -919,7 +933,7 @@ function ServicesView() {
               filtered={fg}
               view={view}
               summaryChildren={fullChildrenByKey.get(fg.group.key) ?? fg.group.children}
-              expanded={expanded.has(fg.group.key)}
+              expanded={isExpanded(fg.group.key)}
               onToggleExpand={toggleExpand}
               selected={selected}
               onToggleChild={toggleChild}

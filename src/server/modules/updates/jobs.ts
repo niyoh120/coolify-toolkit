@@ -4,12 +4,14 @@ import { randomBytes } from 'node:crypto';
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { ApiRequestError, errorCodes } from '../../../shared/errors.js';
 import { digestSchema } from '../../../shared/schemas.js';
+import type { SuccessSource } from '../../../shared/types.js';
 import type { Db } from '../../db/client.js';
 import { pruneJobHistory } from '../../db/retention.js';
 import type { ImageTrackRow, ResourceRow, UpdateJobRow } from '../../db/schema.js';
 import { imageTracks, resources, updateJobs } from '../../db/schema.js';
 import type { SettingsRepo } from '../../db/settings-repo.js';
 import { coolifyDigestTag } from '../../integrations/registry/reference.js';
+import { isAwaitingConfirmation } from '../dto.js';
 import { effectiveManagementGate } from '../inventory/management-state.js';
 import { parentRowOf } from '../inventory/parent-row.js';
 
@@ -73,8 +75,10 @@ export class JobsService {
     return (
       rows.find(
         (j) =>
+          // ACTIVE_STATUSES (pending/running) already covers running+awaiting;
+          // legacy terminal rows with a stale awaiting stage only match the
+          // digest-scoped terminal branch below.
           (ACTIVE_STATUSES as readonly string[]).includes(j.status) ||
-          j.stage === 'awaiting_confirmation' ||
           (candidateDigest != null &&
             j.candidateDigest === candidateDigest &&
             ['failed', 'conflict', 'unknown_submit', 'blocked'].includes(j.status)),
@@ -132,10 +136,10 @@ export class JobsService {
     }
     const existing = this.blockingJob(resourceId, digest);
     if (existing != null) {
-      if (
-        ['pending', 'running'].includes(existing.status) ||
-        existing.stage === 'awaiting_confirmation'
-      ) {
+      // Strictly active statuses only: legacy terminal rows with a stale
+      // awaiting_confirmation stage must fall through to the normal rules
+      // instead of blocking the resource forever as "in flight".
+      if (['pending', 'running'].includes(existing.status)) {
         throw new ApiRequestError(errorCodes.conflict, 'An update task is already in flight', 409);
       }
       if (existing.candidateDigest === digest && existing.status === 'unknown_submit') {
@@ -280,6 +284,8 @@ export class JobsService {
         stage: 'queued',
         // A retry is a fresh deployment attempt; never resume a failed one.
         deploymentUuid: null,
+        // A retry re-opens the whole wait window; a stale due time must not fire.
+        confirmationDueAt: null,
         errorCode: null,
         errorMessage: null,
         updatedAt: now,
@@ -296,7 +302,7 @@ export class JobsService {
 
   confirmSubmission(jobId: number, digest: string): UpdateJobRow {
     const job = this.get(jobId);
-    if (job.stage !== 'awaiting_confirmation') {
+    if (!isAwaitingConfirmation(job)) {
       throw new ApiRequestError(errorCodes.blocked, 'Task is not awaiting confirmation', 409);
     }
     if (digest !== job.candidateDigest) {
@@ -307,12 +313,16 @@ export class JobsService {
       );
     }
     const now = Date.now();
+    // Expected-state conditional update: a concurrent auto-check, retry or
+    // source edit must win over a stale confirmation request.
     const updated = this.db
       .update(updateJobs)
       .set({
         status: 'success',
         stage: 'done',
         confirmedManually: true,
+        // Cancels the pending delayed auto-check for this job.
+        confirmationDueAt: null,
         finishedAt: now,
         updatedAt: now,
         log: [
@@ -320,24 +330,36 @@ export class JobsService {
           { at: new Date(now).toISOString(), stage: 'done', message: '人工确认提交结果' },
         ],
       })
-      .where(eq(updateJobs.id, jobId))
+      .where(
+        and(
+          eq(updateJobs.id, jobId),
+          eq(updateJobs.status, 'running'),
+          eq(updateJobs.stage, 'awaiting_confirmation'),
+          eq(updateJobs.candidateDigest, job.candidateDigest),
+        ),
+      )
       .returning()
       .get();
-    if (updated != null) {
-      this.advanceTrackOnSuccess(job, 'manual', null);
-      this.db
-        .update(resources)
-        .set({ blockedReason: null, updatedAt: now })
-        .where(eq(resources.id, job.resourceId))
-        .run();
+    if (updated == null) {
+      throw new ApiRequestError(
+        errorCodes.conflict,
+        'Task state changed during confirmation; refresh and review',
+        409,
+      );
     }
-    return updated ?? job;
+    this.advanceTrackOnSuccess(job, 'manual', null);
+    this.db
+      .update(resources)
+      .set({ blockedReason: null, updatedAt: now })
+      .where(eq(resources.id, job.resourceId))
+      .run();
+    return updated;
   }
 
   /** Advance success evidence. source=manual records human attestation only. */
   advanceTrackOnSuccess(
     job: UpdateJobRow,
-    source: 'deployment' | 'manual',
+    source: SuccessSource,
     deploymentUuid: string | null,
   ): void {
     const now = Date.now();

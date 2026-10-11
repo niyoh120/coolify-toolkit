@@ -28,16 +28,23 @@ const DEPLOY_LABEL: Record<string, { text: string; tone: BadgeTone }> = {
   deploying: { text: '部署中', tone: 'info' },
   success: { text: '部署成功', tone: 'success' },
   failed: { text: '部署失败', tone: 'danger' },
-  pending_confirmation: { text: '已提交 / 待确认', tone: 'warning' },
+  pending_confirmation: { text: '等待自动检查', tone: 'warning' },
 };
 
 const BLOCK_LABEL: Record<Exclude<BlockReason, null>, string> = {
   external_change: '外部修改，需重新确认',
   platform_missing: '目标平台待配置',
   excluded: '管理受限', // 通用兼容映射；明确分类原因由 ManagementBadge 呈现
-  compose_confirmation_pending: 'Compose 提交待确认',
+  compose_confirmation_pending: '等待自动检查',
   stopped: '资源已停止',
   update_failed: '更新失败已暂停',
+};
+
+/** 人工确认徽标：成功证据来源的显示名。 */
+export const SUCCESS_SOURCE_LABEL: Record<string, string> = {
+  deployment: '部署确认',
+  manual: '人工确认',
+  runtime_observation: '运行观察自动确认',
 };
 
 export const POLICY_LABEL: Record<string, string> = {
@@ -101,7 +108,11 @@ const JOB_STATUS: Record<string, { text: string; tone: BadgeTone }> = {
   blocked: { text: '已阻塞', tone: 'neutral' },
 };
 
-export function JobStatusBadge({ status }: { status: string }) {
+export function JobStatusBadge({ status, awaiting }: { status: string; awaiting?: boolean }) {
+  // 等待自动检查是独立的运行态：显示专属徽标而非「执行中」。
+  if (awaiting === true) {
+    return <Badge tone="warning">等待自动检查</Badge>;
+  }
   const info = JOB_STATUS[status] ?? { text: status, tone: 'neutral' as BadgeTone };
   return <Badge tone={info.tone}>{info.text}</Badge>;
 }

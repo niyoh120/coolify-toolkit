@@ -3,7 +3,12 @@
 // columns plus inline check & update actions; selection column is optional.
 
 import type { ResourceDTO } from '../../../shared/types.js';
-import { checkBlockedHint, policyTone, updateBlockedHint } from '../../lib/resource-view.js';
+import {
+  checkBlockedHint,
+  confirmBlockedHint,
+  policyTone,
+  updateBlockedHint,
+} from '../../lib/resource-view.js';
 import {
   BlockedBadge,
   CheckBadge,
@@ -25,9 +30,12 @@ export interface ChildResourcesTableProps {
   onOpen: (id: number) => void;
   onCheck: (id: number) => void;
   onUpdate: (id: number) => void;
-  /** Local ids currently running a check/update (busy feedback). */
+  /** 单项人工确认；未提供时隐藏该列内按钮（应用 Tab 保持原操作集合）。 */
+  onConfirm?: (r: ResourceDTO) => void;
+  /** Local ids currently running a check/update/confirm (busy feedback). */
   checkingId?: number | null;
   updatingId?: number | null;
+  confirmingId?: number | null;
   emptyText?: string;
 }
 
@@ -39,8 +47,10 @@ export function ChildResourcesTable({
   onOpen,
   onCheck,
   onUpdate,
+  onConfirm,
   checkingId,
   updatingId,
+  confirmingId,
   emptyText = '该服务暂无子容器。',
 }: ChildResourcesTableProps) {
   if (rows.length === 0) return <Empty>{emptyText}</Empty>;
@@ -61,13 +71,14 @@ export function ChildResourcesTable({
           <Th className="min-w-[5rem]">部署</Th>
           <Th className="min-w-[4.5rem]">状态</Th>
           <Th className="min-w-[4.5rem]">策略</Th>
-          <Th className="min-w-[11rem]">操作</Th>
+          <Th className="min-w-[13rem]">操作</Th>
         </tr>
       </thead>
       <tbody>
         {rows.map((r) => {
           const checkHint = checkBlockedHint(r);
           const updateHint = updateBlockedHint(r);
+          const confirmHint = confirmBlockedHint(r);
           return (
             <tr key={r.id} className="hover:bg-[var(--color-bg-overlay)]/40">
               {selected != null && onToggleSelected != null && (
@@ -156,6 +167,16 @@ export function ChildResourcesTable({
                   >
                     {updatingId === r.id ? '提交中…' : '执行更新'}
                   </Button>
+                  {onConfirm != null && (
+                    <Button
+                      variant="ghost"
+                      disabled={confirmHint != null || confirmingId === r.id}
+                      title={confirmHint ?? '记录人工确认并解除等待'}
+                      onClick={() => onConfirm(r)}
+                    >
+                      {confirmingId === r.id ? '确认中…' : '确认更新完成'}
+                    </Button>
+                  )}
                 </div>
               </Td>
             </tr>

@@ -23,7 +23,7 @@ const EVENT_LABEL: Record<string, string> = {
   upstream_changed: '上游变化',
   update_success: '更新完成',
   update_failed: '更新失败',
-  submit_unknown: '提交待确认',
+  submit_unknown: '提交结果未知',
 };
 
 const STATUS_TONE: Record<string, BadgeTone> = {

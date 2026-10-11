@@ -7,10 +7,15 @@ import type { Policy } from '../../../shared/types.js';
 import { ApiError, api } from '../../lib/api.js';
 import {
   type BatchCheckStats,
+  type BatchConfirmStats,
   type BatchUpdateStats,
+  type ConfirmItem,
   checkOutcomeFeedback,
   classifyCheckOutcome,
+  confirmItemFeedback,
+  isStaleConfirmError,
   summarizeBatchChecks,
+  summarizeBatchConfirmations,
   summarizeBatchUpdates,
 } from '../../lib/resource-view.js';
 import { useRefresh } from '../../main.js';
@@ -45,6 +50,7 @@ export function useBatchRunner() {
   const [busy, setBusy] = useState(false);
   const [activeCheckId, setActiveCheckId] = useState<number | null>(null);
   const [activeUpdateId, setActiveUpdateId] = useState<number | null>(null);
+  const [activeConfirmId, setActiveConfirmId] = useState<number | null>(null);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [result, setResult] = useState<BatchLines | null>(null);
 
@@ -157,15 +163,62 @@ export function useBatchRunner() {
     }
   };
 
+  /**
+   * Serial batch confirm over a frozen {jobId, digest} snapshot. Only real 2xx
+   * responses count as confirmed; a 409/404 means the task already moved on
+   * (auto-check won, retried, or resource removed) and is reported as a skip.
+   */
+  const runConfirmations = async (items: ConfirmItem[]): Promise<BatchLines> => {
+    setBusy(true);
+    setProgress({ done: 0, total: items.length });
+    const stats: BatchConfirmStats = { confirmed: 0, skipped: 0, failed: 0 };
+    const detail: FeedbackLine[] = [];
+    let done = 0;
+    for (const item of items) {
+      setActiveConfirmId(item.resourceId);
+      try {
+        await api.confirmJob(item.jobId, item.candidateDigest);
+        stats.confirmed += 1;
+        detail.push({ id: nextFeedbackId(), text: confirmItemFeedback(item) });
+      } catch (e) {
+        if (e instanceof ApiError && isStaleConfirmError(e.status)) {
+          stats.skipped += 1;
+          detail.push({
+            id: nextFeedbackId(),
+            text: `${item.resourceName}：状态已变化，已跳过（${e.message}）`,
+          });
+        } else {
+          stats.failed += 1;
+          detail.push({
+            id: nextFeedbackId(),
+            text: `${item.resourceName}：确认失败（${e instanceof Error ? e.message : '请求错误'}），请刷新后核对`,
+          });
+        }
+      } finally {
+        done += 1;
+        setProgress({ done, total: items.length });
+      }
+    }
+    setActiveConfirmId(null);
+    setProgress(null);
+    setBusy(false);
+    const lines = { summary: summarizeBatchConfirmations(stats), detail };
+    setResult(lines);
+    refresh();
+    return lines;
+  };
+
   return {
     busy,
     activeCheckId,
     activeUpdateId,
+    activeConfirmId,
     progress,
     result,
     setResult,
     runChecks,
     runUpdates,
+    runConfirmations,
     runPolicy,
   };
 }

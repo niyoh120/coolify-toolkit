@@ -5,11 +5,12 @@
 // Failure keeps the written target config, pauses auto updates and notifies.
 // Rollback is explicitly out of scope (phase 1).
 
-import { and, asc, eq, isNotNull, or } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, lte, or } from 'drizzle-orm';
+import { parse as parseYaml } from 'yaml';
 import type { AppConfig } from '../../config.js';
 import type { Db } from '../../db/client.js';
 import type { ImageTrackRow, ResourceRow, UpdateJobRow } from '../../db/schema.js';
-import { imageTracks, resources, updateJobs } from '../../db/schema.js';
+import { imageTracks, notificationOutbox, resources, updateJobs } from '../../db/schema.js';
 import type { SettingsRepo } from '../../db/settings-repo.js';
 import type { CoolifyClient } from '../../integrations/coolify/client.js';
 import { CoolifyApiError } from '../../integrations/coolify/client.js';
@@ -22,20 +23,40 @@ import type { JobsService } from './jobs.js';
 
 const CONFIRM_WINDOW_MS = 10 * 60_000;
 const POLL_INTERVAL_MS = 5_000;
+/** Delay before the single post-deploy runtime check for compose children. */
+const AUTO_CONFIRM_DELAY_MS = 60_000;
+/** Max due checks claimed per tick; the 5s worker loop re-runs promptly. */
+const CONFIRMATION_BATCH = 50;
 type LogSink = (stage: UpdateJobRow['stage'], message: string) => void;
 
 export interface ExecutorTiming {
   pollIntervalMs: number;
   confirmWindowMs: number;
+  /** Waiting window between the targeted start and the single auto-check. */
+  autoConfirmDelayMs: number;
 }
 
 const DEFAULT_TIMING: ExecutorTiming = {
   pollIntervalMs: POLL_INTERVAL_MS,
   confirmWindowMs: CONFIRM_WINDOW_MS,
+  autoConfirmDelayMs: AUTO_CONFIRM_DELAY_MS,
 };
+
+/** Typed check failure carrying an explicit error code for the job row. */
+class ComposeCheckError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ComposeCheckError';
+  }
+}
 
 export class UpdateExecutor {
   private running = false;
+  /** Independent reentry guard for due confirmations (5s tick overlap). */
+  private confirming = false;
 
   constructor(
     private readonly db: Db,
@@ -196,6 +217,8 @@ export class UpdateExecutor {
         errorCode,
         errorMessage,
         stage: status === 'success' ? 'done' : current.stage,
+        // Every terminal state leaves awaiting_confirmation: cancel any due check.
+        confirmationDueAt: null,
         finishedAt: now,
         updatedAt: now,
       })
@@ -238,16 +261,104 @@ export class UpdateExecutor {
       .set({ blockedReason: 'update_failed', updatedAt: now })
       .where(eq(resources.id, job.resourceId))
       .run();
+    this.notifyTerminal(
+      job,
+      '更新失败',
+      `资源 #${job.resourceId} 更新到 ${short(job.candidateDigest)} 失败（${code}）：${message}。` +
+        '当前目标配置已保留，自动更新已暂停。',
+    );
+  }
+
+  /** Shared outbox write for failure/conflict terminals (dedupe per job). */
+  private notifyTerminal(job: UpdateJobRow, title: string, body: string): void {
     this.outbox.enqueue({
       eventType: 'update_failed',
       resourceId: job.resourceId,
       dedupeKey: `update_failed:${job.id}`,
-      payload: {
-        title: '更新失败',
-        body: `资源 #${job.resourceId} 更新到 ${short(job.candidateDigest)} 失败（${code}）：${message}。当前目标配置已保留，自动更新已暂停。`,
-        type: 'failure',
-      },
+      payload: { title, body, type: 'failure' },
     });
+  }
+
+  /** External-change guard for runtime drift; call only after winning the job. */
+  private markExternalChange(job: UpdateJobRow): void {
+    this.db
+      .update(resources)
+      .set({ blockedReason: 'external_change', updatedAt: Date.now() })
+      .where(eq(resources.id, job.resourceId))
+      .run();
+  }
+
+  /**
+   * Conditional terminal write for the delayed check: the whole wait window
+   * (status/stage/dueAt/digest) is re-verified so a manual confirmation or
+   * retry that raced ahead always wins; the loser writes nothing. Returns true
+   * when this invocation won the job.
+   */
+  private finalizeAwaitingJob(
+    job: UpdateJobRow,
+    dueAt: number,
+    status: 'failed' | 'conflict' | 'blocked',
+    code: string,
+    message: string,
+    extraLogs: UpdateJobRow['log'] = [],
+  ): boolean {
+    const now = Date.now();
+    const live = this.db.select().from(updateJobs).where(eq(updateJobs.id, job.id)).get();
+    if (live == null) return false;
+    const updated = this.db
+      .update(updateJobs)
+      .set({
+        status,
+        errorCode: code,
+        errorMessage: message,
+        confirmationDueAt: null,
+        finishedAt: now,
+        updatedAt: now,
+        log: [...live.log, ...extraLogs],
+      })
+      .where(
+        and(
+          eq(updateJobs.id, job.id),
+          eq(updateJobs.status, 'running'),
+          eq(updateJobs.stage, 'awaiting_confirmation'),
+          eq(updateJobs.confirmationDueAt, dueAt),
+          eq(updateJobs.candidateDigest, job.candidateDigest),
+        ),
+      )
+      .returning()
+      .get();
+    return updated != null;
+  }
+
+  /** Guarded failure for the delayed check: winner-only side effects. */
+  private failAwaitingJob(
+    job: UpdateJobRow,
+    dueAt: number,
+    code: string,
+    message: string,
+    extraLogs: UpdateJobRow['log'] = [],
+  ): void {
+    if (this.finalizeAwaitingJob(job, dueAt, 'failed', code, message, extraLogs)) {
+      this.pauseWithNotification(job, code, message);
+    }
+  }
+
+  /** Guarded conflict for the delayed check: winner-only guard + notification. */
+  private conflictAwaitingJob(
+    job: UpdateJobRow,
+    dueAt: number,
+    code: string,
+    message: string,
+    extraLogs: UpdateJobRow['log'] = [],
+  ): void {
+    if (this.finalizeAwaitingJob(job, dueAt, 'conflict', code, message, extraLogs)) {
+      this.markExternalChange(job);
+      this.notifyTerminal(
+        job,
+        '更新冲突',
+        `资源 #${job.resourceId} 自动检查发现配置漂移（${code}）：${message}。目标已保留，资源已置为外部修改状态，请核对后在资源详情重新确认追踪来源。`,
+      );
+    }
   }
 
   // --- dispatch ---------------------------------------------------------------
@@ -745,10 +856,13 @@ export class UpdateExecutor {
         return;
       }
     }
+    // Persist the single delayed auto-check window; the scheduler's due-check
+    // entry point owns it from here (no sleep, the queue stays free).
     const now = Date.now();
+    const dueAt = now + this.timing.autoConfirmDelayMs;
     this.db
       .update(updateJobs)
-      .set({ stage: 'awaiting_confirmation', updatedAt: now })
+      .set({ stage: 'awaiting_confirmation', confirmationDueAt: dueAt, updatedAt: now })
       .where(eq(updateJobs.id, job.id))
       .run();
     this.db
@@ -760,17 +874,272 @@ export class UpdateExecutor {
       })
       .where(eq(resources.id, resource.id))
       .run();
+    log(
+      'awaiting_confirmation',
+      `已提交定向部署；${Math.round(this.timing.autoConfirmDelayMs / 1000)} 秒后自动检查一次运行状态，期间也可在服务列表「确认更新完成」`,
+    );
+  }
+
+  // --- delayed single auto-check -------------------------------------------------
+
+  /**
+   * Claim-and-run one due auto-check per compose child per invocation. Global
+   * pause never blocks this: an already-submitted deployment is still observed.
+   * Waits are expressed in the database (confirmation_due_at), so nothing sleeps
+   * on the queue. Returns the number of due jobs processed.
+   */
+  async processDueConfirmations(): Promise<number> {
+    if (this.confirming) return 0;
+    this.confirming = true;
+    let processed = 0;
+    try {
+      const now = Date.now();
+      const due = this.db
+        .select()
+        .from(updateJobs)
+        .where(
+          and(
+            eq(updateJobs.status, 'running'),
+            eq(updateJobs.stage, 'awaiting_confirmation'),
+            lte(updateJobs.confirmationDueAt, now),
+          ),
+        )
+        .orderBy(asc(updateJobs.confirmationDueAt), asc(updateJobs.id))
+        .limit(CONFIRMATION_BATCH)
+        .all();
+      for (const job of due) {
+        // The WHERE clause already excludes NULL due times; this guard exists
+        // only to narrow the type for the window-guarded calls below.
+        const dueAt = job.confirmationDueAt;
+        if (dueAt == null) continue;
+        const resource = this.db
+          .select()
+          .from(resources)
+          .where(eq(resources.id, job.resourceId))
+          .get();
+        if (resource?.kind !== 'service_application') continue;
+        processed += 1;
+        try {
+          await this.runScheduledConfirmation(job, dueAt);
+        } catch (err) {
+          // Per-item isolation: one broken check never blocks the batch.
+          this.failAwaitingJob(
+            job,
+            dueAt,
+            'internal_error',
+            err instanceof Error ? err.message : 'unknown error',
+          );
+        }
+      }
+    } finally {
+      this.confirming = false;
+    }
+    return processed;
+  }
+
+  /**
+   * One read-only round against Coolify, then a conditional finalize. The wait
+   * window (status/stage/dueAt/candidate) is re-verified in the final UPDATE so
+   * a manual confirmation or retry that raced ahead always wins.
+   */
+  private async runScheduledConfirmation(job: UpdateJobRow, dueAt: number): Promise<void> {
+    // 时序不变量：以下四个终态分支必须保持在首个 await 之前的同步前缀内——
+    // 单线程下与人工确认无交错窗口；若未来在其前插入 await，请改走
+    // finalizeAwaitingJob 窗口守卫，避免覆盖已成立的终态。
+    const resource = this.db.select().from(resources).where(eq(resources.id, job.resourceId)).get();
+    if (resource == null) {
+      this.finishJob(job, 'blocked', 'resource_missing', 'Resource disappeared');
+      return;
+    }
+    if (resource.kind !== 'service_application') {
+      this.finishJob(job, 'blocked', 'unsupported_kind', 'Auto-check covers compose children only');
+      return;
+    }
+    if (resource.parentId == null) {
+      this.finishJob(job, 'blocked', 'orphan_child', 'Compose child lost its parent');
+      return;
+    }
+    const parent = this.db
+      .select()
+      .from(resources)
+      .where(eq(resources.id, resource.parentId))
+      .get();
+    if (parent == null) {
+      this.finishJob(job, 'blocked', 'parent_missing', 'Parent service not found');
+      return;
+    }
+    // Observation notes are buffered and persisted only by the window winner,
+    // so a lost race can never rewrite a terminal row's stage/log.
+    const notes: UpdateJobRow['log'] = [];
+    const note = (message: string): void => {
+      notes.push({ at: new Date().toISOString(), stage: 'awaiting_confirmation', message });
+    };
+
+    // Read-only round: service detail (raw compose) + live child list.
+    let service: Awaited<ReturnType<CoolifyClient['getService']>>;
+    let children: Awaited<ReturnType<CoolifyClient['listServiceApplications']>>;
+    try {
+      [service, children] = await Promise.all([
+        this.coolify.getService(parent.coolifyUuid),
+        this.coolify.listServiceApplications(parent.coolifyUuid),
+      ]);
+    } catch (err) {
+      this.failAwaitingJob(
+        job,
+        dueAt,
+        'coolify_unreachable',
+        err instanceof Error ? err.message : 'auto-check read failed',
+        notes,
+      );
+      return;
+    }
+
+    // Locate the live child by UUID.
+    const target = children.find((c) => c.uuid === resource.coolifyUuid);
+    if (target == null) {
+      this.failAwaitingJob(
+        job,
+        dueAt,
+        'child_missing',
+        '目标子容器已从服务中消失，保留上一成功证据',
+        notes,
+      );
+      return;
+    }
+
+    // Status: main segment must be running (running:unhealthy included); the
+    // health suffix is logged only — healthchecks stay optional.
+    const rawStatus = target.status ?? '';
+    const [statusMain, healthSuffix] = rawStatus.split(':').map((s) => s.trim());
+    if (statusMain !== 'running') {
+      this.failAwaitingJob(
+        job,
+        dueAt,
+        'container_not_running',
+        `自动检查发现容器状态为「${rawStatus === '' ? '未知' : rawStatus}」，预期 running`,
+        notes,
+      );
+      return;
+    }
+    if (healthSuffix != null && healthSuffix !== '') {
+      note(
+        healthSuffix === 'healthy'
+          ? '容器健康检查已通过'
+          : `容器健康状态：${healthSuffix}（持续信号，不影响本次确认）`,
+      );
+    }
+
+    // Compose service node key: persisted composeServiceName wins; live child
+    // name is the fallback. A mismatch is recorded as configuration drift.
+    const liveName = target.name ?? '';
+    const persistedKey = resource.composeServiceName ?? '';
+    if (persistedKey === '' && liveName === '') {
+      this.failAwaitingJob(
+        job,
+        dueAt,
+        'compose_service_key_missing',
+        '无法确定 compose 服务节点名（两处均为空）',
+        notes,
+      );
+      return;
+    }
+    const serviceKey = persistedKey !== '' ? persistedKey : liveName;
+    if (persistedKey !== '' && liveName !== '' && liveName !== persistedKey) {
+      note(
+        `配置漂移：持久化服务名 ${persistedKey} 与实时容器名 ${liveName} 不一致，按持久化名检查`,
+      );
+    }
+
+    // Child image must equal the fixed digest reference this job wrote.
+    if (target.image !== job.candidateReference) {
+      this.conflictAwaitingJob(
+        job,
+        dueAt,
+        'external_change',
+        `子容器 image 已变为 ${target.image ?? '空'}，预期 ${short(job.candidateDigest)} 引用`,
+        notes,
+      );
+      return;
+    }
+
+    // Raw compose: the target service node's image must equal the candidate.
+    try {
+      const nodeImage = composeTargetNodeImage(service.docker_compose_raw ?? '', serviceKey);
+      if (nodeImage !== job.candidateReference) {
+        this.conflictAwaitingJob(
+          job,
+          dueAt,
+          'external_change',
+          `raw compose 中 services.${serviceKey}.image 已变为 ${nodeImage ?? '空'}，预期 ${short(job.candidateDigest)} 引用`,
+          notes,
+        );
+        return;
+      }
+    } catch (err) {
+      if (err instanceof ComposeCheckError) {
+        this.failAwaitingJob(job, dueAt, err.code, err.message, notes);
+        return;
+      }
+      throw err;
+    }
+
+    // All green: conditional finalize over the same waiting window.
+    const now = Date.now();
+    const finalized = this.db
+      .update(updateJobs)
+      .set({
+        status: 'success',
+        stage: 'done',
+        confirmationDueAt: null,
+        finishedAt: now,
+        updatedAt: now,
+        log: [
+          ...job.log,
+          ...notes,
+          {
+            at: new Date(now).toISOString(),
+            stage: 'done' as const,
+            message: '单次运行观察自动确认：容器 running 且目标镜像配置一致',
+          },
+        ],
+      })
+      .where(
+        and(
+          eq(updateJobs.id, job.id),
+          eq(updateJobs.status, 'running'),
+          eq(updateJobs.stage, 'awaiting_confirmation'),
+          eq(updateJobs.confirmationDueAt, dueAt),
+          eq(updateJobs.candidateDigest, job.candidateDigest),
+        ),
+      )
+      .returning()
+      .get();
+    if (finalized == null) return; // manual confirm / retry raced ahead
+    this.jobs.advanceTrackOnSuccess(job, 'runtime_observation', null);
+    // Clear only this task's confirmation guard; independent blocks stay.
+    const fresh = this.db.select().from(resources).where(eq(resources.id, resource.id)).get();
+    if (fresh != null) {
+      this.db
+        .update(resources)
+        .set({
+          currentImage: job.candidateReference,
+          blockedReason:
+            fresh.blockedReason === 'compose_confirmation_pending' ? null : fresh.blockedReason,
+          updatedAt: now,
+        })
+        .where(eq(resources.id, resource.id))
+        .run();
+    }
     this.outbox.enqueue({
-      eventType: 'submit_unknown',
+      eventType: 'update_success',
       resourceId: resource.id,
-      dedupeKey: `compose_submitted:${job.id}`,
+      dedupeKey: `update_success:${job.id}`,
       payload: {
-        title: 'Compose 更新已提交，待确认',
-        body: `资源 ${resource.name} 已提交定向部署（Coolify 仅返回 queued，无完成证据）。请在验证容器运行正常后，在更新历史中人工确认。`,
-        type: 'warning',
+        title: '更新完成',
+        body: `资源 ${resource.name} 已更新到 ${short(job.candidateDigest)}（单次运行观察自动确认）。`,
+        type: 'success',
       },
     });
-    log('awaiting_confirmation', '已提交；等待人工确认（无完成证据可用）');
   }
 
   // --- boot reconciliation ------------------------------------------------------
@@ -784,7 +1153,41 @@ export class UpdateExecutor {
     const running = this.db.select().from(updateJobs).where(eq(updateJobs.status, 'running')).all();
     for (const job of running) {
       const now = Date.now();
-      if (job.stage === 'awaiting_confirmation') continue; // user decision pending
+      if (job.stage === 'awaiting_confirmation') {
+        const resource = this.db
+          .select()
+          .from(resources)
+          .where(eq(resources.id, job.resourceId))
+          .get();
+        if (resource?.kind === 'service_application') {
+          // Backfill the due time for legacy/pre-upgrade rows (updatedAt+delay);
+          // rows that already expired are taken over by the first worker tick.
+          if (job.confirmationDueAt == null) {
+            this.db
+              .update(updateJobs)
+              .set({ confirmationDueAt: job.updatedAt + this.timing.autoConfirmDelayMs })
+              .where(eq(updateJobs.id, job.id))
+              .run();
+          }
+          // Upgrade semantics: pause the not-yet-sent manual-confirmation warning
+          // bound to this job; already-sent history stays untouched.
+          this.db
+            .update(notificationOutbox)
+            .set({
+              status: 'paused',
+              lastError: '已升级为提交后延迟单次自动检查，该提醒停用',
+            })
+            .where(
+              and(
+                eq(notificationOutbox.dedupeKey, `compose_submitted:${job.id}`),
+                eq(notificationOutbox.eventType, 'submit_unknown'),
+                inArray(notificationOutbox.status, ['pending', 'failed']),
+              ),
+            )
+            .run();
+        }
+        continue; // user decision / auto-check pending
+      }
       const resource = this.db
         .select()
         .from(resources)
@@ -836,6 +1239,48 @@ export class UpdateExecutor {
 
 function short(digest: string): string {
   return digest.startsWith('sha256:') ? digest.slice(7, 19) : digest.slice(0, 12);
+}
+
+/**
+ * Read the target service node's image from raw compose. Only the exact target
+ * node counts: a sibling value or a comment can never satisfy the check.
+ * Throws ComposeCheckError with a stable code for every unreadable shape.
+ */
+function composeTargetNodeImage(raw: string, serviceKey: string): string | null {
+  if (raw.trim() === '') {
+    throw new ComposeCheckError('compose_raw_missing', 'raw compose 缺失或为空，无法核对目标节点');
+  }
+  let doc: unknown;
+  try {
+    doc = parseYaml(raw);
+  } catch (err) {
+    throw new ComposeCheckError(
+      'compose_raw_invalid',
+      `raw compose 解析失败：${err instanceof Error ? err.message : 'parse error'}`,
+    );
+  }
+  if (doc == null || typeof doc !== 'object') {
+    throw new ComposeCheckError('compose_raw_invalid', 'raw compose 解析结果不是对象');
+  }
+  const services = (doc as { services?: unknown }).services;
+  if (services == null || typeof services !== 'object' || Array.isArray(services)) {
+    throw new ComposeCheckError('compose_service_missing', 'raw compose 缺少 services 段');
+  }
+  const node = (services as Record<string, unknown>)[serviceKey];
+  if (node == null || typeof node !== 'object' || Array.isArray(node)) {
+    throw new ComposeCheckError(
+      'compose_service_missing',
+      `raw compose 中不存在 services.${serviceKey} 节点`,
+    );
+  }
+  const image = (node as { image?: unknown }).image;
+  if (typeof image !== 'string' || image === '') {
+    throw new ComposeCheckError(
+      'compose_image_missing',
+      `raw compose 中 services.${serviceKey}.image 缺失或非文本`,
+    );
+  }
+  return image;
 }
 
 function sleep(ms: number): Promise<void> {

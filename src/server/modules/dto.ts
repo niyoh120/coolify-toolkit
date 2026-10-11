@@ -5,6 +5,7 @@ import type {
   DeployState,
   ImageIssue,
   ImageIssueCode,
+  PendingConfirmationDTO,
   ResourceDTO,
   TrackDTO,
   TrackView,
@@ -38,6 +39,31 @@ function exclusionSourceOf(
   return 'self';
 }
 
+/**
+ * Awaiting set membership is strict: status must be running AND the stage must
+ * be awaiting_confirmation. Legacy rows with a terminal status but a stale
+ * awaiting stage never re-enter the pending set.
+ */
+export function isAwaitingConfirmation(job: UpdateJobRow | null | undefined): job is UpdateJobRow {
+  return job != null && job.status === 'running' && job.stage === 'awaiting_confirmation';
+}
+
+/** Pending compose confirmation summary for the child row; null otherwise. */
+export function pendingConfirmationDTO(
+  resource: ResourceRow,
+  awaitingJob: UpdateJobRow | null,
+): PendingConfirmationDTO | null {
+  if (resource.kind !== 'service_application' || !isAwaitingConfirmation(awaitingJob)) return null;
+  return {
+    jobId: awaitingJob.id,
+    candidateDigest: awaitingJob.candidateDigest,
+    confirmationDueAt:
+      awaitingJob.confirmationDueAt != null
+        ? new Date(awaitingJob.confirmationDueAt).toISOString()
+        : null,
+  };
+}
+
 export function deriveTrackView(
   track: ImageTrackRow,
   latestJob: UpdateJobRow | null,
@@ -57,7 +83,7 @@ export function deriveTrackView(
   else checkOutcome = 'matching';
 
   let deployState: DeployState = 'unknown';
-  if (awaitingJob != null) deployState = 'pending_confirmation';
+  if (isAwaitingConfirmation(awaitingJob)) deployState = 'pending_confirmation';
   else if (latestJob?.status === 'pending' || latestJob?.status === 'running')
     deployState = 'deploying';
   else if (track.lastSuccessfulDigest != null && track.lastSuccessfulDigest === configured) {
@@ -146,6 +172,7 @@ export function resourceToDTO(
       resource.lastSyncedAt != null ? new Date(resource.lastSyncedAt).toISOString() : null,
     updatedAt: resource.updatedAt != null ? new Date(resource.updatedAt).toISOString() : null,
     track: track != null && view != null ? trackToDTO(track, view) : null,
+    pendingConfirmation: pendingConfirmationDTO(resource, awaitingJob),
   };
 }
 

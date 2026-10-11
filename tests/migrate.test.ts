@@ -92,11 +92,92 @@ describe('sqlite migrations', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('upgrades a pre-confirmation database: adds confirmation_due_at and keeps rows', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'toolkit-upg-'));
+    const dbPath = path.join(dir, 'toolkit.db');
+    try {
+      // Simulate the previous schema: replay the real first migration (full old
+      // shape, update_jobs without confirmation_due_at) and record only it in the
+      // journal, so every later migration applies on top during upgrade.
+      {
+        const { DatabaseSync } = require('node:sqlite') as {
+          DatabaseSync: typeof import('node:sqlite').DatabaseSync;
+        };
+        const raw = new DatabaseSync(dbPath);
+        const oldSql = readFileSync(
+          path.join('drizzle', FIRST_MIGRATION_DIR, 'migration.sql'),
+          'utf8',
+        );
+        for (const stmt of oldSql.split('--> statement-breakpoint')) {
+          raw.exec(stmt);
+        }
+        raw.exec(`
+          CREATE TABLE __drizzle_migrations (
+            id INTEGER PRIMARY KEY,
+            hash text NOT NULL,
+            created_at numeric,
+            name text,
+            applied_at TEXT
+          );
+        `);
+        raw
+          .prepare(
+            `INSERT INTO __drizzle_migrations (hash, created_at, name, applied_at)
+             VALUES ('seed', 0, ?, 'seeded')`,
+          )
+          .run(FIRST_MIGRATION_DIR);
+        const now = Date.now();
+        raw
+          .prepare(
+            `INSERT INTO resources (kind, coolify_uuid, name, policy, config_fingerprint,
+             current_image, created_at, updated_at) VALUES ('application', 'legacy-app', 'jellyfin',
+             'notify', 'fp', 'nginx:1.25', ?, ?)`,
+          )
+          .run(now, now);
+        raw
+          .prepare(
+            `INSERT INTO update_jobs (resource_id, kind, trigger, candidate_digest,
+             candidate_reference, status, stage, idempotency_key, log, created_at, updated_at)
+             VALUES (1, 'update', 'manual', ?, ?, 'running', 'awaiting_confirmation',
+             'legacy:1', '[]', ?, ?)`,
+          )
+          .run(`sha256:${'a'.repeat(64)}`, 'nginx@legacy', now, now);
+        raw.close();
+      }
+      // Upgrade: the new migration applies cleanly on the old shape.
+      {
+        const { db, close } = openDatabase(dbPath);
+        migrate(db);
+        const legacy = db.select().from(updateJobs).all();
+        expect(legacy).toHaveLength(1);
+        expect(legacy[0]).toMatchObject({ status: 'running', stage: 'awaiting_confirmation' });
+        expect(legacy[0]?.confirmationDueAt).toBeNull();
+        // The added column is writable and readable.
+        db.update(updateJobs)
+          .set({ confirmationDueAt: 1234 })
+          .where(eq(updateJobs.id, legacy[0]!.id))
+          .run();
+        expect(db.select().from(updateJobs).all()[0]?.confirmationDueAt).toBe(1234);
+        close();
+      }
+      // Reopen again: idempotent, data intact.
+      {
+        const { db, close } = openDatabase(dbPath);
+        migrate(db);
+        expect(db.select().from(updateJobs).all()[0]?.confirmationDueAt).toBe(1234);
+        close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // --- 旧库升级：真实旧 schema → 版本化 SQL migration → 正常同步 -----------------
 
-const OLD_MIGRATION_DIR = '20260929024617_elite_dagger';
+const FIRST_MIGRATION_DIR = '20260929024617_elite_dagger';
+const OLD_MIGRATION_DIR = FIRST_MIGRATION_DIR;
 const NEW_MIGRATION_DIR = '20261001000000_management_classification';
 
 /** Build a pre-upgrade database: old schema only, first migration recorded. */

@@ -360,6 +360,190 @@ describe('api', () => {
       expect(names).toContain('svc-a');
     });
   });
+
+  describe('pending confirmation DTO', () => {
+    let childId: number;
+    let jobId: number;
+
+    beforeEach(() => {
+      const now = Date.now();
+      const parent = h.db
+        .insert(resources)
+        .values({
+          kind: 'compose_service',
+          coolifyUuid: 'svc-dto',
+          name: 'svc-dto',
+          lastSyncedAt: now,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning()
+        .get();
+      const child = h.db
+        .insert(resources)
+        .values({
+          kind: 'service_application',
+          coolifyUuid: 'child-dto',
+          parentId: parent.id,
+          name: 'web-dto',
+          composeServiceName: 'web',
+          policy: 'manual',
+          configFingerprint: 'fp',
+          lastSyncedAt: now,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning()
+        .get();
+      h.db
+        .insert(imageTracks)
+        .values({
+          resourceId: child.id,
+          sourceRegistry: 'docker.io',
+          sourceRepository: 'library/nginx',
+          sourceRepositoryAuthored: 'nginx',
+          sourceTag: '1.27',
+          targetPlatform: 'linux/amd64',
+          platformSource: 'compose',
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+      const job = h.db
+        .insert(updateJobs)
+        .values({
+          resourceId: child.id,
+          kind: 'update',
+          trigger: 'manual',
+          candidateDigest: D_B,
+          candidateReference: `nginx@${D_B}`,
+          status: 'running',
+          stage: 'awaiting_confirmation',
+          confirmationDueAt: now + 60_000,
+          idempotencyKey: 'manual:dto:d_b:0',
+          log: [],
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning()
+        .get();
+      childId = child.id;
+      jobId = job.id;
+    });
+
+    it('projects the awaiting compose task onto the child row only', async () => {
+      const app = createApp(deps);
+      const list = await app.request('/api/resources');
+      const body = (await list.json()) as {
+        resources: Array<{
+          id: number;
+          name: string;
+          pendingConfirmation: {
+            jobId: number;
+            candidateDigest: string;
+            confirmationDueAt: string | null;
+          } | null;
+        }>;
+      };
+      const child = body.resources.find((r) => r.id === childId);
+      const parent = body.resources.find((r) => r.name === 'svc-dto');
+      expect(child?.pendingConfirmation).toMatchObject({
+        jobId,
+        candidateDigest: D_B,
+      });
+      expect(child?.pendingConfirmation?.confirmationDueAt).toBeTruthy();
+      expect(parent?.pendingConfirmation).toBeNull();
+
+      // Deploy state and overview stay consistent.
+      const detail = await app.request(`/api/resources/${childId}`);
+      const dbody = (await detail.json()) as {
+        resource: {
+          pendingConfirmation: { jobId: number } | null;
+          track: { view: { deployState: string } } | null;
+        };
+        jobs: Array<{ id: number; confirmationDueAt: string | null; successSource: string | null }>;
+      };
+      expect(dbody.resource.pendingConfirmation?.jobId).toBe(jobId);
+      expect(dbody.resource.track?.view.deployState).toBe('pending_confirmation');
+      expect(dbody.jobs[0]?.confirmationDueAt).toBeTruthy();
+      expect(dbody.jobs[0]?.successSource).toBeNull();
+    });
+
+    it('excludes legacy terminal rows with a stale awaiting stage from the pending set', async () => {
+      h.db
+        .update(updateJobs)
+        .set({ status: 'failed', errorCode: 'x', errorMessage: 'x' })
+        .where(eq(updateJobs.id, jobId))
+        .run();
+      const app = createApp(deps);
+      const list = await app.request('/api/resources');
+      const body = (await list.json()) as {
+        resources: Array<{ id: number; pendingConfirmation: unknown | null }>;
+      };
+      expect(body.resources.find((r) => r.id === childId)?.pendingConfirmation).toBeNull();
+      const overview = await app.request('/api/overview');
+      const ob = (await overview.json()) as { pendingConfirmations: number };
+      expect(ob.pendingConfirmations).toBe(0);
+    });
+
+    it('derives successSource from status, confirmation and kind', async () => {
+      const app = createApp(deps);
+      // Runtime observation: success without manual attestation on a compose child.
+      h.db
+        .update(updateJobs)
+        .set({ status: 'success', stage: 'done', finishedAt: Date.now() })
+        .where(eq(updateJobs.id, jobId))
+        .run();
+      const jobsRes = await app.request('/api/jobs');
+      const jb = (await jobsRes.json()) as {
+        jobs: Array<{ id: number; successSource: string | null }>;
+      };
+      expect(jb.jobs.find((j) => j.id === jobId)?.successSource).toBe('runtime_observation');
+
+      // Historical manual attestation stays manual.
+      h.db
+        .update(updateJobs)
+        .set({ confirmedManually: true })
+        .where(eq(updateJobs.id, jobId))
+        .run();
+      const jobsRes2 = await app.request('/api/jobs');
+      const jb2 = (await jobsRes2.json()) as {
+        jobs: Array<{ id: number; successSource: string | null }>;
+      };
+      expect(jb2.jobs.find((j) => j.id === jobId)?.successSource).toBe('manual');
+    });
+
+    it('guards the confirm endpoint: digest mismatch, double confirm', async () => {
+      const app = createApp(deps);
+      const wrong = await app.request(`/api/jobs/${jobId}/confirm`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ digest: `sha256:${'a'.repeat(64)}` }),
+      });
+      expect(wrong.status).toBe(409);
+
+      const ok = await app.request(`/api/jobs/${jobId}/confirm`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ digest: D_B }),
+      });
+      expect(ok.status).toBe(200);
+      const row = h.db.select().from(updateJobs).where(eq(updateJobs.id, jobId)).get();
+      expect(row).toMatchObject({
+        status: 'success',
+        confirmedManually: true,
+        confirmationDueAt: null,
+      });
+
+      // Second confirm on the terminal row is refused.
+      const again = await app.request(`/api/jobs/${jobId}/confirm`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ digest: D_B }),
+      });
+      expect(again.status).toBe(409);
+    });
+  });
 });
 
 describe('management guards (upgrade transition)', () => {

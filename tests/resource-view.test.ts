@@ -4,13 +4,17 @@
 import { describe, expect, it } from 'vitest';
 import type { ResourceDTO, TrackDTO, TrackView } from '../src/shared/types.js';
 import {
+  buildConfirmSnapshot,
   buildServiceGroups,
+  type ConfirmItem,
   checkBlockedHint,
   checkOutcomeFeedback,
   childNeedsAttention,
   classifyCheckOutcome,
+  confirmBlockedHint,
   filterServiceGroups,
   groupSummary,
+  isStaleConfirmError,
   managementReason,
   managementReasonDetail,
   paginateGroups,
@@ -21,6 +25,7 @@ import {
   selectionState,
   serviceServerNames,
   summarizeBatchChecks,
+  summarizeBatchConfirmations,
   summarizeBatchUpdates,
   updateBlockedHint,
 } from '../src/web/lib/resource-view.js';
@@ -91,6 +96,7 @@ function dto(over: Partial<ResourceDTO> & Pick<ResourceDTO, 'id' | 'name'>): Res
     lastSyncedAt: null,
     updatedAt: null,
     track: null,
+    pendingConfirmation: null,
     ...over,
   };
 }
@@ -497,5 +503,74 @@ describe('management reason display', () => {
         dto({ id: 11, name: 'x', imageIssue: { code: 'unsupported_registry', registry: null } }),
       ),
     ).toBe('暂不支持的镜像仓库');
+  });
+});
+
+describe('manual confirmation eligibility and batch snapshot', () => {
+  const pending = {
+    jobId: 901,
+    candidateDigest: `sha256:${'d'.repeat(64)}`,
+    confirmationDueAt: '2026-01-01T00:01:00.000Z',
+  };
+
+  it('confirm eligibility follows the active pending task only', () => {
+    const confirmable = dto({ id: 51, name: 'web', pendingConfirmation: pending });
+    expect(confirmBlockedHint(confirmable)).toBeNull();
+    const noTask = dto({ id: 52, name: 'idle' });
+    expect(confirmBlockedHint(noTask)).toBe('暂无待确认的更新任务');
+    const removed = dto({
+      id: 53,
+      name: 'gone',
+      status: 'removed',
+      pendingConfirmation: pending,
+    });
+    expect(confirmBlockedHint(removed)).toBe('资源已移除');
+  });
+
+  it('freezes the batch snapshot to selected rows with an active task', () => {
+    const rows = [
+      dto({ id: 61, name: 'web', parentName: 'stack', pendingConfirmation: pending }),
+      dto({
+        id: 62,
+        name: 'same-name-web',
+        parentName: 'other-stack',
+        pendingConfirmation: { ...pending, jobId: 902 },
+      }),
+      dto({ id: 63, name: 'idle' }),
+    ];
+    const snap = buildConfirmSnapshot(rows, [62, 61, 63, 99]);
+    const items: ConfirmItem[] = snap.items;
+    // Selection order preserved; duplicate names carry the parent for定位.
+    expect(items).toEqual([
+      {
+        resourceId: 62,
+        resourceName: 'same-name-web',
+        parentName: 'other-stack',
+        jobId: 902,
+        candidateDigest: pending.candidateDigest,
+      },
+      {
+        resourceId: 61,
+        resourceName: 'web',
+        parentName: 'stack',
+        jobId: 901,
+        candidateDigest: pending.candidateDigest,
+      },
+    ]);
+    expect(snap.skipped).toEqual([
+      { resourceId: 63, name: 'idle', reason: '暂无待确认的更新任务' },
+    ]);
+    // Empty selection → empty snapshot.
+    expect(buildConfirmSnapshot(rows, [])).toEqual({ items: [], skipped: [] });
+  });
+
+  it('summarizes confirmation results and classifies stale errors', () => {
+    expect(summarizeBatchConfirmations({ confirmed: 2, skipped: 1, failed: 1 })).toBe(
+      '确认完成：已确认 2，跳过 1，失败 1',
+    );
+    expect(isStaleConfirmError(409)).toBe(true);
+    expect(isStaleConfirmError(404)).toBe(true);
+    expect(isStaleConfirmError(500)).toBe(false);
+    expect(isStaleConfirmError(403)).toBe(false);
   });
 });

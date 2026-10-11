@@ -10,7 +10,8 @@
 - Application 镜像字段：`docker_image` + `docker_image_tag`；digest 固定写入 tag 字段的 `sha256-<hex>` 形式；`PATCH /applications/{uuid}` 仅提交 `docker_image_tag`。
 - `POST /applications/{uuid}/start` 返回 `deployment_uuid`；`GET /deployments/{deployment_uuid}` 查询 `status`（finished/failed/cancelled/queued/in_progress）。
 - Compose 子容器：`GET /services/{uuid}/applications` 返回 `fqdn`/`status`（无 `id`、无 `is_stopped`）；`PATCH /services/{uuid}/applications/{child}` 接受 `image` 且经 `updateCompose()` 写回 raw Compose（源码 v4.3.23 已核对）。
-- `POST /services/{uuid}/applications/{child}/start` 仅返回 queued 文本，无部署 UUID → Compose 完成证据缺口，产品上落地为“待人工确认”。
+- `POST /services/{uuid}/applications/{child}/start` 仅返回 queued 文本，无部署 UUID → Compose 完成证据缺口，产品上落地为提交后延迟单次运行观察检查（约 60 秒，running + 目标镜像两处一致即推定成功），并提供列表内单项/批量人工确认作为提前放行入口。
+- 待核实（受控集成验证项）：`updateCompose()` 写回 raw Compose 后目标节点 image 是否保持 `authored@sha256:<64hex>` 全等形态。当前自动检查按字符串全等比较该引用；如实测出现归一化差异（引号、registry 前缀补全等），再依证据调整比较规则。
 - `GET /version` 部分构建返回纯文本，客户端做了 text/json 双解析。
 
 toolkit 侧保护：写前语义校验（当前镜像 ∈ {追踪来源, 上一摘要, 候选}）、兄弟容器/域名漂移检测、raw Compose 必须包含目标镜像、前后指纹（镜像+域名白名单字段，原始 compose/env 不落盘）。

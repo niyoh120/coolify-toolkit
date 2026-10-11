@@ -34,7 +34,7 @@ export function OverviewPage() {
     { label: '受管理资源', value: data.resourcesManaged },
     { label: '候选更新', value: data.candidates },
     { label: '失败 / 待处理', value: data.failures },
-    { label: '待人工确认', value: data.pendingConfirmations },
+    { label: '待自动检查', value: data.pendingConfirmations },
   ];
 
   return (

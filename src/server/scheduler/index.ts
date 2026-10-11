@@ -31,10 +31,13 @@ export class Scheduler {
     );
     this.reloadResourceSchedules();
 
-    // Worker: drains the update queue (concurrency honored inside executor).
+    // Worker: drains the update queue (concurrency honored inside executor) and
+    // runs due compose auto-checks; the two entry points stay independent so a
+    // long application poll never delays a due confirmation.
     this.workerTimer = setInterval(() => {
       if (this.stopped) return;
       void this.deps.executor.processQueue().catch(() => undefined);
+      void this.deps.executor.processDueConfirmations().catch(() => undefined);
     }, 5_000);
 
     // Outbox: retry due notifications.

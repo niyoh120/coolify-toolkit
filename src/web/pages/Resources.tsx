@@ -43,7 +43,9 @@ import {
 import { api } from '../lib/api.js';
 import {
   belongsToView,
+  buildConfirmSnapshot,
   buildServiceGroups,
+  type ConfirmItem,
   checkBlockedHint,
   DEFAULT_SERVICE_FILTERS,
   type ExclusionView,
@@ -71,6 +73,13 @@ type PendingBatch =
   | { kind: 'check' }
   | { kind: 'update' }
   | { kind: 'policy'; policy: Policy }
+  | {
+      kind: 'confirm';
+      /** 冻结的任务快照：只有这批 job+digest 会被确认。 */
+      items: ConfirmItem[];
+      skippedCount: number;
+      selectedCount: number;
+    }
   | null;
 
 /** 三档筛选的选择器（应用/服务列表共用）。 */
@@ -151,6 +160,19 @@ function previewNames(list: ResourceDTO[]): string {
       .map((r) => r.name)
       .join('、') + (list.length > 8 ? ` 等 ${list.length} 项` : '')
   );
+}
+
+/** Single-row confirm target built from the row's live pendingConfirmation. */
+function confirmSnapshotItem(rows: ResourceDTO[], id: number): ConfirmItem | null {
+  const row = rows.find((r) => r.id === id);
+  if (row == null || row.pendingConfirmation == null) return null;
+  return {
+    resourceId: row.id,
+    resourceName: row.name,
+    parentName: row.parentName,
+    jobId: row.pendingConfirmation.jobId,
+    candidateDigest: row.pendingConfirmation.candidateDigest,
+  };
 }
 
 // --- applications tab -------------------------------------------------------------
@@ -242,7 +264,7 @@ function ApplicationsView() {
         updatableRows.map((r) => r.id),
         nameOf,
       );
-    } else {
+    } else if (pending.kind === 'policy') {
       // 受限项（待同步/排除/镜像问题）提交前过滤，弹窗列出跳过原因；后端仍整批原子预检兜底。
       void batchRunner.runPolicy(
         selectedRows.filter((r) => !isConfigReadOnly(r)).map((r) => r.id),
@@ -657,6 +679,17 @@ function ServicesView() {
     if (page > pages) setPage(pages);
   }, [filtered.length, pageSize, page]);
 
+  // 轮询后用当前页可选 id 集合收敛选择：隐藏/消失的资源不能留在批量范围内。
+  // 必须在早退之前调用，保证 hook 顺序稳定。
+  const selectableKey = selectableChildIds(paged).join(',');
+  useEffect(() => {
+    setSelected((prev) => {
+      const allowed = new Set(selectableKey === '' ? [] : selectableKey.split(',').map(Number));
+      const next = prev.filter((id) => allowed.has(id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [selectableKey]);
+
   if (isLoading) return <Loading />;
   if (error != null) return <ErrorBox error={error} />;
 
@@ -665,6 +698,8 @@ function ServicesView() {
   const selectedRows = resources.filter((r) => selected.includes(r.id));
   const checkableRows = selectedRows.filter((r) => checkBlockedHint(r) == null);
   const updatableRows = selectedRows.filter((r) => updateBlockedHint(r) == null);
+  const confirmSnapshot = buildConfirmSnapshot(resources, selected);
+  const confirmableCount = confirmSnapshot.items.length;
 
   const toggleChild = (id: number, checked: boolean): void => {
     setSelected((prev) => (checked ? [...prev, id] : prev.filter((x) => x !== id)));
@@ -695,6 +730,9 @@ function ServicesView() {
         updatableRows.map((r) => r.id),
         nameOf,
       );
+    } else if (pending.kind === 'confirm') {
+      // 只确认快照冻结的 job+digest；批量中新建的任务留在范围外。
+      void batchRunner.runConfirmations(pending.items);
     } else {
       void batchRunner.runPolicy(
         selectedRows.filter((r) => !isConfigReadOnly(r)).map((r) => r.id),
@@ -819,6 +857,25 @@ function ServicesView() {
                 >
                   执行更新
                 </Button>
+                <Button
+                  variant="outline"
+                  disabled={batchRunner.busy || confirmableCount === 0}
+                  title={
+                    confirmableCount === 0
+                      ? '勾选中没有待确认的更新任务'
+                      : '对勾选中待确认的任务记录人工确认并解除等待'
+                  }
+                  onClick={() =>
+                    setPendingBatch({
+                      kind: 'confirm',
+                      items: confirmSnapshot.items,
+                      skippedCount: confirmSnapshot.skipped.length,
+                      selectedCount: selected.length,
+                    })
+                  }
+                >
+                  批量确认更新完成（{confirmableCount}）
+                </Button>
                 <Select
                   value=""
                   aria-label="批量设置策略"
@@ -873,8 +930,15 @@ function ServicesView() {
               onUpdate={(id) => {
                 void batchRunner.runUpdates([id], nameOf);
               }}
+              onConfirm={(r) => {
+                // 页面级执行锁：批量进行中不接受新的行级确认。
+                if (batchRunner.busy) return;
+                const item = confirmSnapshotItem(resources, r.id);
+                if (item != null) void batchRunner.runConfirmations([item]);
+              }}
               checkingId={batchRunner.activeCheckId}
               updatingId={batchRunner.activeUpdateId}
+              confirmingId={batchRunner.activeConfirmId}
             />
           ))}
         </div>
@@ -906,7 +970,8 @@ function ServicesView() {
               disabled={
                 batchRunner.busy ||
                 (pendingBatch?.kind === 'policy' &&
-                  selectedRows.filter((r) => !isConfigReadOnly(r)).length === 0)
+                  selectedRows.filter((r) => !isConfigReadOnly(r)).length === 0) ||
+                (pendingBatch?.kind === 'confirm' && pendingBatch.items.length === 0)
               }
               onClick={confirmBatch}
             >
@@ -967,6 +1032,34 @@ function ServicesView() {
             )}
           </>
         )}
+        {pendingBatch?.kind === 'confirm' && (
+          <>
+            <p>
+              已选 {pendingBatch.selectedCount} 项子容器，其中 {pendingBatch.items.length}{' '}
+              项有待确认的更新任务。确认会记录「容器已正常运行」并解除等待；后续自动检查与同服务队列立即放行。
+            </p>
+            {pendingBatch.items.length > 0 && (
+              <div className="text-[12px]">
+                <div className="flex flex-col gap-0.5">
+                  {pendingBatch.items.slice(0, 8).map((item) => (
+                    <div key={item.jobId}>
+                      {item.parentName != null && `${item.parentName} / `}
+                      {item.resourceName} →{' '}
+                      <span className="mono">{shortDigest(item.candidateDigest)}</span>
+                    </div>
+                  ))}
+                  {pendingBatch.items.length > 8 && <div>等 {pendingBatch.items.length} 项</div>}
+                </div>
+              </div>
+            )}
+            {pendingBatch.skippedCount > 0 && (
+              <p className="text-[12px]">
+                其余 {pendingBatch.skippedCount} 项无待确认任务，将自动跳过。
+              </p>
+            )}
+            {pendingBatch.items.length === 0 && <p>没有可确认的子容器，请调整选择。</p>}
+          </>
+        )}
       </Modal>
     </>
   );
@@ -984,8 +1077,10 @@ interface ServiceGroupSectionProps {
   onOpen: (id: number) => void;
   onCheck: (id: number) => void;
   onUpdate: (id: number) => void;
+  onConfirm?: (r: ResourceDTO) => void;
   checkingId: number | null;
   updatingId: number | null;
+  confirmingId?: number | null;
 }
 
 function ServiceGroupSection({
@@ -999,8 +1094,10 @@ function ServiceGroupSection({
   onOpen,
   onCheck,
   onUpdate,
+  onConfirm,
   checkingId,
   updatingId,
+  confirmingId,
 }: ServiceGroupSectionProps) {
   const { group, visibleChildren } = filtered;
   const parent = group.parent;
@@ -1113,8 +1210,10 @@ function ServiceGroupSection({
             onOpen={onOpen}
             onCheck={onCheck}
             onUpdate={onUpdate}
+            onConfirm={onConfirm}
             checkingId={checkingId}
             updatingId={updatingId}
+            confirmingId={confirmingId}
             emptyText="该服务暂无子容器。"
           />
         </div>

@@ -15,13 +15,13 @@ import {
   settingsPatchSchema,
   updateRequestSchema,
 } from '../../shared/schemas.js';
-import type { JobDTO, ResourceKind } from '../../shared/types.js';
+import type { JobDTO, ResourceKind, SuccessSource } from '../../shared/types.js';
 import type { Db } from '../db/client.js';
 import type { UpdateJobRow } from '../db/schema.js';
 import { imageTracks, notificationOutbox, resources, updateJobs } from '../db/schema.js';
 import type { Deps } from '../deps.js';
 import { normalizeReference } from '../integrations/registry/reference.js';
-import { resourceToDTO } from '../modules/dto.js';
+import { isAwaitingConfirmation, resourceToDTO } from '../modules/dto.js';
 import {
   effectiveManagementGate,
   type ManagementGateCode,
@@ -149,7 +149,8 @@ export function createApi(deps: Deps): Hono {
       const failures = jobs.filter((j) =>
         ['failed', 'unknown_submit', 'conflict'].includes(j.status),
       ).length;
-      const pendingConfirmations = jobs.filter((j) => j.stage === 'awaiting_confirmation').length;
+      // 待自动检查：仅 active 等待中的 Compose 任务；终态残留 stage 的行排除。
+      const pendingConfirmations = jobs.filter((j) => isAwaitingConfirmation(j)).length;
       // 受管 = 已分类、未配置排除、无镜像问题、非 compose_service 且非 ignore。
       const managed = active.filter(
         (r) =>
@@ -200,7 +201,7 @@ export function createApi(deps: Deps): Hono {
       const awaitingByResource = new Map<number, (typeof jobs)[number]>();
       for (const j of jobs) {
         if (!latestJobByResource.has(j.resourceId)) latestJobByResource.set(j.resourceId, j);
-        if (j.stage === 'awaiting_confirmation' && !awaitingByResource.has(j.resourceId)) {
+        if (isAwaitingConfirmation(j) && !awaitingByResource.has(j.resourceId)) {
           awaitingByResource.set(j.resourceId, j);
         }
       }
@@ -247,7 +248,7 @@ export function createApi(deps: Deps): Hono {
         .where(eq(updateJobs.resourceId, id))
         .orderBy(desc(updateJobs.id))
         .all();
-      const awaiting = jobRows.find((j) => j.stage === 'awaiting_confirmation') ?? null;
+      const awaiting = jobRows.find((j) => isAwaitingConfirmation(j)) ?? null;
       const parentRow =
         resource.parentId != null
           ? (db.select().from(resources).where(eq(resources.id, resource.parentId)).get() ?? null)
@@ -521,7 +522,7 @@ export function createApi(deps: Deps): Hono {
           ? {
               kind: 'compose_child' as const,
               parentName: parentName(db, resource.parentId),
-              note: '定向部署；Coolify 仅返回 queued，提交后需人工确认',
+              note: '定向部署；提交约 60 秒后自动检查一次运行状态并确认，也可在服务列表提前「确认更新完成」',
             }
           : {
               kind: 'application' as const,
@@ -875,5 +876,19 @@ function jobToDTO(job: UpdateJobRow, resourceName: string, resourceKind_: Resour
     log: job.log as JobDTO['log'],
     createdAt: iso(job.createdAt) ?? '',
     finishedAt: iso(job.finishedAt),
+    confirmationDueAt: iso(job.confirmationDueAt),
+    successSource: deriveSuccessSource(job, resourceKind_),
   };
+}
+
+/**
+ * Evidence source derived from the success state: historical compose successes
+ * stay manual, application successes stay deployment; only the new delayed
+ * runtime check yields runtime_observation (confirmedManually stays false).
+ */
+function deriveSuccessSource(job: UpdateJobRow, kind: ResourceKind): SuccessSource | null {
+  if (job.status !== 'success') return null;
+  if (job.confirmedManually) return 'manual';
+  if (kind === 'service_application') return 'runtime_observation';
+  return 'deployment';
 }

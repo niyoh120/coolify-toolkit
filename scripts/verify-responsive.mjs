@@ -100,7 +100,8 @@ async function goto(baseUrl, hash) {
   // 避免 scenarioAState 注入的筛选/选择残留到后续场景。
   await ab(['reload']);
   const ready = `({ ready: document.readyState === 'complete' && !!document.querySelector('main')?.children.length, loading: !!document.querySelector('main')?.textContent.includes('加载中') })`;
-  // 轮询超时后再 reload 重试一轮：瞬时导航/挂载抖动（page not ready 假阳性）自愈。
+  // 轮询超时后再 reload 重试一轮：瞬时导航/挂载抖动（page not ready 假阳性）与
+  // CDP/daemon 偶发卡顿在整段未就绪时自愈，避免环境噪音误报。
   for (let attempt = 0; attempt < 2; attempt++) {
     for (let t = 0; t < 60; t++) {
       try {
@@ -846,6 +847,174 @@ async function scenarioC(baseUrl) {
   await ab(['screenshot', path.join(shotsDir, 'narrow-320-services.png')]);
 }
 
+/** 确认交互：行内单项确认、批量确认弹窗、快照范围与逐项反馈。 */
+async function scenarioD(baseUrl) {
+  const group = 'D 确认交互';
+  const mediaLabel = 'stack-media-suite 子容器';
+
+  // --- services tab @720: row button states ---
+  await setViewport(720, HEIGHT);
+  await goto(baseUrl, '#/resources?tab=services');
+  await clickInPage(
+    "[...document.querySelectorAll('button[aria-label^=\"展开服务\"]')].find(b => b.getAttribute('aria-label').includes('stack-media-suite'))",
+    'expand media group',
+  );
+  await waitFor(
+    `[(() => { const r = [...document.querySelectorAll('[role="region"]')]; return r.some(x => x.getAttribute('aria-label') === '${mediaLabel}'); })()]`,
+    { label: 'media child region' },
+  );
+  const rowBtns = await evalJson(`(() => {
+    const region = [...document.querySelectorAll('[role="region"]')].find((r) => r.getAttribute('aria-label') === '${mediaLabel}');
+    if (region == null) return [];
+    const rows = [...region.querySelectorAll('tbody tr')];
+    return rows.map((r) => {
+      const btn = [...r.querySelectorAll('td:last-child button')].find((b) => b.textContent.includes('确认更新完成'));
+      return btn == null ? null : { text: btn.textContent.trim(), disabled: btn.disabled, title: btn.title };
+    });
+  })()`);
+  check(
+    group,
+    '行操作区末列存在「确认更新完成」且无任务行禁用',
+    rowBtns.length === 8 &&
+      rowBtns[0]?.disabled === false &&
+      rowBtns[0]?.title === '记录人工确认并解除等待' &&
+      rowBtns[1]?.disabled === false &&
+      rowBtns.slice(2).every((b) => b?.disabled === true && b.title.includes('暂无待确认')),
+    { first: rowBtns[0], third: rowBtns[2], total: rowBtns.length },
+  );
+
+  // --- single confirm stays on the list and refreshes the row ---
+  await clickInPage(
+    "[...document.querySelectorAll('[role=\"region\"] td:last-child button')].find(b => b.textContent.trim() === '确认更新完成' && !b.disabled)",
+    'single confirm button',
+  );
+  await waitFor(`document.body.textContent.includes('已记录人工确认')`, {
+    label: 'single confirm feedback',
+  });
+  const afterSingle = await waitFor(
+    `(() => {
+      const region = [...document.querySelectorAll('[role="region"]')].find((r) => r.getAttribute('aria-label') === '${mediaLabel}');
+      if (region == null) return null;
+      const btn = [...region.querySelectorAll('td:last-child button')].find((b) => b.textContent.includes('确认更新完成'));
+      return btn != null && btn.disabled === true ? { disabled: true } : null;
+    })()`,
+    { label: 'row confirm disabled after confirm' },
+  );
+  check(group, '单项确认后停留在列表且行按钮回到禁用态', afterSingle?.disabled === true);
+
+  // --- batch confirm modal: frozen snapshot, progress, partial feedback ---
+  await clickInPage(
+    "[...document.querySelectorAll('input[aria-label^=\"选择服务\"]')].find(i => i.getAttribute('aria-label').includes('stack-media-suite'))",
+    'media group checkbox',
+  );
+  // 字符串返回值（无数组包装）：未就绪时保持 null，waitFor 真正轮询到启用为止。
+  const batchBtn = await waitFor(
+    "(() => { const b = [...document.querySelectorAll('button')].find((x) => x.textContent.includes('批量确认更新完成')); return b != null && !b.disabled ? b.textContent.trim() : null; })()",
+    { label: 'batch confirm button' },
+  );
+  check(group, '勾选后批量按钮显示可确认数量', batchBtn === '批量确认更新完成（1）', { batchBtn });
+
+  await clickInPage(
+    "[...document.querySelectorAll('button')].find((x) => x.textContent.includes('批量确认更新完成'))",
+    'open batch confirm modal',
+  );
+  await waitFor(`document.querySelector('[role="dialog"]') != null`, {
+    label: 'confirm modal open',
+  });
+  const modalText = await evalJson(`(() => {
+    const dlg = document.querySelector('[role="dialog"]');
+    return {
+      selected: dlg.textContent.includes('已选 8 项子容器'),
+      confirmable: dlg.textContent.includes('1 项有待确认的更新任务'),
+      skipNote: dlg.textContent.includes('无待确认任务，将自动跳过'),
+      digestShown: dlg.textContent.includes('→'),
+      nameShown: dlg.textContent.includes('extremely-long-sub-container-name'),
+    };
+  })()`);
+  check(
+    group,
+    '批量确认弹窗显示选中数/可确认数/跳过说明与候选摘要',
+    modalText.selected &&
+      modalText.confirmable &&
+      modalText.skipNote &&
+      modalText.digestShown &&
+      modalText.nameShown,
+    modalText,
+  );
+
+  // 320x568: dialog stays viewport-bounded with scrollable body.
+  await setViewport(320, 568);
+  await sleep(300);
+  const geo = await evalJson(`(() => {
+    const dlg = document.querySelector('[role="dialog"]');
+    if (dlg == null) return { open: false };
+    const r = dlg.getBoundingClientRect();
+    const body = dlg.querySelector('[data-modal-body]');
+    return {
+      open: true, vh: innerHeight,
+      top: Math.round(r.top), bottom: Math.round(r.bottom),
+      bodyScrollable: body == null ? null : body.scrollHeight >= body.clientHeight,
+      cancelVisible: [...dlg.querySelectorAll('button')].some((b) => b.textContent.trim() === '取消' && b.getClientRects().length > 0),
+    };
+  })()`);
+  check(
+    group,
+    '确认弹窗 @320x568 受视口约束且正文可滚动',
+    geo.open &&
+      geo.top >= 0 &&
+      geo.bottom <= geo.vh &&
+      geo.bodyScrollable === true &&
+      geo.cancelVisible,
+    geo,
+  );
+
+  // Execute: one confirm, zero skips, row cleared.
+  await clickInPage(
+    "[...document.querySelector('[role=\"dialog\"]').querySelectorAll('button')].find(b => b.textContent.trim() === '确认执行')",
+    'batch confirm execute',
+  );
+  await waitFor(`document.body.textContent.includes('确认完成：已确认 1，跳过 0，失败 0')`, {
+    label: 'batch confirm summary',
+  });
+  const rowCleared = await evalJson(`(() => {
+    const region = [...document.querySelectorAll('[role="region"]')].find((r) => r.getAttribute('aria-label') === '${mediaLabel}');
+    if (region == null) return null;
+    const btn = [...region.querySelectorAll('td:last-child button')].find((b) => b.textContent.includes('确认更新完成'));
+    return btn == null ? null : { disabled: btn.disabled, title: btn.title };
+  })()`);
+  check(
+    group,
+    '批量确认后任务离开待确认集合',
+    rowCleared?.disabled === true && rowCleared.title.includes('暂无待确认'),
+    rowCleared,
+  );
+
+  // Empty-selection guard: with no confirmable rows the batch entry stays disabled.
+  await clickInPage(
+    "[...document.querySelectorAll('input[aria-label^=\"选择服务\"]')].find(i => i.getAttribute('aria-label').includes('stack-utils'))",
+    'select utils group',
+  );
+  const disabledEntry = await evalJson(`(() => {
+    const b = [...document.querySelectorAll('button')].find((x) => x.textContent.includes('批量确认更新完成'));
+    return b == null ? null : { disabled: b.disabled, label: b.textContent.trim() };
+  })()`);
+  check(
+    group,
+    '无可确认任务时批量入口禁用',
+    disabledEntry?.disabled === true && disabledEntry.label === '批量确认更新完成（0）',
+    disabledEntry,
+  );
+
+  // Desktop screenshot of the services tab with the confirm column.
+  await setViewport(1440, HEIGHT);
+  await goto(baseUrl, '#/resources?tab=services');
+  await clickInPage(
+    "[...document.querySelectorAll('button[aria-label^=\"展开服务\"]')].find(b => b.getAttribute('aria-label').includes('stack-media-suite'))",
+    'expand media group for screenshot',
+  );
+  await ab(['screenshot', path.join(shotsDir, 'services-confirm-1440.png')]);
+}
+
 // --- helpers for scenario data ------------------------------------------------------
 
 async function serviceDetailId(baseUrl) {
@@ -924,6 +1093,7 @@ async function main() {
     await scenarioB(baseUrl);
     await scenarioC(baseUrl);
     await scenarioManagementViews(baseUrl);
+    await scenarioD(baseUrl);
 
     if (fixture.unknownHits.length > 0) {
       check('fixture', '页面未请求未实现的 API', false, fixture.unknownHits);

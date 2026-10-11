@@ -13,6 +13,7 @@ import {
   ManagementBadge,
   POLICY_LABEL,
   registryTagsUrl,
+  SUCCESS_SOURCE_LABEL,
   shortDigest,
 } from '../components/status.js';
 import {
@@ -421,10 +422,11 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
     onError: (e) =>
       setActionError(`本次确认未完成：${e instanceof Error ? e.message : '请求错误'}`),
   });
+  const awaiting = job.status === 'running' && job.stage === 'awaiting_confirmation';
   return (
     <div className="rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)]/40 px-3 py-2 text-[12px]">
       <div className="flex flex-wrap items-center gap-2">
-        <JobStatusBadge status={job.status} />
+        <JobStatusBadge status={job.status} awaiting={awaiting} />
         <Badge>{job.kind === 'initial_pin' ? '初始化' : '更新'}</Badge>
         <Badge tone={job.trigger === 'auto' ? 'accent' : 'neutral'}>
           {job.trigger === 'auto' ? '自动' : '手动'}
@@ -432,6 +434,11 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
         <span>
           {shortDigest(job.priorDigest)} → <Mono>{shortDigest(job.candidateDigest)}</Mono>
         </span>
+        {job.successSource != null && (
+          <Badge tone="neutral">
+            {SUCCESS_SOURCE_LABEL[job.successSource] ?? job.successSource}
+          </Badge>
+        )}
         {job.deploymentUuid != null && (
           <span className="mono text-[var(--color-text-muted)]">
             部署 {job.deploymentUuid.slice(0, 8)}
@@ -446,10 +453,11 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
               同目标重试
             </Button>
           )}
-          {job.stage === 'awaiting_confirmation' && (
+          {awaiting && (
             <Button
               variant="accent"
               className="whitespace-normal"
+              title="记录人工确认并解除等待；也可等提交约 60 秒后的单次自动检查"
               onClick={() => confirm.mutate()}
               disabled={confirm.isPending}
             >
@@ -458,6 +466,13 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
           )}
         </span>
       </div>
+      {awaiting && job.confirmationDueAt != null && (
+        <div className="pt-1 text-[var(--color-text-secondary)]">
+          提交约 60 秒后自动检查一次运行状态（预计{' '}
+          {new Date(job.confirmationDueAt).toLocaleTimeString('zh-CN', { hour12: false })}，受 5
+          秒轮询与负载影响）；期间可随时人工确认。
+        </div>
+      )}
       {job.errorMessage != null && (
         <div className="pt-1 break-all text-[var(--color-danger)]">
           {job.errorCode}: {job.errorMessage}

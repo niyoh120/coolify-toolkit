@@ -3,7 +3,7 @@ import { useMutation, useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
 
 import { ResourceTabsBar } from '../components/ResourceTabsBar.js';
-import { JobStatusBadge, shortDigest } from '../components/status.js';
+import { JobStatusBadge, SUCCESS_SOURCE_LABEL, shortDigest } from '../components/status.js';
 import {
   Badge,
   Button,
@@ -133,10 +133,13 @@ export function HistoryPage() {
                     </span>
                   </Td>
                   <Td>
-                    <JobStatusBadge status={j.status} />
-                    {j.stage === 'awaiting_confirmation' && (
-                      <Badge tone="warning" title="Coolify 仅返回 queued，无完成证据">
-                        待确认
+                    <JobStatusBadge
+                      status={j.status}
+                      awaiting={j.status === 'running' && j.stage === 'awaiting_confirmation'}
+                    />
+                    {j.successSource != null && (
+                      <Badge tone="neutral" className="whitespace-normal">
+                        {SUCCESS_SOURCE_LABEL[j.successSource] ?? j.successSource}
                       </Badge>
                     )}
                   </Td>
@@ -176,9 +179,10 @@ export function HistoryPage() {
                           重试
                         </Button>
                       )}
-                      {j.stage === 'awaiting_confirmation' && (
+                      {j.status === 'running' && j.stage === 'awaiting_confirmation' && (
                         <Button
                           variant="accent"
+                          title="记录人工确认并解除等待；也可等服务列表的自动检查"
                           onClick={() => {
                             if (
                               window.confirm(

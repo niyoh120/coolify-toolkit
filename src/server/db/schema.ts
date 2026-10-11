@@ -99,8 +99,11 @@ export const imageTracks = sqliteTable(
     lastSuccessfulDigest: text('last_successful_digest'),
     lastSuccessAt: integer('last_success_at'),
     lastSuccessDeploymentUuid: text('last_success_deployment_uuid'),
-    /** deployment = completion evidence; manual = user-attested (compose limitation). */
-    lastSuccessSource: text('last_success_source', { enum: ['deployment', 'manual'] }),
+    /** deployment = completion evidence; manual = user-attested (compose limitation;
+     *  runtime_observation = single post-deploy runtime check auto-confirmed). */
+    lastSuccessSource: text('last_success_source', {
+      enum: ['deployment', 'manual', 'runtime_observation'],
+    }),
     pinnedAt: integer('pinned_at'),
     /** discovered | user */
     trackSource: text('track_source', { enum: ['discovered', 'user'] })
@@ -155,6 +158,9 @@ export const updateJobs = sqliteTable(
     log: text('log', { mode: 'json' }).$type<unknown[]>().notNull().default([]),
     /** Manual confirmation for compose submissions without completion evidence. */
     confirmedManually: integer('confirmed_manually', { mode: 'boolean' }).notNull().default(false),
+    /** Epoch-ms due time of the single delayed auto-check for compose children.
+     *  Independent column: log writes bump updatedAt and must not shift the timer. */
+    confirmationDueAt: integer('confirmation_due_at'),
     idempotencyKey: text('idempotency_key').notNull(),
     createdAt: integer('created_at').notNull().$defaultFn(now),
     updatedAt: integer('updated_at').notNull().$defaultFn(now),

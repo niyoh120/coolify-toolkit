@@ -79,7 +79,7 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
   const summary = groupSummary(children);
   const checkable = children.filter((r) => checkBlockedHint(r) == null);
   const updatable = children.filter((r) => updateBlockedHint(r) == null);
-  // 同服务前一个任务待人工确认：后续任务只能排队，提供进入子容器确认的入口。
+  // 同服务前一个任务等待自动检查/人工确认：后续任务只能排队，行内按钮可直接确认。
   const awaitingChildren = children.filter(
     (r) => r.track?.view.deployState === 'pending_confirmation',
   );
@@ -271,17 +271,23 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
               {awaitingChildren.length > 0 && (
                 <div className="rounded border border-[var(--color-info)]/40 bg-[var(--color-info)]/5 px-3 py-2 text-[12px] text-[var(--color-info)]">
                   {awaitingChildren.length}{' '}
-                  个子容器有已提交、待人工确认的任务，同服务的后续任务将排队。请进入对应子容器详情确认：
+                  个子容器有已提交、等待自动检查的任务，同服务的后续任务将排队。默认在提交约 60
+                  秒后自动检查一次；也可在下方行操作中直接「确认更新完成」提前放行：
                   <span className="flex flex-wrap gap-2 pt-1">
                     {awaitingChildren.map((r) => (
-                      <button
-                        key={r.id}
-                        type="button"
-                        className="text-[var(--color-accent)] hover:underline"
-                        onClick={() => navigate({ page: 'resource', id: r.id })}
-                      >
-                        {r.name} ↗
-                      </button>
+                      <span key={r.id}>
+                        {r.name}
+                        {r.pendingConfirmation?.confirmationDueAt != null && (
+                          <span className="text-[var(--color-text-muted)]">
+                            （到期{' '}
+                            {new Date(r.pendingConfirmation.confirmationDueAt).toLocaleTimeString(
+                              'zh-CN',
+                              { hour12: false },
+                            )}
+                            ）
+                          </span>
+                        )}
+                      </span>
                     ))}
                   </span>
                 </div>
@@ -319,8 +325,23 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
                 onUpdate={(id) => {
                   void batchRunner.runUpdates([id], nameOf);
                 }}
+                onConfirm={(r) => {
+                  // 页面级执行锁：批量进行中不接受新的行级确认。
+                  if (batchRunner.busy) return;
+                  if (r.pendingConfirmation == null) return;
+                  void batchRunner.runConfirmations([
+                    {
+                      resourceId: r.id,
+                      resourceName: r.name,
+                      parentName: r.parentName,
+                      jobId: r.pendingConfirmation.jobId,
+                      candidateDigest: r.pendingConfirmation.candidateDigest,
+                    },
+                  ]);
+                }}
                 checkingId={batchRunner.activeCheckId}
                 updatingId={batchRunner.activeUpdateId}
+                confirmingId={batchRunner.activeConfirmId}
                 emptyText="该服务暂无可显示的 active 子容器。"
               />
               <GroupFeedback batch={batchRunner.result} lines={feedbackLines} />

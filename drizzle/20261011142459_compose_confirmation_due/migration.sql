@@ -1,0 +1,1 @@
+ALTER TABLE `update_jobs` ADD `confirmation_due_at` integer;

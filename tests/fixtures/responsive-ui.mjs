@@ -61,6 +61,7 @@ function makeResource(overrides = {}) {
     lastSyncedAt: '2025-05-01T07:00:00.000Z',
     updatedAt: '2025-05-01T07:30:00.000Z',
     track: null,
+    pendingConfirmation: null,
   };
   return { ...base, ...overrides };
 }
@@ -97,6 +98,8 @@ function makeTrack(resourceId, overrides = {}) {
 }
 
 function makeJob(id, overrides = {}) {
+  // 成功证据来源只属于成功/运行中（等待确认）的任务；失败与冲突行不带徽标。
+  const status = overrides.status ?? 'success';
   return {
     id,
     resourceId: 1,
@@ -125,6 +128,9 @@ function makeJob(id, overrides = {}) {
     ],
     createdAt: '2025-05-01T08:00:00.000Z',
     finishedAt: '2025-05-01T08:02:00.000Z',
+    confirmationDueAt: null,
+    successSource:
+      overrides.successSource ?? (status === 'success' || status === 'running' ? 'deployment' : null),
     ...overrides,
   };
 }
@@ -399,11 +405,33 @@ function buildState() {
         parentCoolifyUuid: mediaParent.coolifyUuid,
         serverName: LONG_SERVER,
         domains: LONG_DOMAIN,
-        track: makeTrack(rid, {
-          sourceRepository: `media/very-long-component-repository-${i}`,
-          sourceTag: 'stable',
-        }),
+        track: makeTrack(
+          rid,
+          i <= 2
+            ? {
+                sourceRepository: `media/very-long-component-repository-${i}`,
+                sourceTag: 'stable',
+                view: {
+                  configuredMatchesUpstream: true,
+                  hasCandidate: false,
+                  checkOutcome: 'matching',
+                  deployState: 'pending_confirmation',
+                },
+              }
+            : {
+                sourceRepository: `media/very-long-component-repository-${i}`,
+                sourceTag: 'stable',
+              },
+        ),
         policy: 'auto',
+        pendingConfirmation:
+          i <= 2
+            ? {
+                jobId: 900000 + i,
+                candidateDigest: hex64(`pend-${rid}`),
+                confirmationDueAt: '2025-05-01T08:01:30.000Z',
+              }
+            : null,
       }),
     );
   }
@@ -466,8 +494,23 @@ function buildState() {
       }),
     );
   }
-
-  // --- jobs: 25 rows across statuses (>1 page), long errors, one awaiting -------
+  // pendingConfirmation carriers must have matching live jobs so the confirm
+  // endpoint can succeed (mirrors the real server contract).
+  for (const pendChild of resources.filter((r) => r.pendingConfirmation != null)) {
+    jobs.push(
+      makeJob(pendChild.pendingConfirmation.jobId, {
+        resourceId: pendChild.id,
+        resourceName: pendChild.name,
+        resourceKind: 'service_application',
+        candidateDigest: pendChild.pendingConfirmation.candidateDigest,
+        status: 'running',
+        stage: 'awaiting_confirmation',
+        deploymentUuid: null,
+        successSource: null,
+        confirmationDueAt: pendChild.pendingConfirmation.confirmationDueAt,
+      }),
+    );
+  }
   for (let i = 1; i <= 25; i++) {
     const rid = resources[(i * 7) % resources.length];
     if (i === 3) {
@@ -475,8 +518,11 @@ function buildState() {
         makeJob(id(), {
           resourceId: rid.id,
           resourceName: rid.name,
-          status: 'unknown_submit',
+          status: 'running',
           stage: 'awaiting_confirmation',
+          deploymentUuid: null,
+          successSource: null,
+          confirmationDueAt: '2025-05-01T08:01:30.000Z',
         }),
       );
     } else if (i === 5) {
@@ -585,9 +631,7 @@ function buildState() {
     const failures = jobs.filter((j) =>
       ['failed', 'unknown_submit', 'conflict'].includes(j.status),
     ).length;
-    const pending = resources.filter(
-      (r) => r.track?.view.deployState === 'pending_confirmation',
-    ).length;
+    const pending = resources.filter((r) => r.pendingConfirmation != null).length;
     return {
       resourcesTotal: resources.length,
       resourcesManaged: managed,
@@ -786,6 +830,8 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
           log: [{ at: new Date().toISOString(), stage: 'queued', message: '任务进入队列' }],
         });
         state.jobs.unshift(job);
+        job.successSource = null;
+        job.confirmationDueAt = null;
         track.configuredDigest = candidate;
         track.configuredReference = job.candidateReference;
         track.view = {
@@ -834,6 +880,14 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
       if (seg[3] === 'confirm' && method === 'POST') {
         job.stage = 'done';
         job.status = 'success';
+        job.successSource = 'manual';
+        job.confirmationDueAt = null;
+        // Mirror the server: the confirmed task leaves the pending set.
+        const owner = state.resources.find((r) => r.pendingConfirmation?.jobId === job.id);
+        if (owner != null) {
+          owner.pendingConfirmation = null;
+          if (owner.track?.view != null) owner.track.view.deployState = 'success';
+        }
         return json({ job });
       }
     }

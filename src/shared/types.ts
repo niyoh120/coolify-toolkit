@@ -12,7 +12,7 @@ export type BlockReason =
   | 'external_change' // user edited the image outside toolkit expectations
   | 'platform_missing' // no verifiable target platform
   | 'excluded' // matches infra exclusion list or unsupported type
-  | 'compose_confirmation_pending' // compose deployment lacks completion evidence
+  | 'compose_confirmation_pending' // compose: submitted, waiting for the delayed auto-check
   | 'stopped' // resource is stopped; manual start required
   | 'update_failed' // last update failed; keep target config, require user action
   | null;
@@ -76,7 +76,18 @@ export type DeployState =
   | 'deploying'
   | 'success'
   | 'failed'
-  | 'pending_confirmation'; // compose: submitted, no completion evidence available
+  | 'pending_confirmation'; // compose: submitted, waiting for the delayed auto-check
+
+/** How a successful job's evidence was established. */
+export type SuccessSource = 'deployment' | 'manual' | 'runtime_observation';
+
+/** Pending compose confirmation summary projected onto the owning child row. */
+export interface PendingConfirmationDTO {
+  jobId: number;
+  candidateDigest: string;
+  /** Epoch ISO time of the single delayed auto-check; null for legacy rows. */
+  confirmationDueAt: string | null;
+}
 
 /** Effective combined view for one image track (derived, not stored). */
 export interface TrackView {
@@ -127,6 +138,8 @@ export interface ResourceDTO {
   updatedAt: string | null;
   /** null when the resource cannot carry a track (compose_service parent). */
   track: TrackDTO | null;
+  /** Active running/awaiting_confirmation compose task summary; null otherwise. */
+  pendingConfirmation: PendingConfirmationDTO | null;
 }
 
 export interface TrackDTO {
@@ -147,7 +160,7 @@ export interface TrackDTO {
   lastSuccessfulDigest: string | null;
   lastSuccessAt: string | null;
   lastSuccessDeploymentUuid: string | null;
-  lastSuccessSource: 'deployment' | 'manual' | null;
+  lastSuccessSource: SuccessSource | null;
   pinnedAt: string | null;
   view: TrackView;
 }
@@ -178,6 +191,10 @@ export interface JobDTO {
   log: JobLogEntry[];
   createdAt: string;
   finishedAt: string | null;
+  /** Due time of the pending single auto-check; null unless awaiting it. */
+  confirmationDueAt: string | null;
+  /** Derived evidence source once the job succeeded; null while in flight. */
+  successSource: SuccessSource | null;
 }
 
 export interface NotificationDTO {

@@ -9,11 +9,13 @@ import { eq } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { AppConfig } from '../src/server/config.js';
 import { migrate, type OpenDbResult, openDatabase } from '../src/server/db/client.js';
+import type { UpdateJobRow } from '../src/server/db/schema.js';
 import { imageTracks, notificationOutbox, resources, updateJobs } from '../src/server/db/schema.js';
 import { SettingsRepo } from '../src/server/db/settings-repo.js';
 import type { CoolifyClient } from '../src/server/integrations/coolify/client.js';
 import { CoolifyApiError } from '../src/server/integrations/coolify/client.js';
 import { Outbox } from '../src/server/modules/notifications/outbox.js';
+import { UpdateChecker } from '../src/server/modules/updates/checker.js';
 import { UpdateExecutor } from '../src/server/modules/updates/executor.js';
 import { JobsService } from '../src/server/modules/updates/jobs.js';
 import type {
@@ -98,6 +100,7 @@ function freshExecutor(): void {
   executor = new UpdateExecutor(h.db, coolify.client(), jobs, outbox, settings, cfg, {
     pollIntervalMs: 5,
     confirmWindowMs: 2_000,
+    autoConfirmDelayMs: 60_000,
   });
 }
 
@@ -322,6 +325,9 @@ describe('application executor', () => {
 
 class StubCompose extends StubCoolify {
   raw = 'services:\n  web:\n    image: nginx:1.27\n  db:\n    image: postgres:16\n';
+  svcUuid = 'svc-1';
+  childUuid = 'child-1';
+  siblingUuid = 'child-2';
   children: CoolifyServiceApplication[] = [
     {
       uuid: 'child-1',
@@ -346,6 +352,20 @@ class StubCompose extends StubCoolify {
   ];
   childPatchCalls = 0;
   childStartCalls = 0;
+  /** Simulated latency for service reads (race tests). */
+  readDelayMs = 0;
+  /** When true, service reads fail with a network-level error. */
+  failReads = false;
+
+  constructor(suffix = '') {
+    super();
+    if (suffix !== '') {
+      this.svcUuid += suffix;
+      this.childUuid += suffix;
+      this.siblingUuid += suffix;
+      for (const c of this.children) c.uuid += suffix;
+    }
+  }
 
   override client(): CoolifyClient {
     const self = this;
@@ -353,7 +373,8 @@ class StubCompose extends StubCoolify {
     return {
       ...base,
       async getService(uuid: string) {
-        if (uuid !== 'svc-1') throw new CoolifyApiError('missing', 404);
+        if (self.readDelayMs > 0) await sleep(self.readDelayMs);
+        if (self.failReads || uuid !== self.svcUuid) throw new CoolifyApiError('missing', 404);
         return {
           uuid,
           docker_compose_raw: self.raw,
@@ -362,6 +383,8 @@ class StubCompose extends StubCoolify {
         } as unknown as CoolifyService;
       },
       async listServiceApplications() {
+        if (self.readDelayMs > 0) await sleep(self.readDelayMs);
+        if (self.failReads) throw new CoolifyApiError('read failed', null);
         return self.children.map((c) => ({ ...c }));
       },
       async patchServiceApplication(
@@ -373,8 +396,12 @@ class StubCompose extends StubCoolify {
         const c = self.children.find((x) => x.uuid === childUuid);
         if (c == null) throw new CoolifyApiError('not found', 404);
         c.image = patch.image as string;
-        // Mirror the real updateCompose(): raw gets rewritten with the new image.
-        self.raw = self.raw.replace('nginx:1.27', patch.image as string);
+        // Mirror the real updateCompose(): raw gets rewritten with the new image
+        // (sequential jobs replace the previous digest-pinned reference).
+        self.raw = self.raw.replace(
+          /nginx@(sha256:[a-f0-9]{64})|nginx:1\.27/,
+          patch.image as string,
+        );
         return {};
       },
       async startServiceApplication() {
@@ -385,81 +412,83 @@ class StubCompose extends StubCoolify {
   }
 }
 
+async function seedCompose(suffix = ''): Promise<number> {
+  const now = Date.now();
+  const svcUuid = `svc-1${suffix}`;
+  const parent = h.db
+    .insert(resources)
+    .values({
+      kind: 'compose_service',
+      coolifyUuid: svcUuid,
+      name: `stack${suffix}`,
+      managementClassified: true,
+      lastSyncedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .returning()
+    .get();
+  const child = h.db
+    .insert(resources)
+    .values({
+      kind: 'service_application',
+      coolifyUuid: `child-1${suffix}`,
+      parentId: parent.id,
+      name: 'web',
+      composeServiceName: 'web',
+      currentImage: 'nginx:1.27',
+      configFingerprint: 'fp',
+      policy: 'notify',
+      managementClassified: true,
+      lastSyncedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .returning()
+    .get();
+  // Seed the sibling row so drift checks can compare.
+  h.db
+    .insert(resources)
+    .values({
+      kind: 'service_application',
+      coolifyUuid: `child-2${suffix}`,
+      parentId: parent.id,
+      name: 'db',
+      composeServiceName: 'db',
+      currentImage: 'postgres:16',
+      configFingerprint: 'fp2',
+      managementClassified: true,
+      lastSyncedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+  h.db
+    .insert(imageTracks)
+    .values({
+      resourceId: child.id,
+      sourceRegistry: 'docker.io',
+      sourceRepository: 'library/nginx',
+      sourceRepositoryAuthored: 'nginx',
+      sourceTag: '1.27',
+      targetPlatform: 'linux/amd64',
+      platformSource: 'compose',
+      configuredDigest: null,
+      configuredReference: 'nginx:1.27',
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+  return child.id;
+}
+
 describe('compose child executor', () => {
   function composeExecutor(stub: StubCompose): UpdateExecutor {
     return new UpdateExecutor(h.db, stub.client(), jobs, outbox, settings, cfg, {
       pollIntervalMs: 5,
       confirmWindowMs: 2_000,
+      autoConfirmDelayMs: 60_000,
     });
-  }
-
-  async function seedCompose(): Promise<number> {
-    const now = Date.now();
-    const parent = h.db
-      .insert(resources)
-      .values({
-        kind: 'compose_service',
-        coolifyUuid: 'svc-1',
-        name: 'stack',
-        managementClassified: true,
-        lastSyncedAt: now,
-        createdAt: now,
-        updatedAt: now,
-      })
-      .returning()
-      .get();
-    const child = h.db
-      .insert(resources)
-      .values({
-        kind: 'service_application',
-        coolifyUuid: 'child-1',
-        parentId: parent.id,
-        name: 'web',
-        composeServiceName: 'web',
-        currentImage: 'nginx:1.27',
-        configFingerprint: 'fp',
-        policy: 'notify',
-        managementClassified: true,
-        lastSyncedAt: now,
-        createdAt: now,
-        updatedAt: now,
-      })
-      .returning()
-      .get();
-    // Seed the sibling row so drift checks can compare.
-    h.db
-      .insert(resources)
-      .values({
-        kind: 'service_application',
-        coolifyUuid: 'child-2',
-        parentId: parent.id,
-        name: 'db',
-        composeServiceName: 'db',
-        currentImage: 'postgres:16',
-        configFingerprint: 'fp2',
-        managementClassified: true,
-        lastSyncedAt: now,
-        createdAt: now,
-        updatedAt: now,
-      })
-      .run();
-    h.db
-      .insert(imageTracks)
-      .values({
-        resourceId: child.id,
-        sourceRegistry: 'docker.io',
-        sourceRepository: 'library/nginx',
-        sourceRepositoryAuthored: 'nginx',
-        sourceTag: '1.27',
-        targetPlatform: 'linux/amd64',
-        platformSource: 'compose',
-        configuredDigest: null,
-        configuredReference: 'nginx:1.27',
-        createdAt: now,
-        updatedAt: now,
-      })
-      .run();
-    return child.id;
   }
 
   it('patches only the target image, submits targeted deploy, lands in awaiting_confirmation', async () => {
@@ -471,6 +500,9 @@ describe('compose child executor', () => {
     await exec.processQueue();
     const after = h.db.select().from(updateJobs).where(eq(updateJobs.id, job.id)).get();
     expect(after).toMatchObject({ status: 'running', stage: 'awaiting_confirmation' });
+    // The single delayed auto-check window is persisted (submit time + delay).
+    expect(after?.confirmationDueAt).toBeGreaterThan(Date.now());
+    expect(after?.confirmationDueAt).toBeLessThanOrEqual(Date.now() + 60_000);
     // Target image written as authored@digest; sibling untouched.
     expect(stub.children[0]?.image).toBe(`nginx@${D_B}`);
     expect(stub.children[1]?.image).toBe('postgres:16');
@@ -482,14 +514,14 @@ describe('compose child executor', () => {
       blockedReason: 'compose_confirmation_pending',
       currentImage: `nginx@${D_B}`,
     });
-    // Submit-unknown style notification raised.
+    // New submissions no longer raise the manual-confirmation warning.
     expect(
       h.db
         .select()
         .from(notificationOutbox)
         .all()
         .some((n) => n.eventType === 'submit_unknown'),
-    ).toBe(true);
+    ).toBe(false);
 
     // Manual confirmation records human evidence and unblocks.
     jobs.confirmSubmission(job.id, D_B);
@@ -799,5 +831,401 @@ describe('queue safety across the upgrade transition', () => {
     expect(track?.lastSuccessfulDigest).toBe(D_B);
     const res = h.db.select().from(resources).where(eq(resources.id, id)).get();
     expect(res?.managementClassified).toBe(false);
+  });
+});
+
+// --- delayed single auto-check ---------------------------------------------------
+
+const D_C = `sha256:${'c'.repeat(64)}`; // next upstream candidate
+
+/** Force the persisted waiting window due without sleeping in tests. */
+function dueNow(jobId: number): void {
+  h.db
+    .update(updateJobs)
+    .set({ confirmationDueAt: Date.now() - 1 })
+    .where(eq(updateJobs.id, jobId))
+    .run();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function jobRow(jobId: number): UpdateJobRow {
+  const row = h.db.select().from(updateJobs).where(eq(updateJobs.id, jobId)).get();
+  if (row == null) throw new Error(`job ${jobId} missing`);
+  return row;
+}
+
+describe('compose delayed auto-check', () => {
+  function composeExecutor(stub: StubCompose): UpdateExecutor {
+    return new UpdateExecutor(h.db, stub.client(), jobs, outbox, settings, cfg, {
+      pollIntervalMs: 5,
+      confirmWindowMs: 2_000,
+      autoConfirmDelayMs: 60_000,
+    });
+  }
+
+  /** Submit a compose update and land it in awaiting_confirmation. */
+  async function submitAwaiting(
+    exec: UpdateExecutor,
+    suffix = '',
+  ): Promise<{ jobId: number; childId: number }> {
+    const childId = await seedCompose(suffix);
+    const token = jobs.issuePreviewToken(childId, D_B);
+    const job = jobs.createManualJob(childId, D_B, token);
+    await exec.processQueue();
+    const row = jobRow(job.id);
+    if (row.stage !== 'awaiting_confirmation') {
+      throw new Error(`expected awaiting_confirmation, got ${row.status}/${row.stage}`);
+    }
+    return { jobId: job.id, childId };
+  }
+
+  it('auto-confirms one successful round after the due time and frees the parent', async () => {
+    const stub = new StubCompose();
+    const exec = composeExecutor(stub);
+    const { jobId, childId } = await submitAwaiting(exec);
+    stub.children[0]!.status = 'running:healthy';
+
+    // Before due: the check never runs, even when invoked directly.
+    await expect(exec.processDueConfirmations()).resolves.toBe(0);
+    expect(jobRow(jobId).status).toBe('running');
+
+    // Due: exactly one read round succeeds.
+    dueNow(jobId);
+    await expect(exec.processDueConfirmations()).resolves.toBe(1);
+
+    const row = jobRow(jobId);
+    expect(row).toMatchObject({
+      status: 'success',
+      stage: 'done',
+      confirmedManually: false,
+      confirmationDueAt: null,
+      errorCode: null,
+    });
+    expect(JSON.stringify(row.log)).toContain('健康检查已通过');
+    const track = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, childId)).get();
+    expect(track).toMatchObject({
+      lastSuccessfulDigest: D_B,
+      lastSuccessSource: 'runtime_observation',
+      configuredDigest: D_B,
+    });
+    const childRow = h.db.select().from(resources).where(eq(resources.id, childId)).get();
+    expect(childRow).toMatchObject({ blockedReason: null, currentImage: `nginx@${D_B}` });
+    // Exactly one deduped success notification; no manual-reminder noise.
+    const success = h.db
+      .select()
+      .from(notificationOutbox)
+      .all()
+      .filter((n) => n.eventType === 'update_success');
+    expect(success).toHaveLength(1);
+    expect(success[0]?.body).toContain('运行观察自动确认');
+    expect(success[0]?.dedupeKey).toBe(`update_success:${jobId}`);
+
+    // Parent mutex released: a sibling job for the same parent can now run.
+    const token2 = jobs.issuePreviewToken(childId, D_C);
+    const job2 = jobs.createManualJob(childId, D_C, token2);
+    await exec.processQueue();
+    expect(jobRow(job2.id).status).toBe('running');
+  });
+
+  it('accepts running:unhealthy as running and logs the suffix', async () => {
+    const stub = new StubCompose();
+    const exec = composeExecutor(stub);
+    const { jobId } = await submitAwaiting(exec);
+    stub.children[0]!.status = 'running:unhealthy';
+    dueNow(jobId);
+    await exec.processDueConfirmations();
+    const row = jobRow(jobId);
+    expect(row.status).toBe('success');
+    expect(JSON.stringify(row.log)).toContain('unhealthy');
+  });
+
+  it.each([
+    ['exited', 'container_not_running'],
+    ['starting', 'container_not_running'],
+    ['', 'container_not_running'],
+  ])('fails the check when container status is %s', async (status, code) => {
+    const stub = new StubCompose();
+    const exec = composeExecutor(stub);
+    const { jobId, childId } = await submitAwaiting(exec);
+    stub.children[0]!.status = status;
+    dueNow(jobId);
+    await exec.processDueConfirmations();
+    const row = jobRow(jobId);
+    expect(row).toMatchObject({ status: 'failed', errorCode: code, confirmationDueAt: null });
+    const childRow = h.db.select().from(resources).where(eq(resources.id, childId)).get();
+    expect(childRow?.blockedReason).toBe('update_failed');
+    // Evidence keeps the prior success; target config B stays written.
+    const track = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, childId)).get();
+    expect(track?.lastSuccessfulDigest).toBeNull();
+    expect(track?.configuredDigest).toBe(D_B);
+    // Terminal: re-running the due loop never reprocesses or re-notifies.
+    await expect(exec.processDueConfirmations()).resolves.toBe(0);
+    expect(
+      h.db
+        .select()
+        .from(notificationOutbox)
+        .all()
+        .filter((n) => n.eventType === 'update_failed'),
+    ).toHaveLength(1);
+  });
+
+  it('flags conflict when the live child image drifted', async () => {
+    const stub = new StubCompose();
+    const exec = composeExecutor(stub);
+    const { jobId, childId } = await submitAwaiting(exec);
+    stub.children[0]!.image = 'nginx:9'; // user edited in Coolify after deploy
+    dueNow(jobId);
+    await exec.processDueConfirmations();
+    expect(jobRow(jobId)).toMatchObject({ status: 'conflict', errorCode: 'external_change' });
+    const childRow = h.db.select().from(resources).where(eq(resources.id, childId)).get();
+    expect(childRow?.blockedReason).toBe('external_change');
+    expect(
+      h.db
+        .select()
+        .from(notificationOutbox)
+        .all()
+        .some((n) => n.title === '更新冲突'),
+    ).toBe(true);
+  });
+
+  it.each([
+    [
+      'raw missing',
+      (s: StubCompose) => {
+        s.raw = '   ';
+      },
+      'compose_raw_missing',
+      'failed',
+    ],
+    [
+      'raw invalid',
+      (s: StubCompose) => {
+        s.raw = 'services: [oops';
+      },
+      'compose_raw_invalid',
+      'failed',
+    ],
+    [
+      'target node missing',
+      (s: StubCompose) => {
+        s.raw = 'services:\n  db:\n    image: postgres:16\n';
+      },
+      'compose_service_missing',
+      'failed',
+    ],
+    [
+      'candidate only in a comment',
+      (s: StubCompose) => {
+        s.raw = `services:\n  web:\n    # nginx@${D_B}\n    image: nginx@${D_B}#wrong\n`;
+      },
+      'external_change',
+      'conflict',
+    ],
+  ])('fails with an explicit error when %s', async (_name, mutate, code, expectStatus) => {
+    const stub = new StubCompose();
+    const exec = composeExecutor(stub);
+    const { jobId } = await submitAwaiting(exec);
+    mutate(stub);
+    dueNow(jobId);
+    await exec.processDueConfirmations();
+    const row = jobRow(jobId);
+    expect(row.errorCode).toBe(code);
+    expect(row.confirmationDueAt).toBeNull();
+    expect(row.status).toBe(expectStatus ?? 'failed');
+  });
+
+  it('fails explicitly when the read round errors or the child vanished', async () => {
+    const stub = new StubCompose();
+    const exec = composeExecutor(stub);
+    const { jobId, childId } = await submitAwaiting(exec);
+    stub.failReads = true;
+    dueNow(jobId);
+    await exec.processDueConfirmations();
+    expect(jobRow(jobId)).toMatchObject({ status: 'failed', errorCode: 'coolify_unreachable' });
+    expect(
+      h.db.select().from(resources).where(eq(resources.id, childId)).get()?.blockedReason,
+    ).toBe('update_failed');
+
+    // Disappeared child: explicit error terminal, evidence preserved.
+    const stub2 = new StubCompose('-2');
+    const exec2 = composeExecutor(stub2);
+    const second = await submitAwaiting(exec2, '-2');
+    stub2.children = stub2.children.filter((c) => c.uuid !== 'child-1-2');
+    dueNow(second.jobId);
+    await exec2.processDueConfirmations();
+    expect(jobRow(second.jobId)).toMatchObject({ status: 'failed', errorCode: 'child_missing' });
+  });
+
+  it('a manual confirmation that races the in-flight auto check wins', async () => {
+    const stub = new StubCompose();
+    stub.readDelayMs = 400; // auto check is mid-read while the user confirms
+    const exec = composeExecutor(stub);
+    const { jobId, childId } = await submitAwaiting(exec);
+    dueNow(jobId);
+    const inflight = exec.processDueConfirmations();
+    await sleep(80); // let the auto check start its read round
+    jobs.confirmSubmission(jobId, D_B);
+    await inflight;
+    const row = jobRow(jobId);
+    expect(row).toMatchObject({ status: 'success', confirmedManually: true });
+    const track = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, childId)).get();
+    expect(track?.lastSuccessSource).toBe('manual');
+    // The losing auto check emitted no success notification.
+    expect(
+      h.db
+        .select()
+        .from(notificationOutbox)
+        .all()
+        .some((n) => n.eventType === 'update_success'),
+    ).toBe(false);
+  });
+
+  it('a failing check that loses the race to a manual confirm writes nothing', async () => {
+    const stub = new StubCompose();
+    stub.readDelayMs = 400;
+    const exec = composeExecutor(stub);
+    const { jobId, childId } = await submitAwaiting(exec);
+    dueNow(jobId);
+    const inflight = exec.processDueConfirmations();
+    await sleep(80); // confirm lands while the check is mid-read
+    jobs.confirmSubmission(jobId, D_B);
+    // The read result would fail the check (container exited)...
+    stub.children[0]!.status = 'exited';
+    await inflight;
+    // ...but the guarded failure must not stomp the manual success.
+    expect(jobRow(jobId)).toMatchObject({
+      status: 'success',
+      confirmedManually: true,
+      confirmationDueAt: null,
+    });
+    expect(
+      h.db.select().from(resources).where(eq(resources.id, childId)).get()?.blockedReason,
+    ).toBeNull();
+    expect(
+      h.db
+        .select()
+        .from(notificationOutbox)
+        .all()
+        .some((n) => n.eventType === 'update_failed'),
+    ).toBe(false);
+  });
+
+  it('backfills legacy awaiting rows on boot, pauses old reminders and rechecks read-only', async () => {
+    const stub = new StubCompose();
+    const exec = composeExecutor(stub);
+    const { jobId } = await submitAwaiting(exec);
+    // Simulate a pre-upgrade row: no due time, plus a pending manual reminder.
+    h.db
+      .update(updateJobs)
+      .set({ confirmationDueAt: null, updatedAt: Date.now() - 30_000 })
+      .where(eq(updateJobs.id, jobId))
+      .run();
+    outbox.enqueue({
+      eventType: 'submit_unknown',
+      resourceId: 1,
+      dedupeKey: `compose_submitted:${jobId}`,
+      payload: { title: 'Compose 更新已提交，待确认', body: 'legacy', type: 'warning' },
+    });
+
+    const r = await exec.reconcileOnBoot();
+    expect(r.requeued).toBe(0);
+    const row = jobRow(jobId);
+    expect(row.confirmationDueAt).toBeGreaterThanOrEqual(Date.now() + 29_000);
+    expect(row.status).toBe('running');
+    const notes = h.db.select().from(notificationOutbox).all();
+    expect(notes.find((n) => n.dedupeKey === `compose_submitted:${jobId}`)?.status).toBe('paused');
+
+    // Recovery only reads: no extra deployment is submitted by the auto check.
+    const startsBefore = stub.childStartCalls;
+    dueNow(jobId);
+    await exec.processDueConfirmations();
+    expect(stub.childStartCalls).toBe(startsBefore);
+    expect(jobRow(jobId).status).toBe('success');
+  });
+
+  it('legacy terminal rows with a stale awaiting stage no longer block manual jobs', async () => {
+    const exec = composeExecutor(new StubCompose());
+    const { jobId, childId } = await submitAwaiting(exec);
+    // Simulate pre-upgrade residue: terminal status with a stale awaiting stage.
+    h.db
+      .update(updateJobs)
+      .set({ status: 'failed', errorCode: 'x', errorMessage: 'x' })
+      .where(eq(updateJobs.id, jobId))
+      .run();
+
+    // Same-digest resubmission falls through to the normal failed-job rules
+    // instead of being blocked forever as "in flight".
+    const token = jobs.issuePreviewToken(childId, D_B);
+    expect(jobs.createManualJob(childId, D_B, token).status).toBe('pending');
+    // The resource is now genuinely busy: a second manual job is refused.
+    const token2 = jobs.issuePreviewToken(childId, D_C);
+    expect(() => jobs.createManualJob(childId, D_C, token2)).toThrow(/in flight/i);
+  });
+
+  it('continues checking submitted jobs while global pause blocks new deployments', async () => {
+    const stub = new StubCompose();
+    const exec = composeExecutor(stub);
+    const { jobId } = await submitAwaiting(exec);
+    settings.patch({ globalPaused: true });
+    dueNow(jobId);
+    await exec.processDueConfirmations();
+    expect(jobRow(jobId).status).toBe('success');
+    // New work stays blocked.
+    await expect(exec.processQueue()).resolves.toBe(0);
+  });
+});
+
+// --- monitoring continuity ---------------------------------------------------------
+
+describe('monitoring continuity after auto confirmation', () => {
+  function composeExecutor(stub: StubCompose): UpdateExecutor {
+    return new UpdateExecutor(h.db, stub.client(), jobs, outbox, settings, cfg, {
+      pollIntervalMs: 5,
+      confirmWindowMs: 2_000,
+      autoConfirmDelayMs: 60_000,
+    });
+  }
+
+  it('upstream matching after auto-confirm; a new upstream digest opens a new auto job', async () => {
+    const exec = composeExecutor(new StubCompose());
+    // policy auto so scheduled checks create jobs.
+    const childId = await seedCompose();
+    h.db.update(resources).set({ policy: 'auto' }).where(eq(resources.id, childId)).run();
+    const token = jobs.issuePreviewToken(childId, D_B);
+    const job = jobs.createManualJob(childId, D_B, token);
+    await exec.processQueue();
+    dueNow(job.id);
+    await exec.processDueConfirmations();
+    expect(jobRow(job.id).status).toBe('success');
+
+    let resolved = D_B;
+    const checker = new UpdateChecker(h.db, cfg, settings, outbox, jobs, () =>
+      Promise.resolve({
+        digest: resolved,
+        referenceKind: 'index' as const,
+        platformManifestDigest: resolved,
+        observedAt: Date.now(),
+        manifestContentType: 'application/vnd.oci.image.index.v1+json',
+      }),
+    );
+    // Upstream still B: matching, no new job.
+    const matching = await checker.checkResource(childId, 'scheduled');
+    expect(matching.outcome).toBe('matching');
+    expect(h.db.select().from(updateJobs).all()).toHaveLength(1);
+    // Upstream moves to C: candidate + auto job created for the same resource.
+    resolved = D_C;
+    const candidate = await checker.checkResource(childId, 'scheduled');
+    expect(candidate.outcome).toBe('candidate');
+    const all = h.db.select().from(updateJobs).all();
+    expect(all).toHaveLength(2);
+    expect(all[1]).toMatchObject({
+      resourceId: childId,
+      candidateDigest: D_C,
+      status: 'pending',
+      trigger: 'auto',
+    });
   });
 });

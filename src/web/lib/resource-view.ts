@@ -428,6 +428,88 @@ export function updateBlockedHint(r: ResourceDTO): string | null {
   return null;
 }
 
+// --- confirmation eligibility & batch snapshot -----------------------------------
+
+/** Why the row cannot run 「确认更新完成」 right now; null when confirmable. */
+export function confirmBlockedHint(r: ResourceDTO): string | null {
+  if (r.status !== 'active') return '资源已移除';
+  if (r.pendingConfirmation == null) return '暂无待确认的更新任务';
+  return null;
+}
+
+/** One frozen confirm target: only the exact job+digest pair is confirmed. */
+export interface ConfirmItem {
+  resourceId: number;
+  resourceName: string;
+  /** 父服务名；重名子容器用它在弹窗中定位。 */
+  parentName: string | null;
+  jobId: number;
+  candidateDigest: string;
+}
+
+export interface ConfirmSkip {
+  resourceId: number;
+  name: string;
+  reason: string;
+}
+
+export interface ConfirmSnapshot {
+  /** Rows actually confirmable at snapshot time, in selection order. */
+  items: ConfirmItem[];
+  /** Selected rows skipped because they hold no pending task. */
+  skipped: ConfirmSkip[];
+}
+
+/**
+ * Freeze the confirm targets for the current selection: only selected rows
+ * carrying an active pendingConfirmation enter the snapshot, so tasks started
+ * later or rows hidden by filters can never join the batch.
+ */
+export function buildConfirmSnapshot(rows: ResourceDTO[], selectedIds: number[]): ConfirmSnapshot {
+  const items: ConfirmItem[] = [];
+  const skipped: ConfirmSkip[] = [];
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  for (const id of selectedIds) {
+    const row = byId.get(id);
+    if (row == null) continue; // vanished between render and snapshot
+    if (row.pendingConfirmation == null || row.status !== 'active') {
+      skipped.push({
+        resourceId: row.id,
+        name: row.name,
+        reason: confirmBlockedHint(row) ?? '暂无待确认的更新任务',
+      });
+      continue;
+    }
+    items.push({
+      resourceId: row.id,
+      resourceName: row.name,
+      parentName: row.parentName,
+      jobId: row.pendingConfirmation.jobId,
+      candidateDigest: row.pendingConfirmation.candidateDigest,
+    });
+  }
+  return { items, skipped };
+}
+
+export interface BatchConfirmStats {
+  confirmed: number;
+  skipped: number;
+  failed: number;
+}
+
+export function summarizeBatchConfirmations(stats: BatchConfirmStats): string {
+  return `确认完成：已确认 ${stats.confirmed}，跳过 ${stats.skipped}，失败 ${stats.failed}`;
+}
+
+/** A confirmation request that lost a race (state already changed) is a skip. */
+export function isStaleConfirmError(status: number): boolean {
+  return status === 409 || status === 404;
+}
+
+export function confirmItemFeedback(item: ConfirmItem): string {
+  return `${item.resourceName}：已记录人工确认`;
+}
+
 // --- check outcome feedback ---------------------------------------------------------
 
 export type FeedbackTone = 'success' | 'warning' | 'info' | 'danger' | 'neutral';

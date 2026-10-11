@@ -130,7 +130,8 @@ function makeJob(id, overrides = {}) {
     finishedAt: '2025-05-01T08:02:00.000Z',
     confirmationDueAt: null,
     successSource:
-      overrides.successSource ?? (status === 'success' || status === 'running' ? 'deployment' : null),
+      overrides.successSource ??
+      (status === 'success' || status === 'running' ? 'deployment' : null),
     ...overrides,
   };
 }
@@ -494,6 +495,48 @@ function buildState() {
       }),
     );
   }
+  // --- services pagination: 22 more small groups (3 pages at page size 10) -----
+  // Name sort lands between stack-media-suite and stack-utils, so earlier
+  // scenarios that address stack-media-suite by name keep working.
+  for (let i = 1; i <= 22; i++) {
+    const num = String(i).padStart(2, '0');
+    const pid = id();
+    resources.push(
+      makeResource({
+        id: pid,
+        kind: 'compose_service',
+        name: `stack-page-${num}`,
+        serverName: 'homelab-01',
+        currentImage: null,
+        track: null,
+        policy: 'auto',
+      }),
+    );
+    const cid = id();
+    resources.push(
+      makeResource({
+        id: cid,
+        kind: 'service_application',
+        name: `page-child-${num}`,
+        composeServiceName: `page-child-${num}`,
+        parentResourceId: pid,
+        parentName: `stack-page-${num}`,
+        parentCoolifyUuid: uuid(`res-${pid}`),
+        serverName: 'homelab-01',
+        track: makeTrack(cid, {
+          sourceRepository: `page/tool-${num}`,
+          view: {
+            configuredMatchesUpstream: true,
+            hasCandidate: false,
+            checkOutcome: 'matching',
+            deployState: 'success',
+          },
+          observedDigest: hex64(`cfg-${cid}`),
+        }),
+        policy: 'auto',
+      }),
+    );
+  }
   // pendingConfirmation carriers must have matching live jobs so the confirm
   // endpoint can succeed (mirrors the real server contract).
   for (const pendChild of resources.filter((r) => r.pendingConfirmation != null)) {
@@ -664,6 +707,13 @@ const MIME = {
 export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', port = 0 }) {
   // 默认只绑回环（测试安全默认）；手动预览时可显式传 host/port 对外开放。
   const state = buildState();
+  // 恢复场景的运行时控制（默认全关）。仅供 verify-responsive 脚本通过
+  // POST /api/__fixture/resources-control 调整；页面自身永不触碰。
+  const resourceControl = {
+    delayMs: 0,
+    failRequests: 0,
+    shrinkTo: null,
+  };
   const unknownHits = [];
   let server = null;
   let url = null;
@@ -681,10 +731,35 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
     res.end(body);
   }
 
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   async function handleApi(req, res, pathname, query) {
     const method = req.method ?? 'GET';
     const seg = pathname.split('/').filter(Boolean); // ['api', ...]
     const json = (payload) => send(res, 200, payload);
+
+    // 测试控制端点：调整资源列表响应行为（延迟/强制失败/数据缩水）。
+    if (pathname === '/api/__fixture/resources-control') {
+      if (method === 'POST') {
+        const body = await readBody(req);
+        if (typeof body.delayMs === 'number') resourceControl.delayMs = Math.max(0, body.delayMs);
+        if (typeof body.failRequests === 'number')
+          resourceControl.failRequests = Math.max(0, Math.floor(body.failRequests));
+        if ('shrinkTo' in body) {
+          resourceControl.shrinkTo =
+            typeof body.shrinkTo === 'number' ? Math.max(0, Math.floor(body.shrinkTo)) : null;
+        }
+      }
+      return json({
+        control: {
+          delayMs: resourceControl.delayMs,
+          failRequests: resourceControl.failRequests,
+          shrinkTo: resourceControl.shrinkTo,
+        },
+      });
+    }
 
     if (method === 'GET' && pathname === '/api/overview') return json(state.overview());
     if (method === 'GET' && pathname === '/api/settings') return json(state.settings);
@@ -709,6 +784,14 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
     if (method === 'POST' && pathname === '/api/notifications/test') return json({ ok: true });
 
     if (method === 'GET' && pathname === '/api/resources') {
+      // 恢复场景控制：强制失败（覆盖 react-query 的 1 次重试需连续两次）→ 延迟 → 缩水。
+      if (resourceControl.failRequests > 0) {
+        resourceControl.failRequests -= 1;
+        return send(res, 503, {
+          error: { code: 'fixture_forced_failure', message: '恢复场景强制失败的资源列表请求' },
+        });
+      }
+      if (resourceControl.delayMs > 0) await sleep(resourceControl.delayMs);
       const kind = query.get('kind');
       const policy = query.get('policy');
       const status = query.get('status') ?? 'active';
@@ -720,7 +803,9 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
         .filter((r) =>
           parent == null || parent === '' ? true : String(r.parentResourceId) === parent,
         );
-      return json({ resources: rows });
+      const limited =
+        resourceControl.shrinkTo == null ? rows : rows.slice(0, resourceControl.shrinkTo);
+      return json({ resources: limited });
     }
     if (method === 'POST' && pathname === '/api/resources/batch-policy') {
       const body = await readBody(req);

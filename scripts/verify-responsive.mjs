@@ -94,23 +94,68 @@ async function evalJson(expression) {
   return once;
 }
 
-async function goto(baseUrl, hash) {
+// localStorage 命名空间清理：删除本功能（resources.*）的偏好 key。
+// 持久化后 reload 不再自动清空筛选，需要干净状态的场景入口显式调用。
+const CLEAR_PREFS_SNIPPET = `(() => {
+  let removed = 0;
+  for (let i = localStorage.length - 1; i >= 0; i--) {
+    const k = localStorage.key(i);
+    if (k != null && k.startsWith('resources.')) {
+      localStorage.removeItem(k);
+      removed++;
+    }
+  }
+  return removed;
+})()`;
+
+// 与 src/web/lib/resource-preferences.ts 对应的偏好 key（场景直写/直读存储用）。
+const PREF_KEYS = {
+  appPage: 'resources.applications.page.v1',
+  appPageSize: 'resources.applications.pageSize.v1',
+  appServer: 'resources.applications.server.v1',
+  svcFilters: 'resources.services.filters.v1',
+  svcExpanded: 'resources.services.expanded.v1',
+};
+
+/** 单轮应用就绪轮询：main 已挂载且不在「加载中」。超时抛错。 */
+async function pollAppReady({ attempts = 60, intervalMs = 250, label = 'app ready' } = {}) {
+  for (let t = 0; t < attempts; t++) {
+    try {
+      const r = await evalJson(
+        `(() => { const m = document.querySelector('main'); return m != null && m.children.length > 0 && !m.textContent.includes('加载中'); })()`,
+      );
+      if (r === true) return;
+    } catch {
+      // page mid-navigation; poll again
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`page not ready: ${label}`);
+}
+
+async function goto(baseUrl, hash, { keepPreferences = false } = {}) {
   await ab(['open', `${baseUrl}/${hash.replace(/^#/, '#')}`]);
-  // 同 URL（同 hash）导航不会触发重载：强制 reload，保证每次 goto 都是全新挂载，
-  // 避免 scenarioAState 注入的筛选/选择残留到后续场景。
+  // 需要干净状态的导航：先到达目标 origin 页面，再删除本功能偏好 key，
+  // 保证清理作用在正确的 origin 上（首个调用可能无旧页面可清，失败忽略），
+  // 随后 reload 加载出读到已清理存储的全新挂载。
+  if (!keepPreferences) {
+    try {
+      await ab(['eval', CLEAR_PREFS_SNIPPET], { retry: false });
+    } catch {
+      // no page loaded yet — nothing to clean
+    }
+  }
+  // 同 URL（同 hash）导航不会触发重载：强制 reload，保证每次 goto 都是全新挂载。
+  // keepPreferences 时保留偏好，验证恢复路径。
   await ab(['reload']);
-  const ready = `({ ready: document.readyState === 'complete' && !!document.querySelector('main')?.children.length, loading: !!document.querySelector('main')?.textContent.includes('加载中') })`;
   // 轮询超时后再 reload 重试一轮：瞬时导航/挂载抖动（page not ready 假阳性）与
   // CDP/daemon 偶发卡顿在整段未就绪时自愈，避免环境噪音误报。
   for (let attempt = 0; attempt < 2; attempt++) {
-    for (let t = 0; t < 60; t++) {
-      try {
-        const r = await evalJson(ready);
-        if (r.ready === true && r.loading === false) return;
-      } catch {
-        // page mid-navigation; poll again
-      }
-      await sleep(250);
+    try {
+      await pollAppReady({ label: `${baseUrl}/${hash}` });
+      return;
+    } catch {
+      // retry below after one more reload
     }
     if (attempt === 0) await ab(['reload']);
   }
@@ -271,6 +316,8 @@ function assert(cond, message, detail) {
 const WIDE_WIDTHS = [320, 375, 720, 768, 1024, 1440];
 const BP_PAIRS = [639, 640, 767, 768, 1023, 1024];
 const HEIGHT = 800;
+// 与 fixture 数据一致的长服务器名（恢复场景用它作为服务器筛选值）。
+const LONG_SERVER = 'homelab-server-cn-shanghai-01.internal.example.com';
 
 // --- scenarios --------------------------------------------------------------------
 
@@ -469,16 +516,9 @@ async function scenarioB(baseUrl) {
   });
 
   // --- services tab: two expanded groups with independent scroll regions ----------
+  // 服务组默认全部展开（按钮为「折叠服务」）：直接取前两个组的展开区域。
   await expect(group, '两个展开服务组独立滚动区域', async () => {
     await goto(baseUrl, '#/resources?tab=services');
-    await clickInPage(
-      `[...document.querySelectorAll('button[aria-label^="展开服务"]')][0]`,
-      'expand group 1',
-    );
-    await clickInPage(
-      `[...document.querySelectorAll('button[aria-label^="展开服务"]')][1]`,
-      'expand group 2',
-    );
     const regions = await waitFor(
       `[(() => { const rs = [...document.querySelectorAll('[role="region"][aria-label$="子容器"]')]; return rs.length >= 2; })()]`,
       { label: 'two child regions' },
@@ -501,16 +541,26 @@ async function scenarioB(baseUrl) {
       { after: independence2 },
     );
 
-    // Collapse removes the region.
+    // Collapse removes the region; expanding again restores it (「展开服务」path).
+    // 默认全展开下 region 很多，断言目标组的 region 消失/恢复而非总数。
     await clickInPage(
-      `[...document.querySelectorAll('button[aria-label^="折叠服务"]')][0]`,
+      'document.querySelector(\'button[aria-label="折叠服务 stack-legacy"]\')',
       'collapse group 1',
     );
     const collapsed = await waitFor(
-      `[...document.querySelectorAll('[role="region"][aria-label$="子容器"]')].length === 1`,
+      `!!document.querySelector('[role="region"][aria-label="stack-legacy 子容器"]') === false`,
       { label: 'collapse' },
     );
     check(group, '折叠后对应滚动区域移除', collapsed === true);
+    await clickInPage(
+      'document.querySelector(\'button[aria-label="展开服务 stack-legacy"]\')',
+      'expand group 1 again',
+    );
+    const reopened = await waitFor(
+      `!!document.querySelector('[role="region"][aria-label="stack-legacy 子容器"]')`,
+      { label: 're-expand' },
+    );
+    check(group, '重新展开后滚动区域恢复', reopened === true);
     return { regions: 2 };
   });
 
@@ -852,13 +902,9 @@ async function scenarioD(baseUrl) {
   const group = 'D 确认交互';
   const mediaLabel = 'stack-media-suite 子容器';
 
-  // --- services tab @720: row button states ---
+  // --- services tab @720: row button states（media 组默认展开，直接等 region）---
   await setViewport(720, HEIGHT);
   await goto(baseUrl, '#/resources?tab=services');
-  await clickInPage(
-    "[...document.querySelectorAll('button[aria-label^=\"展开服务\"]')].find(b => b.getAttribute('aria-label').includes('stack-media-suite'))",
-    'expand media group',
-  );
   await waitFor(
     `[(() => { const r = [...document.querySelectorAll('[role="region"]')]; return r.some(x => x.getAttribute('aria-label') === '${mediaLabel}'); })()]`,
     { label: 'media child region' },
@@ -990,9 +1036,10 @@ async function scenarioD(baseUrl) {
   );
 
   // Empty-selection guard: with no confirmable rows the batch entry stays disabled.
+  // （stack-page-01 在第一页且无可确认任务；utils 组已随服务分页 fixture 落到后续页。）
   await clickInPage(
-    "[...document.querySelectorAll('input[aria-label^=\"选择服务\"]')].find(i => i.getAttribute('aria-label').includes('stack-utils'))",
-    'select utils group',
+    "[...document.querySelectorAll('input[aria-label^=\"选择服务\"]')].find(i => i.getAttribute('aria-label').includes('stack-page-01'))",
+    'select page-01 group',
   );
   const disabledEntry = await evalJson(`(() => {
     const b = [...document.querySelectorAll('button')].find((x) => x.textContent.includes('批量确认更新完成'));
@@ -1005,17 +1052,438 @@ async function scenarioD(baseUrl) {
     disabledEntry,
   );
 
-  // Desktop screenshot of the services tab with the confirm column.
+  // Desktop screenshot of the services tab with the confirm column
+  // (media 组默认展开，无需点击)。
   await setViewport(1440, HEIGHT);
   await goto(baseUrl, '#/resources?tab=services');
-  await clickInPage(
-    "[...document.querySelectorAll('button[aria-label^=\"展开服务\"]')].find(b => b.getAttribute('aria-label').includes('stack-media-suite'))",
-    'expand media group for screenshot',
+  await waitFor(
+    `[(() => { const r = [...document.querySelectorAll('[role="region"]')]; return r.some(x => x.getAttribute('aria-label') === '${mediaLabel}'); })()]`,
+    { label: 'media child region for screenshot' },
   );
   await ab(['screenshot', path.join(shotsDir, 'services-confirm-1440.png')]);
 }
 
-// --- helpers for scenario data ------------------------------------------------------
+// --- helpers for persistence scenarios ----------------------------------------------
+
+/** 以 React 兼容方式设置受控 input 值并触发 input 事件（固定标签/值，无特殊字符）。 */
+async function typeInto(ariaLabel, value) {
+  const ok = await evalJson(`(() => {
+    const input = document.querySelector('input[aria-label="${ariaLabel}"]');
+    if (input == null) return false;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(input, '${value}');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  })()`);
+  if (ok !== true) throw new Error(`input not found: ${ariaLabel}`);
+}
+
+/** 以 React 兼容方式设置受控 select 值并触发 change 事件。 */
+async function chooseOption(ariaLabel, value) {
+  const ok = await evalJson(`(() => {
+    const select = document.querySelector('select[aria-label="${ariaLabel}"]');
+    if (select == null) return false;
+    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+    setter.call(select, '${value}');
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  })()`);
+  if (ok !== true) throw new Error(`select not found: ${ariaLabel}`);
+}
+
+const pageText = (cur, total) => `document.body.textContent.includes('第 ${cur} / ${total} 页')`;
+
+async function clickNextPage() {
+  await clickInPage(
+    `[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '下一页' && !b.disabled)`,
+    '下一页 button',
+  );
+}
+
+async function clickPrevPage() {
+  await clickInPage(
+    `[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '上一页' && !b.disabled)`,
+    '上一页 button',
+  );
+}
+
+/** 资源工作区子 Tab（应用/服务/更新历史）的 HeadingTab 按钮 finder。 */
+const subTabButton = (label) =>
+  `[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === ${JSON.stringify(label)})`;
+
+/** POST 资源列表响应控制（恢复场景专用 fixture 端点）。 */
+async function setResourceControl(baseUrl, patch) {
+  const res = await fetch(`${baseUrl}/api/__fixture/resources-control`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(`resource control failed: ${res.status}`);
+}
+
+async function reloadKeepingState() {
+  await ab(['reload']);
+  await pollAppReady({ label: 'reload keeping state' });
+}
+
+/**
+ * 偏好持久化：应用/服务各自的条件、每页、页码、展开集合跨子 Tab 切换、
+ * 更新历史中转与浏览器刷新恢复且互不覆盖；勾选保持组件临时状态。
+ */
+async function scenarioPersistence(baseUrl) {
+  const group = 'E 状态恢复';
+  await setViewport(1024, HEIGHT);
+
+  // --- 应用侧建立状态：搜索 + 服务器 + 每页 10 + 第 2 页 + 勾选 ---
+  await goto(baseUrl, '#/resources'); // 入口清理偏好，干净起点
+  await typeInto('搜索应用', 'very-long');
+  await waitFor(`[...document.querySelectorAll('tbody tr')].length === 16`, {
+    label: 'search very-long → 16 rows',
+  });
+  await chooseOption('按服务器筛选', LONG_SERVER);
+  await waitFor(`[...document.querySelectorAll('tbody tr')].length === 16`, {
+    label: 'server filter keeps 16 rows',
+  });
+  await chooseOption('每页条数', '10');
+  await waitFor(pageText(1, 2), { label: 'app page 1 / 2' });
+  await clickNextPage();
+  await waitFor(pageText(2, 2), { label: 'app page 2 / 2' });
+  const appPage2Rows = await evalJson(`document.querySelectorAll('tbody tr').length`);
+  check(group, '应用第 2 页显示 6 行（16 行/每页 10）', appPage2Rows === 6, { appPage2Rows });
+  await clickInPage(`document.querySelector('tbody input[type=checkbox]')`, 'first row checkbox');
+  const appCheckedBefore = await evalJson(
+    `document.querySelectorAll('tbody input[type=checkbox]:checked').length`,
+  );
+
+  // --- 真实点击子 Tab 到服务侧：每页 10 + 第 2 页 + 展开集合 ---
+  await clickInPage(subTabButton('服务'), 'services sub tab');
+  await waitFor(`!!document.querySelector('input[aria-label="搜索服务"]')`, {
+    label: 'services toolbar',
+  });
+  await chooseOption('每页组数', '10');
+  await waitFor(pageText(1, 3), { label: 'services page 1 / 3' });
+  // 展开集合函数式更新：折叠 page-01 → 展开 page-01（最新状态为展开）→ 折叠 page-02。
+  await clickInPage(
+    `document.querySelector('button[aria-label="折叠服务 stack-page-01"]')`,
+    'collapse page-01',
+  );
+  await clickInPage(
+    `document.querySelector('button[aria-label="展开服务 stack-page-01"]')`,
+    'expand page-01 back',
+  );
+  await clickInPage(
+    `document.querySelector('button[aria-label="折叠服务 stack-page-02"]')`,
+    'collapse page-02',
+  );
+  await clickNextPage();
+  await waitFor(pageText(2, 3), { label: 'services page 2 / 3' });
+
+  // --- 中转：同一 bar 点击「更新历史」→ 回「应用」→ 「服务」---
+  await clickInPage(subTabButton('更新历史'), 'history sub tab');
+  await waitFor(`!!document.querySelector('[role="region"][aria-label="更新历史"]')`, {
+    label: 'history region',
+  });
+  await clickInPage(subTabButton('应用'), 'applications sub tab');
+  await waitFor(`!!document.querySelector('input[aria-label="搜索应用"]')`, {
+    label: 'app toolbar after return',
+  });
+  const appState = await evalJson(`({
+    search: document.querySelector('input[aria-label="搜索应用"]').value,
+    server: document.querySelector('select[aria-label="按服务器筛选"]').value,
+    pageSize: document.querySelector('select[aria-label="每页条数"]').value,
+    indicator: (document.body.textContent.match(/第 \\d+ \\/ \\d+ 页/) ?? [])[0] ?? null,
+    rows: document.querySelectorAll('tbody tr').length,
+    checked: document.querySelectorAll('tbody input[type=checkbox]:checked').length,
+  })`);
+  check(
+    group,
+    '应用侧经中转返回后恢复条件/页码，勾选按临时状态清空',
+    appState.search === 'very-long' &&
+      appState.server === LONG_SERVER &&
+      appState.pageSize === '10' &&
+      appState.indicator === '第 2 / 2 页' &&
+      appState.rows === 6 &&
+      appState.checked === 0,
+    { appCheckedBefore, appState },
+  );
+
+  await clickInPage(subTabButton('服务'), 'services sub tab again');
+  await waitFor(`!!document.querySelector('input[aria-label="搜索服务"]')`, {
+    label: 'services toolbar after return',
+  });
+  const svcState = await evalJson(`({
+    pageSize: document.querySelector('select[aria-label="每页组数"]').value,
+    indicator: (document.body.textContent.match(/第 \\d+ \\/ \\d+ 页/) ?? [])[0] ?? null,
+  })`);
+  check(
+    group,
+    '服务侧经中转返回后恢复每页与页码',
+    svcState.pageSize === '10' && svcState.indicator === '第 2 / 3 页',
+    svcState,
+  );
+  await clickPrevPage();
+  await waitFor(pageText(1, 3), { label: 'services back to page 1' });
+  const svcExpand = await evalJson(`({
+    page01Open: !!document.querySelector('[role="region"][aria-label="stack-page-01 子容器"]'),
+    page02Open: !!document.querySelector('[role="region"][aria-label="stack-page-02 子容器"]'),
+    page03Open: !!document.querySelector('[role="region"][aria-label="stack-page-03 子容器"]'),
+  })`);
+  check(
+    group,
+    '展开集合恢复：page-01 展开、page-02 折叠、page-03 未定制默认展开',
+    svcExpand.page01Open && svcExpand.page02Open === false && svcExpand.page03Open,
+    svcExpand,
+  );
+
+  // --- 浏览器刷新（保留状态路径）：展开集合与页码保持 ---
+  await reloadKeepingState();
+  const svcAfterReload = await evalJson(`({
+    page01Open: !!document.querySelector('[role="region"][aria-label="stack-page-01 子容器"]'),
+    page02Open: !!document.querySelector('[role="region"][aria-label="stack-page-02 子容器"]'),
+    indicator: (document.body.textContent.match(/第 \\d+ \\/ \\d+ 页/) ?? [])[0] ?? null,
+  })`);
+  check(
+    group,
+    '刷新后服务展开集合与页码保持',
+    svcAfterReload.page01Open &&
+      svcAfterReload.page02Open === false &&
+      svcAfterReload.indicator === '第 1 / 3 页',
+    svcAfterReload,
+  );
+  await clickInPage(subTabButton('应用'), 'applications sub tab after reload');
+  await waitFor(`!!document.querySelector('input[aria-label="搜索应用"]')`, {
+    label: 'app toolbar after reload',
+  });
+  const appAfterReload = await evalJson(`({
+    search: document.querySelector('input[aria-label="搜索应用"]').value,
+    indicator: (document.body.textContent.match(/第 \\d+ \\/ \\d+ 页/) ?? [])[0] ?? null,
+  })`);
+  check(
+    group,
+    '刷新后应用条件与页码保持（两类资源互不覆盖）',
+    appAfterReload.search === 'very-long' && appAfterReload.indicator === '第 2 / 2 页',
+    appAfterReload,
+  );
+
+  // --- 展开全部/折叠全部的持久化 ---
+  await clickInPage(subTabButton('服务'), 'services sub tab for expand-all');
+  await waitFor(`!!document.querySelector('input[aria-label="搜索服务"]')`, {
+    label: 'services toolbar for expand-all',
+  });
+  const expandAllFinder = `[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '展开全部')`;
+  await clickInPage(expandAllFinder, 'expand all');
+  await waitFor(`!!document.querySelector('[role="region"][aria-label="stack-page-02 子容器"]')`, {
+    label: 'page-02 opened by expand-all',
+  });
+  await reloadKeepingState();
+  const allOpenAfterReload = await evalJson(`({
+    page02Open: !!document.querySelector('[role="region"][aria-label="stack-page-02 子容器"]'),
+    collapseAllVisible: [...document.querySelectorAll('button')].some((b) => b.textContent.trim() === '折叠全部'),
+  })`);
+  check(
+    group,
+    '「展开全部」后刷新保持全展开',
+    allOpenAfterReload.page02Open && allOpenAfterReload.collapseAllVisible,
+    allOpenAfterReload,
+  );
+  await clickInPage(
+    `[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '折叠全部')`,
+    'collapse all',
+  );
+  await waitFor(
+    `[...document.querySelectorAll('[role="region"][aria-label$="子容器"]')].length === 0`,
+    { label: 'all collapsed' },
+  );
+  await reloadKeepingState();
+  const allCollapsedAfterReload = await evalJson(`({
+    regions: [...document.querySelectorAll('[role="region"][aria-label$="子容器"]')].length,
+    expandAllVisible: [...document.querySelectorAll('button')].some((b) => b.textContent.trim() === '展开全部'),
+  })`);
+  check(
+    group,
+    '「折叠全部」后刷新保持全折叠',
+    allCollapsedAfterReload.regions === 0 && allCollapsedAfterReload.expandAllVisible,
+    allCollapsedAfterReload,
+  );
+
+  // --- 应用侧：筛选改变回第 1 页并清空勾选 ---
+  await clickInPage(subTabButton('应用'), 'applications sub tab for filter reset');
+  await waitFor(`!!document.querySelector('input[aria-label="搜索应用"]')`, {
+    label: 'app toolbar for filter reset',
+  });
+  await waitFor(pageText(2, 2), { label: 'app page 2 / 2 before filter reset' });
+  await clickInPage(
+    `document.querySelector('tbody input[type=checkbox]')`,
+    'row checkbox before filter reset',
+  );
+  // 搜索词在当前服务器筛选范围内命中 1 行（overflow-check-3），触发回第 1 页与清勾选。
+  await typeInto('搜索应用', 'overflow-check-3');
+  await waitFor(pageText(1, 1), { label: 'back to page 1 / 1' });
+  const filterReset = await evalJson(
+    `document.querySelectorAll('tbody input[type=checkbox]:checked').length`,
+  );
+  check(group, '筛选改变回第 1 页并清空勾选', filterReset === 0, { checked: filterReset });
+}
+
+/**
+ * 加载与异常恢复：延迟/失败/数据缩水期间的页码保存、损坏偏好与受限存储
+ * 下的可用性、失效服务器条件的显示与清除。使用独立 fixture origin，
+ * 避免控制状态影响其它场景。
+ */
+async function scenarioRecovery(baseUrl) {
+  const group = 'F 加载异常恢复';
+  await setViewport(1024, HEIGHT);
+
+  // --- a) 应用：预存第 2 页 + 延迟响应 → 成功返回后仍在第 2 页 ---
+  await goto(baseUrl, '#/resources');
+  await chooseOption('每页条数', '10');
+  await waitFor(pageText(1, 3), { label: 'recovery app 1 / 3' });
+  await clickNextPage();
+  await waitFor(pageText(2, 3), { label: 'recovery app 2 / 3' });
+  await setResourceControl(baseUrl, { delayMs: 1500 });
+  await goto(baseUrl, '#/resources', { keepPreferences: true });
+  await waitFor(`!!document.querySelector('[role="region"][aria-label="应用列表"]')`, {
+    label: 'app table after delayed load',
+    timeoutMs: 15000,
+  });
+  const delayed = await evalJson(`({
+    indicator: (document.body.textContent.match(/第 \\d+ \\/ \\d+ 页/) ?? [])[0] ?? null,
+    rows: document.querySelectorAll('tbody tr').length,
+    firstRow: document.querySelector('tbody tr')?.textContent ?? '',
+  })`);
+  check(
+    group,
+    '延迟返回后仍恢复第 2 页（首轮加载期间页码保持）',
+    delayed.indicator === '第 2 / 3 页' &&
+      delayed.rows === 10 &&
+      delayed.firstRow.includes('-check-8'),
+    delayed,
+  );
+  await setResourceControl(baseUrl, { delayMs: 0 });
+
+  // --- b) 请求失败保持存储页码 ---
+  await setResourceControl(baseUrl, { failRequests: 2 });
+  await goto(baseUrl, '#/resources', { keepPreferences: true });
+  await waitFor(`document.body.textContent.includes('出错')`, {
+    label: 'error box during failure',
+    timeoutMs: 15000,
+  });
+  check(group, '请求失败期间显示错误框（存储页码未被清改）', true);
+  await waitFor(`!!document.querySelector('[role="region"][aria-label="应用列表"]')`, {
+    label: 'app table recovered after failure',
+    timeoutMs: 20000,
+  });
+  await waitFor(pageText(2, 3), { label: 'page restored after failure', timeoutMs: 8000 });
+  check(group, '失败恢复后回到存储的第 2 页', true);
+
+  // --- c) 数据缩水：成功空结果把页码写回第 1 页 ---
+  await setResourceControl(baseUrl, { shrinkTo: 0 });
+  await waitFor(`document.body.textContent.includes('暂无应用')`, {
+    label: 'empty state after shrink',
+    timeoutMs: 20000,
+  });
+  check(group, '成功空结果收敛到空态', true);
+  await setResourceControl(baseUrl, { shrinkTo: null });
+  await waitFor(pageText(1, 3), {
+    label: 'app back to page 1 / 3 after restore',
+    timeoutMs: 20000,
+  });
+  check(group, '空结果把页码写回第 1 页，数据恢复后从 1/3 开始', true);
+
+  // --- c2) 服务侧：部分缩水修正至有效页 ---
+  await goto(baseUrl, '#/resources?tab=services');
+  await chooseOption('每页组数', '10');
+  await waitFor(pageText(1, 3), { label: 'recovery services 1 / 3' });
+  await clickNextPage();
+  await waitFor(pageText(2, 3), { label: 'recovery services 2 / 3' });
+  // 30 个应用行 + media 父 + 4 子容器 = 前 35 行 → 仅剩 1 组 → 越界页码修正到第 1 页。
+  await setResourceControl(baseUrl, { shrinkTo: 35 });
+  await waitFor(pageText(1, 1), { label: 'services shrunk to 1 page', timeoutMs: 20000 });
+  check(group, '服务数据缩水后越界页码修正至第 1 页', true);
+  await setResourceControl(baseUrl, { shrinkTo: null });
+  await waitFor(pageText(1, 3), { label: 'services restored to 3 pages', timeoutMs: 20000 });
+  check(group, '服务数据恢复后回到第 1 页展示', true);
+
+  // --- d) 损坏偏好：逐字段回退默认，页面可操作 ---
+  await goto(baseUrl, '#/resources');
+  await evalJson(`(() => {
+    localStorage.setItem('${PREF_KEYS.appPage}', '{oops');
+    localStorage.setItem('${PREF_KEYS.appPageSize}', '{"a":1}');
+    localStorage.setItem('${PREF_KEYS.svcFilters}', '"x"');
+    localStorage.setItem('${PREF_KEYS.svcExpanded}', '["svc-1",42]');
+    return true;
+  })()`);
+  await goto(baseUrl, '#/resources', { keepPreferences: true });
+  await waitFor(`!!document.querySelector('[role="region"][aria-label="应用列表"]')`, {
+    label: 'app table with corrupted prefs',
+  });
+  const corrupted = await evalJson(`({
+    indicator: (document.body.textContent.match(/第 \\d+ \\/ \\d+ 页/) ?? [])[0] ?? null,
+    pageSize: document.querySelector('select[aria-label="每页条数"]').value,
+    rows: document.querySelectorAll('tbody tr').length,
+  })`);
+  check(
+    group,
+    '损坏页码/页容量回退默认（第 1 / 2 页、每页 20）',
+    corrupted.indicator === '第 1 / 2 页' && corrupted.pageSize === '20' && corrupted.rows === 20,
+    corrupted,
+  );
+
+  // --- e) 失效服务器条件：下拉显示保存值且可清除 ---
+  await evalJson(`localStorage.setItem('${PREF_KEYS.appServer}', '"ghost-server"')`);
+  await goto(baseUrl, '#/resources', { keepPreferences: true });
+  await waitFor(`!!document.querySelector('select[aria-label="按服务器筛选"]')`, {
+    label: 'app toolbar with ghost server',
+  });
+  const ghost = await evalJson(`(() => {
+    const select = document.querySelector('select[aria-label="按服务器筛选"]');
+    return {
+      value: select.value,
+      hasOption: [...select.options].some((o) => o.value === 'ghost-server'),
+      empty: document.body.textContent.includes('暂无应用'),
+    };
+  })()`);
+  check(
+    group,
+    '失效服务器条件保留下拉显示且列表为空',
+    ghost.value === 'ghost-server' && ghost.hasOption && ghost.empty,
+    ghost,
+  );
+  await chooseOption('按服务器筛选', '');
+  await waitFor(`[...document.querySelectorAll('tbody tr')].length === 20`, {
+    label: 'list restored after clearing server filter',
+  });
+  const serverCleared = await evalJson(`localStorage.getItem('${PREF_KEYS.appServer}')`);
+  check(group, '切换「全部服务器」后条件清除并写回存储', serverCleared === '""', {
+    serverCleared,
+  });
+
+  // --- f) 受限存储：内存交互继续可用，写入被安全忽略 ---
+  await evalJson(`(() => {
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      get() {
+        throw new Error('storage blocked');
+      },
+    });
+    return true;
+  })()`);
+  await typeInto('搜索应用', 'redis');
+  await waitFor(`[...document.querySelectorAll('tbody tr')].length === 1`, {
+    label: 'search works with blocked storage',
+  });
+  check(group, '受限存储下页面仍可搜索（内存状态）', true);
+  await goto(baseUrl, '#/resources', { keepPreferences: true });
+  await waitFor(`!!document.querySelector('input[aria-label="搜索应用"]')`, {
+    label: 'app toolbar after blocked-storage reload',
+  });
+  const searchAfterBlocked = await evalJson(
+    `document.querySelector('input[aria-label="搜索应用"]').value`,
+  );
+  check(group, '受限存储期间的输入未持久化，reload 后为空', searchAfterBlocked === '', {
+    searchAfterBlocked,
+  });
+}
 
 async function serviceDetailId(baseUrl) {
   const res = await fetch(`${baseUrl}/api/resources?kind=compose_service`);
@@ -1040,9 +1508,19 @@ async function main() {
     console.error('环境阻塞：fixture 创建失败：', err);
     process.exit(2);
   }
+  // 恢复场景用独立 fixture origin：响应控制互不干扰，localStorage 也天然隔离。
+  let recoveryFixture;
+  try {
+    recoveryFixture = createResponsiveFixtureServer({ webRoot });
+  } catch (err) {
+    console.error('环境阻塞：恢复场景 fixture 创建失败：', err);
+    process.exit(2);
+  }
   let server;
+  let recoveryServer;
   try {
     server = await fixture.start();
+    recoveryServer = await recoveryFixture.start();
   } catch (err) {
     console.error('环境阻塞：fixture 启动失败：', err);
     process.exit(2);
@@ -1094,9 +1572,12 @@ async function main() {
     await scenarioC(baseUrl);
     await scenarioManagementViews(baseUrl);
     await scenarioD(baseUrl);
+    await scenarioPersistence(baseUrl);
+    await scenarioRecovery(recoveryServer.url);
 
-    if (fixture.unknownHits.length > 0) {
-      check('fixture', '页面未请求未实现的 API', false, fixture.unknownHits);
+    const unknownHits = [...fixture.unknownHits, ...recoveryFixture.unknownHits];
+    if (unknownHits.length > 0) {
+      check('fixture', '页面未请求未实现的 API', false, unknownHits);
     } else {
       check('fixture', '页面未请求未实现的 API', true);
     }
@@ -1118,6 +1599,7 @@ async function main() {
       }
     }
     await server.close();
+    await recoveryServer.close();
   }
 
   const failed = results.filter((r) => !r.pass);

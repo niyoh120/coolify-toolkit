@@ -1,7 +1,10 @@
 // Resources page: applications tab (flat application rows) and services tab
 // (service-grouped list with per-group children, batch actions on children).
-// Tab state lives in the hash route; switching tabs remounts the view, which
-// resets pagination and selection.
+// Tab state lives in the hash route; switching tabs remounts the view.
+// Search / filters / page size / page / service-group expansion persist per
+// tab in localStorage (resources.*.v1 keys, see lib/resource-preferences.ts)
+// and survive tab switches, reloads and revisits. Selection, confirm dialogs
+// and batch feedback stay component-transient on purpose (batch safety).
 import { useQuery } from '@tanstack/react-query';
 import { useEffect, useMemo, useState } from 'react';
 import type { Policy, ResourceDTO } from '../../shared/types.js';
@@ -41,6 +44,21 @@ import {
   Th,
 } from '../components/ui.js';
 import { api } from '../lib/api.js';
+import { decodeString, usePersistedState } from '../lib/persisted-state.js';
+import {
+  APP_PREF_KEYS,
+  decodeExclusionView,
+  decodeExpanded,
+  decodePage,
+  decodePageSize,
+  decodeServiceFilters,
+  decodeStatusFilter,
+  encodeExpanded,
+  encodeJson,
+  PAGE_SIZES,
+  SERVICE_PREF_KEYS,
+  type StatusFilter,
+} from '../lib/resource-preferences.js';
 import {
   belongsToView,
   buildConfirmSnapshot,
@@ -66,9 +84,6 @@ import {
 } from '../lib/resource-view.js';
 import { useRouter } from '../main.js';
 
-const PAGE_SIZES = [10, 20, 50, 100];
-
-type StatusFilter = 'all' | 'running' | 'stopped';
 type PendingBatch =
   | { kind: 'check' }
   | { kind: 'update' }
@@ -179,12 +194,43 @@ function confirmSnapshotItem(rows: ResourceDTO[], id: number): ConfirmItem | nul
 
 function ApplicationsView() {
   const { navigate } = useRouter();
-  const [view, setView] = useState<ExclusionView>('unexcluded');
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
-  const [server, setServer] = useState('');
-  const [search, setSearch] = useState('');
-  const [pageSize, setPageSize] = useState(20);
-  const [page, setPage] = useState(1);
+  // 浏览偏好（筛选/每页/页码）持久化到 localStorage；勾选与弹窗保持临时状态。
+  const [view, setView] = usePersistedState<ExclusionView>({
+    key: APP_PREF_KEYS.view,
+    defaultValue: 'unexcluded',
+    encode: encodeJson,
+    decode: decodeExclusionView,
+  });
+  const [statusFilter, setStatusFilter] = usePersistedState<StatusFilter>({
+    key: APP_PREF_KEYS.status,
+    defaultValue: 'all',
+    encode: encodeJson,
+    decode: decodeStatusFilter,
+  });
+  const [server, setServer] = usePersistedState<string>({
+    key: APP_PREF_KEYS.server,
+    defaultValue: '',
+    encode: encodeJson,
+    decode: decodeString,
+  });
+  const [search, setSearch] = usePersistedState<string>({
+    key: APP_PREF_KEYS.search,
+    defaultValue: '',
+    encode: encodeJson,
+    decode: decodeString,
+  });
+  const [pageSize, setPageSize] = usePersistedState<number>({
+    key: APP_PREF_KEYS.pageSize,
+    defaultValue: 20,
+    encode: encodeJson,
+    decode: decodePageSize,
+  });
+  const [page, setPage] = usePersistedState<number>({
+    key: APP_PREF_KEYS.page,
+    defaultValue: 1,
+    encode: encodeJson,
+    decode: decodePage,
+  });
   const [selected, setSelected] = useState<number[]>([]);
   const [pendingBatch, setPendingBatch] = useState<PendingBatch>(null);
   const [feedbackLines, pushFeedback] = useFeedbackLines();
@@ -213,10 +259,8 @@ function ApplicationsView() {
     });
   }, [resourceKey]);
 
-  if (isLoading) return <Loading />;
-  if (error != null) return <ErrorBox error={error} />;
-
-  // 三档视图先投影；再叠加状态/服务器/搜索条件。
+  // 三档视图先投影；再叠加状态/服务器/搜索条件。纯计算放在早退之前，
+  // 让下方的页码回写 effect 保持「hooks 全部在 return 前」的固定顺序。
   const rows = resources
     .filter((r) => belongsToView(r, view))
     .filter((r) =>
@@ -231,7 +275,33 @@ function ApplicationsView() {
           (r.track?.sourceRepository ?? '').toLowerCase().includes(q),
       )
     : rows;
-  const pagedRows = filtered.slice((page - 1) * pageSize, page * pageSize);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  // 有效页码同时驱动列表切片与分页控件；越界页码在成功渲染上立即收敛。
+  const effectivePage = Math.min(Math.max(1, page), totalPages);
+  const pagedRows = filtered.slice((effectivePage - 1) * pageSize, effectivePage * pageSize);
+
+  // 持久化页码回写：仅在查询成功后按筛选后总数修正（空结果回到第 1 页）；
+  // 首轮加载与请求失败期间保持恢复出的页码，区分首轮空数组占位与成功空结果。
+  // 越界修正等同视图切换：清空勾选，避免隐藏资源留在批量范围内。
+  useEffect(() => {
+    if (isLoading || error != null) return;
+    if (page !== effectivePage) {
+      setPage(effectivePage);
+      setSelected([]);
+    }
+  }, [effectivePage, error, isLoading, page, setPage]);
+
+  // 服务器条件选项：至少包含当前持久化的非空值，失效或被筛选隐藏的条件
+  // 保持可见、可通过「全部服务器」清除。
+  const knownServers = [
+    ...new Set(rows.map((r) => r.serverName).filter((n): n is string => n != null)),
+  ].sort();
+  const serverChoices =
+    server !== '' && !knownServers.includes(server) ? [server, ...knownServers] : knownServers;
+
+  if (isLoading) return <Loading />;
+  if (error != null) return <ErrorBox error={error} />;
+
   // 排除视图只读：不提供选择与操作。
   const readOnly = view === 'excluded';
   const pendingSyncTotal = resources.filter(isPendingSync).length;
@@ -321,13 +391,11 @@ function ApplicationsView() {
           aria-label="按服务器筛选"
         >
           <option value="">全部服务器</option>
-          {[...new Set(rows.map((r) => r.serverName).filter((n): n is string => n != null))]
-            .sort()
-            .map((name) => (
-              <option key={name} value={name}>
-                {name}
-              </option>
-            ))}
+          {serverChoices.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
         </Select>
         <span className="ml-auto flex items-center gap-1.5 text-[12px] text-[var(--color-text-secondary)]">
           每页
@@ -614,7 +682,7 @@ function ApplicationsView() {
           </Table>
         )}
         <Pagination
-          page={page}
+          page={effectivePage}
           pageSize={pageSize}
           total={filtered.length}
           onChange={(p) => {
@@ -629,19 +697,38 @@ function ApplicationsView() {
 
 // --- services tab -------------------------------------------------------------------
 
-// 折叠/展开是与筛选、翻页无关的显示模式：mode 为全局方向，overrides 记录被
-// 单组箭头手动切换过的组（相对当前模式取反）；切模式时清空 overrides。
-type ExpandMode = 'expanded' | 'collapsed';
-
 function ServicesView() {
   const { navigate } = useRouter();
+  // 浏览偏好（筛选/每页/页码/展开集合）持久化到 localStorage；勾选与弹窗保持临时状态。
   const [view, setView] = useState<ExclusionView>('unexcluded');
-  const [filters, setFilters] = useState<ServiceFilters>(DEFAULT_SERVICE_FILTERS);
-  const [pageSize, setPageSize] = useState(20);
-  const [page, setPage] = useState(1);
+  const [filters, setFilters] = usePersistedState<ServiceFilters>({
+    key: SERVICE_PREF_KEYS.filters,
+    defaultValue: DEFAULT_SERVICE_FILTERS,
+    encode: encodeJson,
+    decode: decodeServiceFilters,
+  });
+  const [pageSize, setPageSize] = usePersistedState<number>({
+    key: SERVICE_PREF_KEYS.pageSize,
+    defaultValue: 20,
+    encode: encodeJson,
+    decode: decodePageSize,
+  });
+  const [page, setPage] = usePersistedState<number>({
+    key: SERVICE_PREF_KEYS.page,
+    defaultValue: 1,
+    encode: encodeJson,
+    decode: decodePage,
+  });
+  // 展开状态：已展开的组 key 集合；undefined 表示「尚未定制」，
+  // 所有组跟随默认全展开（与历史行为一致）。定制后缺席的 key 为折叠，
+  // 后续新出现的组也视为折叠；被筛选隐藏的组保留其展开状态。
+  const [expanded, setExpanded] = usePersistedState<ReadonlySet<string> | undefined>({
+    key: SERVICE_PREF_KEYS.expanded,
+    defaultValue: undefined,
+    encode: encodeExpanded,
+    decode: decodeExpanded,
+  });
   const [selected, setSelected] = useState<number[]>([]);
-  const [expandMode, setExpandMode] = useState<ExpandMode>('expanded');
-  const [expandOverrides, setExpandOverrides] = useState<Set<string>>(() => new Set());
   const [pendingBatch, setPendingBatch] = useState<PendingBatch>(null);
   const [feedbackLines] = useFeedbackLines();
   const batchRunner = useBatchRunner();
@@ -665,7 +752,12 @@ function ServicesView() {
     [groups],
   );
   const serverOptions = useMemo(() => serviceServerNames(groups), [groups]);
-  const paged = paginateGroups(filtered, page, pageSize);
+  // 当前视图下的全部组 key：展开集合「尚未定制 → 全展开」物化时使用。
+  const groupKeys = useMemo(() => projected.map((g) => g.key), [projected]);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  // 有效页码同时驱动列表切片与分页控件；越界页码在成功渲染上立即收敛。
+  const effectivePage = Math.min(Math.max(1, page), totalPages);
+  const paged = paginateGroups(filtered, effectivePage, pageSize);
   const pendingSyncTotal = resources.filter(isPendingSync).length;
 
   // 筛选/分页/每页变化在各自处理器里清空选择；轮询缩减数据时把越界页码修正回有效范围。
@@ -679,10 +771,17 @@ function ServicesView() {
       return next.length === prev.length ? prev : next;
     });
   }, [resourceKey]);
+  // 持久化页码回写：仅在查询成功且有实际数据时按筛选后总数修正（空结果回到
+  // 第 1 页）；首轮加载与请求失败期间保持恢复出的页码，区分首轮空数组占位与
+  // 成功空结果。越界修正时直接清空勾选；下方 selectableKey effect 会按新页
+  // 再收敛一次，双保险。
   useEffect(() => {
-    const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
-    if (page > pages) setPage(pages);
-  }, [filtered.length, pageSize, page]);
+    if (isLoading || error != null) return;
+    if (page !== effectivePage) {
+      setPage(effectivePage);
+      setSelected([]);
+    }
+  }, [effectivePage, error, isLoading, page, setPage]);
 
   // 轮询后用当前页可选 id 集合收敛选择：隐藏/消失的资源不能留在批量范围内。
   // 必须在早退之前调用，保证 hook 顺序稳定。
@@ -714,15 +813,17 @@ function ServicesView() {
       if (checked) return [...new Set([...prev, ...pageSelectable])];
       return prev.filter((id) => !pageSelectable.includes(id));
     });
-  const isExpanded = (key: string): boolean =>
-    expandOverrides.has(key) ? expandMode === 'collapsed' : expandMode === 'expanded';
-  const setAllExpanded = (expanded: boolean): void => {
-    setExpandMode(expanded ? 'expanded' : 'collapsed');
-    setExpandOverrides(new Set());
+  const allExpanded =
+    expanded == null || (groupKeys.length > 0 && groupKeys.every((k) => expanded.has(k)));
+  const isExpanded = (key: string): boolean => (expanded == null ? true : expanded.has(key));
+  const setAllExpanded = (target: boolean): void => {
+    // 物化展开集合：全展开 = 当前全部组 key；全折叠 = 空集合。
+    setExpanded(target ? new Set(groupKeys) : new Set<string>());
   };
   const toggleExpand = (key: string): void =>
-    setExpandOverrides((prev) => {
-      const next = new Set(prev);
+    setExpanded((prev) => {
+      // 「尚未定制」时以当前全部组为基底物化，再翻转目标组。
+      const next = new Set(prev ?? groupKeys);
       if (next.has(key)) next.delete(key);
       else next.add(key);
       return next;
@@ -799,14 +900,17 @@ function ServicesView() {
           aria-label="按服务器筛选"
         >
           <option value="">全部服务器</option>
-          {serverOptions.map((name) => (
+          {(filters.server !== '' && !serverOptions.includes(filters.server)
+            ? [filters.server, ...serverOptions]
+            : serverOptions
+          ).map((name) => (
             <option key={name} value={name}>
               {name}
             </option>
           ))}
         </Select>
-        <Button variant="outline" onClick={() => setAllExpanded(expandMode !== 'expanded')}>
-          {expandMode === 'expanded' ? '折叠全部' : '展开全部'}
+        <Button variant="outline" onClick={() => setAllExpanded(!allExpanded)}>
+          {allExpanded ? '折叠全部' : '展开全部'}
         </Button>
         <span className="ml-auto flex items-center gap-1.5 text-[12px] text-[var(--color-text-secondary)]">
           每页
@@ -959,7 +1063,7 @@ function ServicesView() {
       )}
       <Card>
         <Pagination
-          page={page}
+          page={effectivePage}
           pageSize={pageSize}
           total={filtered.length}
           onChange={(p) => {

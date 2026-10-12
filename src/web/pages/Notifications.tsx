@@ -59,7 +59,7 @@ export function NotificationsPage() {
   const pagedItems = items.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex h-full min-h-0 flex-col gap-4">
       <h1 className="text-[18px] font-semibold">通知</h1>
       {data?.appriseConfigured === false && (
         <div className="rounded border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/5 px-3 py-2 text-[12px] text-[var(--color-warning)]">
@@ -67,13 +67,13 @@ export function NotificationsPage() {
         </div>
       )}
 
-      <Card>
+      <Card className="flex min-h-0 flex-1 flex-col">
         <CardHeader title="通知队列" />
         {items.length === 0 ? (
           <Empty>暂无通知记录。</Empty>
         ) : (
           <>
-            <Table ariaLabel="通知队列">
+            <Table ariaLabel="通知队列" fill>
               <thead>
                 <tr>
                   <Th className="min-w-[5rem]">事件</Th>

@@ -71,6 +71,24 @@ body {
   max-height: var(--table-max-height);
 }
 
+/* Fill variant (Table fill): the wrapper becomes a flex column that grows to
+   the remaining height of an ancestor h-full flex-column chain
+   (main -> page root -> card -> wrapper), so full-page tables adapt to the
+   viewport instead of capping at --table-max-height; pagination/toolbar rows
+   above/below keep their natural height and the table scrolls internally.
+   Nested/secondary tables stay on the default capped behaviour. */
+.table-fill {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 0%;
+  flex-direction: column;
+}
+.table-fill > .table-scroll {
+  min-height: 10rem; /* 窄屏兜底：可视区过矮时交给外层 main 滚动 */
+  flex: 1 1 0%;
+  max-height: none;
+}
+
 /* Status badge base: short labels stay one line; long reasons can wrap when the
    caller opts in (Badge accepts extra classes). */
 .badge {

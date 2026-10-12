@@ -122,7 +122,16 @@ export function Select({ className, children, ...props }: SelectHTMLAttributes<H
   );
 }
 
-export function Table({ children, ariaLabel }: { children: ReactNode; ariaLabel: string }) {
+export function Table({
+  children,
+  ariaLabel,
+  fill,
+}: {
+  children: ReactNode;
+  ariaLabel: string;
+  /** 满高模式：滚动区撑满祖先 flex 列链的剩余高度（页面级表格用），默认保持 60vh 上限。 */
+  fill?: boolean;
+}) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [edge, setEdge] = useState({ overflow: false, atStart: true, atEnd: true });
 
@@ -166,7 +175,7 @@ export function Table({ children, ariaLabel }: { children: ReactNode; ariaLabel:
   const arrowClass =
     'inline-flex h-6 w-6 items-center justify-center rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)] disabled:cursor-not-allowed disabled:opacity-40';
   return (
-    <div>
+    <div className={cn(fill && 'table-fill')}>
       {edge.overflow && (
         <div className="flex items-center justify-between gap-2 px-3 pt-2 text-[12px] text-[var(--color-text-muted)]">
           <span data-table-hint>内容较宽，可左右滚动查看全部列</span>

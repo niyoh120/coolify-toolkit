@@ -65,7 +65,7 @@ export function HistoryPage() {
   const pagedJobs = jobs.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex h-full min-h-0 flex-col gap-4">
       <ResourceTabsBar active="history" />
       {actionError != null && (
         <div
@@ -91,11 +91,11 @@ export function HistoryPage() {
           ))}
         </Select>
       </div>
-      <Card>
+      <Card className="flex min-h-0 flex-1 flex-col">
         {jobs.length === 0 ? (
           <Empty>暂无任务记录。</Empty>
         ) : (
-          <Table ariaLabel="更新历史">
+          <Table ariaLabel="更新历史" fill>
             <thead>
               <tr>
                 <Th className="min-w-[8rem] max-w-[14rem]">资源</Th>

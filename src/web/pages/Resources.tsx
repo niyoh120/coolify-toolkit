@@ -160,7 +160,12 @@ function FeedbackArea({ batch, lines }: { batch: BatchLines | null; lines: Feedb
 
 export function ResourcesPage({ tab }: { tab: 'applications' | 'services' }) {
   return (
-    <div className="flex flex-col gap-4">
+    <div
+      className={
+        // 应用 Tab 是页面级表格：满高 flex 链让表格自适应屏幕高度；服务 Tab 是卡片列表，保持文档流。
+        tab === 'applications' ? 'flex h-full min-h-0 flex-col gap-4' : 'flex flex-col gap-4'
+      }
+    >
       <ResourceTabsBar active={tab} />
       {tab === 'services' ? <ServicesView /> : <ApplicationsView />}
     </div>
@@ -345,7 +350,7 @@ function ApplicationsView() {
   };
 
   return (
-    <>
+    <div className="flex min-h-0 flex-1 flex-col gap-4">
       {/* 工具栏：搜索 + 三档视图/状态/服务器 + 每页条数 */}
       <div className="flex flex-wrap items-center gap-2">
         <SearchInput
@@ -543,7 +548,7 @@ function ApplicationsView() {
         )}
       </Modal>
 
-      <Card>
+      <Card className="flex min-h-0 flex-1 flex-col">
         {filtered.length === 0 ? (
           <Empty>
             {rows.length === 0
@@ -551,7 +556,7 @@ function ApplicationsView() {
               : '没有匹配的应用，请调整搜索或筛选条件。'}
           </Empty>
         ) : (
-          <Table ariaLabel="应用列表">
+          <Table ariaLabel="应用列表" fill>
             <thead>
               <tr>
                 {!readOnly && (
@@ -691,7 +696,7 @@ function ApplicationsView() {
           }}
         />
       </Card>
-    </>
+    </div>
   );
 }
 

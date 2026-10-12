@@ -1127,6 +1127,99 @@ async function reloadKeepingState() {
 }
 
 /**
+ * 策略筛选与批量后即时刷新：
+ * 1) 应用/服务 Tab 提供按策略筛选且筛选生效；
+ * 2) 批量设置策略后，页面无刷新，行内徽章即变为新策略（防「刷新页面才生效」回归）。
+ */
+async function scenarioPolicy(baseUrl) {
+  const group = 'E 策略筛选与批量后即时刷新';
+  await setViewport(1024, HEIGHT);
+  const setSelectValue = (ariaLabel, value) =>
+    evalJson(`(() => {
+      const sel = document.querySelector('select[aria-label="${ariaLabel}"]');
+      if (sel == null) return false;
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+      setter.call(sel, '${value}');
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
+
+  // 1) 应用 Tab：策略下拉存在，选项齐全；长名应用 fixture 含 auto/notify/manual 多档，
+  //    选「自动」后可见行应全为「自动」徽章。
+  await goto(baseUrl, '#/resources');
+  await waitFor(`document.querySelector('select[aria-label="按策略筛选"]') != null`, {
+    label: 'apps policy select',
+  });
+  const policyOptions = await evalJson(
+    `[...document.querySelector('select[aria-label="按策略筛选"]').options].map((o) => o.value).join(',')`,
+  );
+  check(group, '应用 Tab 策略下拉选项齐全', policyOptions === ',ignore,notify,manual,auto', {
+    policyOptions,
+  });
+  await setSelectValue('按策略筛选', 'auto');
+  const appsFiltered = await waitFor(
+    `(() => {
+      const rows = [...document.querySelectorAll('tbody tr')].map((r) => r.textContent);
+      return rows.length > 0 && rows.every((t) => t.includes('自动')) ? { rows: rows.length } : null;
+    })()`,
+    { label: 'apps filtered to policy=auto' },
+  );
+  check(
+    group,
+    '应用 Tab 按策略筛选生效（可见行全为自动）',
+    (appsFiltered?.rows ?? 0) > 0,
+    appsFiltered,
+  );
+
+  // 2) 服务 Tab：子容器策略下拉存在；筛「手动」时 auto 子容器组（utils/media）整组隐藏。
+  await goto(baseUrl, '#/resources?tab=services');
+  await waitFor(`document.querySelector('select[aria-label="按子容器策略筛选"]') != null`, {
+    label: 'services child policy select',
+  });
+  await setSelectValue('按子容器策略筛选', 'manual');
+  const svcFiltered = await waitFor(
+    `(() => {
+      const text = document.body.textContent;
+      return !text.includes('utils-child-1') && text.includes('legacy-child')
+        ? { filtered: true }
+        : null;
+    })()`,
+    { label: 'services policy=manual hides auto groups' },
+  );
+  check(group, '服务 Tab 按子容器策略筛选生效', svcFiltered?.filtered === true);
+
+  // 3) 批量设置策略：勾选 utils-child-1（auto）改「手动」，反馈出现后徽章应已更新。
+  //    关键回归：全程不 reload，若徽章仍为「自动」说明列表未随变更刷新。
+  await goto(baseUrl, '#/resources?tab=services');
+  await setSelectValue('每页组数', '100');
+  await clickInPage(
+    `document.querySelector('input[aria-label="选择 utils-child-1"]')`,
+    'utils-child-1 checkbox',
+  );
+  await setSelectValue('批量设置策略', 'manual');
+  await waitFor(`document.querySelector('[role="dialog"]') != null`, {
+    label: 'batch policy modal open',
+  });
+  await clickInPage(
+    `[...document.querySelectorAll('[role="dialog"] button')].find((b) => b.textContent.trim() === '确认执行')`,
+    'confirm batch policy',
+  );
+  await waitFor(`document.body.textContent.includes('已将 1 项资源策略设置完成')`, {
+    label: 'batch policy feedback',
+  });
+  const refreshed = await waitFor(
+    `(() => {
+      const cb = document.querySelector('input[aria-label="选择 utils-child-1"]');
+      if (cb == null) return null;
+      const row = cb.closest('tr');
+      return row != null && row.textContent.includes('手动') ? { badge: '手动' } : null;
+    })()`,
+    { label: 'utils-child-1 badge shows 手动 without reload' },
+  );
+  check(group, '批量改策略后表格徽章即时更新（无手动刷新）', refreshed?.badge === '手动');
+}
+
+/**
  * 偏好持久化：应用/服务各自的条件、每页、页码、展开集合跨子 Tab 切换、
  * 更新历史中转与浏览器刷新恢复且互不覆盖；勾选保持组件临时状态。
  */
@@ -1572,6 +1665,7 @@ async function main() {
     await scenarioC(baseUrl);
     await scenarioManagementViews(baseUrl);
     await scenarioD(baseUrl);
+    await scenarioPolicy(baseUrl);
     await scenarioPersistence(baseUrl);
     await scenarioRecovery(recoveryServer.url);
 
@@ -1636,7 +1730,7 @@ async function scenarioManagementViews(baseUrl) {
   const group = 'D 管理状态视图';
   await setViewport(1024, HEIGHT);
 
-  // 1) 默认「未排除」视图：待同步与镜像问题行可见，提示条出现。
+  // 1) 默认「全部」视图：待同步与镜像问题行可见，提示条出现。
   //    先把每页条数设为 100，保证 edge 行（排在列表后段）进入当前页。
   await goto(baseUrl, '#/resources');
   await evalJson(`(() => {
@@ -1657,7 +1751,7 @@ async function scenarioManagementViews(baseUrl) {
       variable: rows.some((t) => t.includes('edge-var-image') && t.includes('镜像变量未解析')),
       excluded: rows.some((t) => t.includes('edge-excluded')),
       active: [...document.querySelectorAll('button')].some(
-        (b) => b.getAttribute('aria-pressed') === 'true' && b.textContent.trim() === '未排除',
+        (b) => b.getAttribute('aria-pressed') === 'true' && b.textContent.trim() === '全部',
       ),
     };
   })()`);

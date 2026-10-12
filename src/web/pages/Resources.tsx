@@ -51,11 +51,13 @@ import {
   decodeExpanded,
   decodePage,
   decodePageSize,
+  decodePolicyFilter,
   decodeServiceFilters,
   decodeStatusFilter,
   encodeExpanded,
   encodeJson,
   PAGE_SIZES,
+  type PolicyFilter,
   SERVICE_PREF_KEYS,
   type StatusFilter,
 } from '../lib/resource-preferences.js';
@@ -98,6 +100,7 @@ type PendingBatch =
   | null;
 
 /** 三档筛选的选择器（应用/服务列表共用）。 */
+const POLICY_SELECT_OPTIONS: readonly Policy[] = ['ignore', 'notify', 'manual', 'auto'];
 function ViewSegmented({
   value,
   onChange,
@@ -113,7 +116,7 @@ function ViewSegmented({
       value={value}
       onChange={onChange}
       options={[
-        { value: 'unexcluded', label: '未排除' },
+        { value: 'unexcluded', label: '全部' },
         { value: 'managed', label: '受管' },
         { value: 'excluded', label: '已排除' },
       ]}
@@ -212,6 +215,12 @@ function ApplicationsView() {
     encode: encodeJson,
     decode: decodeStatusFilter,
   });
+  const [policyFilter, setPolicyFilter] = usePersistedState<PolicyFilter>({
+    key: APP_PREF_KEYS.policy,
+    defaultValue: '',
+    encode: encodeJson,
+    decode: decodePolicyFilter,
+  });
   const [server, setServer] = usePersistedState<string>({
     key: APP_PREF_KEYS.server,
     defaultValue: '',
@@ -264,13 +273,14 @@ function ApplicationsView() {
     });
   }, [resourceKey]);
 
-  // 三档视图先投影；再叠加状态/服务器/搜索条件。纯计算放在早退之前，
+  // 三档视图先投影；再叠加状态/策略/服务器/搜索条件。纯计算放在早退之前，
   // 让下方的页码回写 effect 保持「hooks 全部在 return 前」的固定顺序。
   const rows = resources
     .filter((r) => belongsToView(r, view))
     .filter((r) =>
       statusFilter === 'all' ? true : statusFilter === 'stopped' ? r.isStopped : !r.isStopped,
     )
+    .filter((r) => (policyFilter === '' ? true : r.policy === policyFilter))
     .filter((r) => (server === '' ? true : r.serverName === server));
   const q = search.trim().toLowerCase();
   const filtered = q
@@ -351,7 +361,7 @@ function ApplicationsView() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
-      {/* 工具栏：搜索 + 三档视图/状态/服务器 + 每页条数 */}
+      {/* 工具栏：搜索 + 三档视图/状态/策略/服务器 + 每页条数 */}
       <div className="flex flex-wrap items-center gap-2">
         <SearchInput
           value={search}
@@ -386,6 +396,22 @@ function ApplicationsView() {
             { value: 'stopped', label: '已停止' },
           ]}
         />
+        <Select
+          value={policyFilter}
+          onChange={(e) => {
+            setPolicyFilter(e.target.value as PolicyFilter);
+            setPage(1);
+            clearSelection();
+          }}
+          aria-label="按策略筛选"
+        >
+          <option value="">全部策略</option>
+          {POLICY_SELECT_OPTIONS.map((p) => (
+            <option key={p} value={p}>
+              {POLICY_LABEL[p]}
+            </option>
+          ))}
+        </Select>
         <Select
           value={server}
           onChange={(e) => {
@@ -463,10 +489,11 @@ function ApplicationsView() {
             }}
           >
             <option value="">设置策略…</option>
-            <option value="ignore">忽略</option>
-            <option value="notify">通知</option>
-            <option value="manual">手动</option>
-            <option value="auto">自动</option>
+            {POLICY_SELECT_OPTIONS.map((p) => (
+              <option key={p} value={p}>
+                {POLICY_LABEL[p]}
+              </option>
+            ))}
           </Select>
         </div>
       )}
@@ -896,6 +923,22 @@ function ServicesView() {
           ]}
         />
         <Select
+          value={filters.policy}
+          onChange={(e) => {
+            setFilters((f) => ({ ...f, policy: e.target.value as PolicyFilter }));
+            setPage(1);
+            clearSelection();
+          }}
+          aria-label="按子容器策略筛选"
+        >
+          <option value="">全部策略</option>
+          {POLICY_SELECT_OPTIONS.map((p) => (
+            <option key={p} value={p}>
+              {POLICY_LABEL[p]}
+            </option>
+          ))}
+        </Select>
+        <Select
           value={filters.server}
           onChange={(e) => {
             setFilters((f) => ({ ...f, server: e.target.value }));
@@ -1010,10 +1053,11 @@ function ServicesView() {
                   }}
                 >
                   <option value="">设置策略…</option>
-                  <option value="ignore">忽略</option>
-                  <option value="notify">通知</option>
-                  <option value="manual">手动</option>
-                  <option value="auto">自动</option>
+                  {POLICY_SELECT_OPTIONS.map((p) => (
+                    <option key={p} value={p}>
+                      {POLICY_LABEL[p]}
+                    </option>
+                  ))}
                 </Select>
               </span>
             )}

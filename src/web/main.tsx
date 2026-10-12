@@ -135,10 +135,12 @@ function Shell(): ReactNode {
   );
 }
 
-// Refresh invalidation helper shared by mutation flows.
-export function useRefresh(): () => void {
+// Refresh invalidation helper shared by mutation flows. Resolves when the
+// invalidated active queries have finished refetching, so batch flows can
+// sequence their result feedback behind fresh list data.
+export function useRefresh(): () => Promise<void> {
   const qc = useQueryClient();
-  return () => void qc.invalidateQueries();
+  return () => qc.invalidateQueries();
 }
 
 export function main(): void {

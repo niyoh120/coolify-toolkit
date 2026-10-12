@@ -21,6 +21,9 @@ export const PAGE_SIZES = [10, 20, 50, 100] as const;
 export const STATUS_FILTERS = ['all', 'running', 'stopped'] as const;
 export type StatusFilter = (typeof STATUS_FILTERS)[number];
 
+/** Update-policy filter tiers (applications and service children); '' = all. */
+export type PolicyFilter = (typeof POLICY_VALUES)[number];
+
 const EXCLUSION_VIEWS = ['unexcluded', 'managed', 'excluded'] as const;
 const LEGACY_MANAGED = ['all', 'managed'] as const;
 const POLICY_VALUES = ['', 'ignore', 'notify', 'manual', 'auto'] as const;
@@ -31,6 +34,7 @@ export const APP_PREF_KEYS = {
   search: 'resources.applications.search.v1',
   view: 'resources.applications.view.v1',
   status: 'resources.applications.status.v1',
+  policy: 'resources.applications.policy.v1',
   server: 'resources.applications.server.v1',
   pageSize: 'resources.applications.pageSize.v1',
   page: 'resources.applications.page.v1',
@@ -68,6 +72,10 @@ export function decodeExclusionView(raw: unknown): ExclusionView | null {
 
 export function decodeStatusFilter(raw: unknown): StatusFilter | null {
   return decodeEnum(raw, STATUS_FILTERS);
+}
+
+export function decodePolicyFilter(raw: unknown): PolicyFilter | null {
+  return decodeEnum(raw, POLICY_VALUES);
 }
 
 export function decodePageSize(raw: unknown): number | null {

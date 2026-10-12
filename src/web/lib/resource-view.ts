@@ -225,7 +225,7 @@ export function projectGroupsForView(groups: ServiceGroup[], view: ExclusionView
 
 export interface ServiceFilters {
   search: string;
-  /** 子容器策略条件：视图模型保留维度，由单元测试覆盖；当前页面未提供入口。 */
+  /** 子容器策略条件：由服务 Tab「按子容器策略筛选」下拉驱动，单测覆盖过滤行为。 */
   policy: '' | Policy;
   /** 旧「受管」双轨条件：已被三档视图（ExclusionView.managed）取代，仅为兼容保留。 */
   managed: 'all' | 'managed';

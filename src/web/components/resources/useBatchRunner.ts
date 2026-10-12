@@ -84,10 +84,12 @@ export function useBatchRunner() {
     }
     setActiveCheckId(null);
     setProgress(null);
-    setBusy(false);
     const lines = { summary: summarizeBatchChecks(stats), detail };
+    // 先等列表重取完成再展示反馈：反馈与刷新后的表格同帧出现。
+    // busy 保持到重取结束：重取窗口内不可叠加新批量（与 runPolicy 语义一致）。
+    await refresh();
     setResult(lines);
-    refresh();
+    setBusy(false);
     return lines;
   };
 
@@ -122,10 +124,12 @@ export function useBatchRunner() {
     }
     setActiveUpdateId(null);
     setProgress(null);
-    setBusy(false);
     const lines = { summary: summarizeBatchUpdates(stats), detail };
+    // 先等列表重取完成再展示反馈：反馈与刷新后的表格同帧出现。
+    // busy 保持到重取结束：重取窗口内不可叠加新批量（与 runPolicy 语义一致）。
+    await refresh();
     setResult(lines);
-    refresh();
+    setBusy(false);
     return lines;
   };
 
@@ -134,8 +138,9 @@ export function useBatchRunner() {
     try {
       const res = await api.batchPolicy(ids, policy);
       // 成功数来自 API（去重后的实际目标数），与提交数可能不同。
+      // 先等列表重取完成再展示反馈：反馈与刷新后的表格同帧出现。
+      await refresh();
       setResult({ summary: `已将 ${res.updated} 项资源策略设置完成。`, detail: [] });
-      refresh();
     } catch (err) {
       // 整批原子失败：展示「整批未保存」与逐项原因，策略保持原值。
       const detail: FeedbackLine[] = [];
@@ -157,7 +162,7 @@ export function useBatchRunner() {
         summary: `策略整批未保存：${err instanceof Error ? err.message : '请求错误'}`,
         detail,
       });
-      refresh();
+      await refresh();
     } finally {
       setBusy(false);
     }
@@ -201,10 +206,12 @@ export function useBatchRunner() {
     }
     setActiveConfirmId(null);
     setProgress(null);
-    setBusy(false);
     const lines = { summary: summarizeBatchConfirmations(stats), detail };
+    // 先等列表重取完成再展示反馈：反馈与刷新后的表格同帧出现。
+    // busy 保持到重取结束：重取窗口内不可叠加新批量（与 runPolicy 语义一致）。
+    await refresh();
     setResult(lines);
-    refresh();
+    setBusy(false);
     return lines;
   };
 
@@ -230,7 +237,7 @@ export function useCheckOne(nameOf: (id: number) => string, onFeedback: (line: s
     mutationFn: (id: number) => api.checkResource(id),
     onSuccess: (res, id) => {
       onFeedback(checkOutcomeFeedback(nameOf(id), res.check.outcome, res.check.message).text);
-      refresh();
+      void refresh();
     },
     onError: (e, id) => {
       onFeedback(`${nameOf(id)}：检查失败（${e instanceof Error ? e.message : '请求错误'}）`);
@@ -246,7 +253,7 @@ export function useUpdateOne(nameOf: (id: number) => string, onFeedback: (line: 
     onSuccess: (res, id) => {
       if (res.skipped) onFeedback(`${nameOf(id)}：无更新，已跳过`);
       else onFeedback(`${nameOf(id)}：更新任务已提交`);
-      refresh();
+      void refresh();
     },
     onError: (e, id) => {
       onFeedback(`${nameOf(id)}：提交失败（${e instanceof Error ? e.message : '请求错误'}）`);

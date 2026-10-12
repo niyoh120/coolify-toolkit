@@ -44,7 +44,7 @@ export function HistoryPage() {
     mutationFn: (id: number) => api.retryJob(id),
     onSuccess: () => {
       setActionError(null);
-      refresh();
+      void refresh();
     },
     onError: (e) =>
       setActionError(`本次重试未执行：${e instanceof Error ? e.message : '请求错误'}`),
@@ -53,7 +53,7 @@ export function HistoryPage() {
     mutationFn: (job: (typeof jobs)[number]) => api.confirmJob(job.id, job.candidateDigest),
     onSuccess: () => {
       setActionError(null);
-      refresh();
+      void refresh();
     },
     onError: (e) =>
       setActionError(`本次确认未完成：${e instanceof Error ? e.message : '请求错误'}`),

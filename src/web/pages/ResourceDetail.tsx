@@ -80,7 +80,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
     onSuccess: (res) => {
       // blocked（HTTP 200）不改变任何数据，必须显式展示结果，否则像“没反应”。
       setCheckFeedback(checkOutcomeFeedback(resource.name, res.check.outcome, res.check.message));
-      refresh();
+      void refresh();
     },
     onError: (e) => {
       setCheckFeedback({
@@ -105,7 +105,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
     onSuccess: () => {
       setPreview(null);
       setActionError(null);
-      refresh();
+      void refresh();
     },
     onError: (e) => setActionError(e instanceof Error ? e.message : String(e)),
   });
@@ -408,7 +408,7 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
     mutationFn: () => api.retryJob(job.id),
     onSuccess: () => {
       setActionError(null);
-      refresh();
+      void refresh();
     },
     onError: (e) =>
       setActionError(`本次重试未执行：${e instanceof Error ? e.message : '请求错误'}`),
@@ -417,7 +417,7 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
     mutationFn: () => api.confirmJob(job.id, job.candidateDigest),
     onSuccess: () => {
       setActionError(null);
-      refresh();
+      void refresh();
     },
     onError: (e) =>
       setActionError(`本次确认未完成：${e instanceof Error ? e.message : '请求错误'}`),

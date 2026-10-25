@@ -59,5 +59,8 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   console.error('[toolkit] startup failed:', err instanceof Error ? err.message : err);
+  if (err instanceof Error && err.cause instanceof Error) {
+    console.error('[toolkit] caused by:', err.cause.message);
+  }
   process.exit(1);
 });

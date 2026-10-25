@@ -1,59 +1,76 @@
-// Single-instance guard: exclusive lock file next to the database.
-// Stale locks (dead pid) are reclaimed; a live second instance fails fast.
-import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
+// Single-instance guard: exclusive SQLite file lock next to the database.
+//
+// The lock is a dedicated SQLite connection holding EXCLUSIVE locking_mode on
+// its own small database file (toolkit.lock.db). The lock lives in the kernel
+// (POSIX byte-range locks) and is released by the OS when the process exits —
+// gracefully, on kill -9, OOM, or power loss — so a stale lock can never wedge
+// the next boot. This also works across pid namespaces (containers) and
+// across containers sharing the same /data volume, where pid-file checks fail.
+//
+// Tradeoff: the lock file cannot carry the holder's pid (it would be stale or
+// namespace-local), so the error message stays generic; diagnostics go through
+// logs instead.
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+
+// Fail fast: a second instance must not queue behind the holder's lock.
+const FAIL_FAST_BUSY_TIMEOUT_MS = 0;
 
 export class SingleInstanceLock {
-  private fd: number | null = null;
+  private conn: DatabaseSync | null = null;
 
   constructor(private readonly lockPath: string) {}
 
   acquire(): void {
-    if (existsSync(this.lockPath)) {
-      const pid = this.readPid();
-      if (pid != null && this.pidAlive(pid)) {
+    if (this.conn != null) {
+      throw new Error('SingleInstanceLock already acquired');
+    }
+    const conn = new DatabaseSync(this.lockPath);
+    try {
+      conn.exec(`PRAGMA busy_timeout = ${FAIL_FAST_BUSY_TIMEOUT_MS};`);
+      // EXCLUSIVE locking_mode keeps the kernel-level byte-range lock held
+      // between transactions for this connection's lifetime.
+      conn.exec('PRAGMA locking_mode = EXCLUSIVE;');
+      // A real write pins the OS lock: on a brand-new (0-byte) file a bare
+      // read takes no byte-range lock, so the write is what makes the lock
+      // visible to other processes/connections.
+      conn.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);');
+      conn
+        .prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?);')
+        .run('acquired_at', new Date().toISOString());
+    } catch (err) {
+      conn.close();
+      // SQLITE_NOTADB (primary result code 26): the file exists but has no
+      // SQLite header — e.g. a leftover non-SQLite artifact. Deleting it is
+      // safe; the lock is kernel-held, so the file itself carries no state.
+      const errcode = (err as { errcode?: number }).errcode;
+      if (errcode === 26) {
         throw new Error(
-          `Another toolkit instance (pid ${pid}) is running (lock: ${this.lockPath})`,
+          `Lock file ${this.lockPath} is corrupt (not a SQLite database); delete it and restart`,
+          { cause: err },
         );
       }
-      unlinkSync(this.lockPath); // stale lock from a crashed process
+      throw new Error(`Another toolkit instance is running (lock held: ${this.lockPath})`, {
+        cause: err,
+      });
     }
-    this.fd = openSync(this.lockPath, 'wx');
-    writeSync(this.fd, String(process.pid));
+    this.conn = conn;
   }
 
   release(): void {
-    if (this.fd != null) {
-      closeSync(this.fd);
-      this.fd = null;
+    if (this.conn != null) {
       try {
-        unlinkSync(this.lockPath);
-      } catch {
-        // already gone
+        this.conn.close(); // kernel drops the file lock, even after a crash
+      } finally {
+        this.conn = null;
       }
-    }
-  }
-
-  private readPid(): number | null {
-    try {
-      const content = readFileSync(this.lockPath, 'utf8').trim();
-      const pid = Number.parseInt(content, 10);
-      return Number.isFinite(pid) ? pid : null;
-    } catch {
-      return null;
-    }
-  }
-
-  private pidAlive(pid: number): boolean {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
     }
   }
 }
 
 export function lockPathFor(databasePath: string): string {
-  return path.join(path.dirname(databasePath), 'toolkit.lock');
+  // A sibling of the real database keeps the lock on the same volume as /data
+  // while never colliding with toolkit.db itself (SQLite would refuse to open
+  // the same file twice).
+  return path.join(path.dirname(databasePath), 'toolkit.lock.db');
 }

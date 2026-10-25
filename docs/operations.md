@@ -30,9 +30,9 @@
 
 ## 备份与升级
 
-- 业务数据（SQLite + WAL）在 `/data`。升级/迁移前：停止容器 → 备份整个目录（含 `toolkit.db-wal`、`toolkit.db-shm`、`toolkit.lock`）→ 再升级。
+- 业务数据（SQLite + WAL）在 `/data`。升级/迁移前：停止容器 → 备份整个目录（含 `toolkit.db-wal`、`toolkit.db-shm`、`toolkit.lock.db`）→ 再升级。
 - 迁移失败（启动日志 `startup failed`）时回滚到上一镜像并恢复备份目录。
-- 单实例锁：`/data/toolkit.lock`。进程被 kill -9 后重启会自动回收陈旧锁；若锁提示存在活跃实例，先确认无重复容器。
+- 单实例锁：`/data/toolkit.lock.db`（SQLite 内核级文件锁，锁随进程退出由内核自动释放，kill -9 / 断电后重启可直接启动；若锁提示存在活跃实例，先确认无重复容器或共享同一数据卷的其它实例）。若启动报 `lock file ... is corrupt (not a SQLite database)`，说明锁文件损坏（非 SQLite 格式），停止容器删除该文件后重启即可，锁状态完全由内核持有，删除无副作用。
 
 ## 旧库升级（管理分类迁移）
 

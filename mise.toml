@@ -74,7 +74,7 @@ if [ -f data/server.pid ]; then
   kill "$pid" 2>/dev/null || true
   rm -f data/server.pid
 fi
-# 兜底：kill 遗留的孤儿进程（pid 文件过期时占住 toolkit.lock）
+# 兜底：kill 遗留的孤儿进程（pid 文件过期时占住 toolkit.lock.db）
 pkill -f 'node --env-file=.env dist/server/index.js' 2>/dev/null || true
 sleep 1
 echo "已停止"

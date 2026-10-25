@@ -264,7 +264,7 @@ export class UpdateExecutor {
     this.notifyTerminal(
       job,
       '更新失败',
-      `资源 #${job.resourceId} 更新到 ${short(job.candidateDigest)} 失败（${code}）：${message}。` +
+      `资源 ${this.resourceLabel(job.resourceId)} 更新到 ${short(job.candidateDigest)} 失败（${code}）：${message}。` +
         '当前目标配置已保留，自动更新已暂停。',
     );
   }
@@ -277,6 +277,16 @@ export class UpdateExecutor {
       dedupeKey: `update_failed:${job.id}`,
       payload: { title, body, type: 'failure' },
     });
+  }
+
+  /** "name（#id）" for notification copy; row always exists (FK cascade). */
+  private resourceLabel(resourceId: number): string {
+    const row = this.db
+      .select({ name: resources.name })
+      .from(resources)
+      .where(eq(resources.id, resourceId))
+      .get();
+    return row != null ? `${row.name}（#${resourceId}）` : `#${resourceId}`;
   }
 
   /** External-change guard for runtime drift; call only after winning the job. */
@@ -356,7 +366,7 @@ export class UpdateExecutor {
       this.notifyTerminal(
         job,
         '更新冲突',
-        `资源 #${job.resourceId} 自动检查发现配置漂移（${code}）：${message}。目标已保留，资源已置为外部修改状态，请核对后在资源详情重新确认追踪来源。`,
+        `资源 ${this.resourceLabel(job.resourceId)} 自动检查发现配置漂移（${code}）：${message}。目标已保留，资源已置为外部修改状态，请核对后在资源详情重新确认追踪来源。`,
       );
     }
   }
@@ -640,7 +650,7 @@ export class UpdateExecutor {
       dedupeKey: `submit_unknown:${job.id}`,
       payload: {
         title: '提交结果未知',
-        body: `资源 #${job.resourceId} 的更新提交结果未知：${reason}。请先在更新历史中对账或人工确认，避免重复部署。`,
+        body: `资源 ${this.resourceLabel(job.resourceId)} 的更新提交结果未知：${reason}。请先在更新历史中对账或人工确认，避免重复部署。`,
         type: 'warning',
       },
     });

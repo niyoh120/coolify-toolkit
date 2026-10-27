@@ -7,6 +7,8 @@ import type {
   SelectHTMLAttributes,
 } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { toast } from 'sonner';
+import { FEEDBACK } from '../lib/action-feedback.js';
 
 export function cn(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(' ');
@@ -274,15 +276,71 @@ export function Td({
   );
 }
 
+/**
+ * 共享复制入口：Clipboard Promise 期间忙碌并防重复触发；成功/拒绝用 Sonner
+ * 反馈；API 缺失（非安全上下文等）明确提示当前环境不可用。
+ * 失败提示附带复制内容，避免敏感值落进 toast。
+ */
+function useCopyValue(): { copy(text: string): void; busy: boolean } {
+  const [busy, setBusy] = useState(false);
+  // 同步执行锁：state 更新是异步的，同一轮多次调用的旧闭包仍读到旧值，
+  // 防重复必须依赖同步设置的 ref；state 仅负责展示。
+  const inFlight = useRef(false);
+  const copy = useCallback((text: string): void => {
+    if (inFlight.current) return; // 上一次复制未结束前忽略新点击。
+    if (typeof navigator === 'undefined' || navigator.clipboard?.writeText == null) {
+      toast.error('无法复制', {
+        description: '当前环境不可用 Clipboard API（需 HTTPS 或 localhost）。',
+        duration: FEEDBACK.errorMs,
+        closeButton: true,
+      });
+      return;
+    }
+    inFlight.current = true;
+    setBusy(true);
+    try {
+      // writeText 返回 Promise；同步异常与拒绝都要接住，避免 unhandled rejection。
+      void Promise.resolve(navigator.clipboard.writeText(text))
+        .then(() => {
+          toast.success('已复制', { description: text, duration: FEEDBACK.successMs });
+        })
+        .catch(() => {
+          toast.error('复制失败', {
+            description: '浏览器拒绝或中断了写入，请重试。',
+            duration: FEEDBACK.errorMs,
+            closeButton: true,
+          });
+        })
+        .finally(() => {
+          inFlight.current = false;
+          setBusy(false);
+        });
+    } catch {
+      inFlight.current = false;
+      setBusy(false);
+      toast.error('复制失败', {
+        description: '浏览器拒绝或中断了写入，请重试。',
+        duration: FEEDBACK.errorMs,
+        closeButton: true,
+      });
+    }
+  }, []);
+  return { copy, busy };
+}
+
 export function Mono({ children, copyable }: { children: ReactNode; copyable?: boolean }) {
   const text = typeof children === 'string' ? children : undefined;
+  const { copy, busy } = useCopyValue();
+  const onClick = text != null ? () => copy(text) : undefined;
   return (
     <span className="mono text-[var(--color-text-secondary)]" title={text}>
-      {copyable && text != null ? (
+      {copyable && text != null && onClick != null ? (
         <button
           type="button"
-          className="mono cursor-pointer text-[var(--color-text-secondary)] underline decoration-dotted underline-offset-2 hover:text-[var(--color-accent)]"
-          onClick={() => void navigator.clipboard.writeText(text)}
+          className="mono cursor-pointer text-[var(--color-text-secondary)] underline decoration-dotted underline-offset-2 hover:text-[var(--color-accent)] disabled:cursor-wait disabled:opacity-60"
+          onClick={onClick}
+          disabled={busy}
+          aria-busy={busy}
           title="点击复制完整值"
         >
           {children}

@@ -3,6 +3,7 @@
 // aggregated ServiceDetail; everything else renders the single-resource view.
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { type ReactNode, useState } from 'react';
+import { toast } from 'sonner';
 import type { AdoptPreviewDTO, JobDTO, ResourceDTO } from '../../shared/types.js';
 import {
   BlockedBadge,
@@ -30,6 +31,7 @@ import {
   Mono,
   Select,
 } from '../components/ui.js';
+import { type ActionFeedbackMeta, FEEDBACK } from '../lib/action-feedback.js';
 import { api, type Policy, type PreviewResult } from '../lib/api.js';
 import {
   adoptBlockedHint,
@@ -56,6 +58,12 @@ export function ResourceDetailPage({ id }: { id: number }) {
   const { resource, jobs } = data;
   if (resource.kind === 'compose_service') return <ServiceDetail parent={resource} />;
   return <SingleResourceDetail resource={resource} jobs={jobs} />;
+}
+
+/** 保存按钮文案：进行中/外部修改/普通三分支，避免嵌套三元内联。 */
+function saveButtonLabel(pending: boolean, externalChange: boolean): string {
+  if (pending) return '保存中…';
+  return externalChange ? '保存并确认当前配置' : '保存';
 }
 
 function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs: JobDTO[] }) {
@@ -96,6 +104,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
 
   const patch = useMutation({
     mutationFn: (p: Parameters<typeof api.patchResource>[1]) => api.patchResource(id, p),
+    meta: { errorFeedback: 'local' } satisfies ActionFeedbackMeta,
     onSuccess: (res) => {
       clearStaleActionState();
       setAdoptFeedback({
@@ -108,6 +117,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
   });
   const check = useMutation({
     mutationFn: api.checkResource,
+    meta: { errorFeedback: 'local' } satisfies ActionFeedbackMeta,
     onSuccess: (res) => {
       // blocked（HTTP 200）不改变任何数据，必须显式展示结果，否则像“没反应”。
       setCheckFeedback(checkOutcomeFeedback(resource.name, res.check.outcome, res.check.message));
@@ -122,6 +132,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
   });
   const previewMut = useMutation({
     mutationFn: () => api.preview(id),
+    meta: { errorFeedback: 'local' } satisfies ActionFeedbackMeta,
     onSuccess: (res) => {
       setPreview(res.preview);
       setActionError(res.preview == null ? (res.message ?? '无更新') : null);
@@ -133,14 +144,21 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
       if (preview == null) throw new Error('请先预览');
       return api.submitUpdate(id, preview.candidateDigest, preview.previewToken);
     },
-    onSuccess: () => {
+    meta: { errorFeedback: 'local' } satisfies ActionFeedbackMeta,
+    onSuccess: (res) => {
       clearStaleActionState();
+      // 202 仅表示任务已接受，非部署完成；明说以避免误读。
+      toast.success('更新任务已提交', {
+        description: `任务 #${res.job.id} 已进入队列；部署结果见任务历史。`,
+        duration: FEEDBACK.successMs,
+      });
       void refresh();
     },
     onError: (e) => setActionError(e instanceof Error ? e.message : String(e)),
   });
   const adoptPreviewMut = useMutation({
     mutationFn: () => api.adoptPreview(id, adoptTag.trim() !== '' ? adoptTag.trim() : undefined),
+    meta: { errorFeedback: 'local' } satisfies ActionFeedbackMeta,
     onSuccess: (res) => {
       setAdoptPreview(res.preview);
       setAdoptError(null);
@@ -152,6 +170,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
       if (adoptPreview == null) throw new Error('请先预览采纳');
       return api.adopt(id, adoptPreview.previewToken);
     },
+    meta: { errorFeedback: 'local' } satisfies ActionFeedbackMeta,
     onSuccess: (res) => {
       clearStaleActionState();
       setAdoptFeedback({ text: res.message, tone: res.status === 'skipped' ? 'info' : 'success' });
@@ -161,6 +180,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
   });
   const resetMut = useMutation({
     mutationFn: () => api.resetTracking(id),
+    meta: { errorFeedback: 'local' } satisfies ActionFeedbackMeta,
     onSuccess: (res) => {
       setResetOpen(false);
       setResetError(null);
@@ -366,9 +386,10 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
                   if (Object.keys(p).length > 0) patch.mutate(p);
                 }}
                 disabled={readOnly || patch.isPending}
+                aria-busy={patch.isPending}
                 title={readOnly ? '当前管理受限，配置只读' : undefined}
               >
-                {externalChange ? '保存并确认当前配置' : '保存'}
+                {saveButtonLabel(patch.isPending, externalChange)}
               </Button>
               <Button
                 onClick={() => {
@@ -376,6 +397,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
                   check.mutate(id);
                 }}
                 disabled={checkHint != null || check.isPending}
+                aria-busy={check.isPending}
                 title={checkHint ?? '检查上游是否有新版本'}
               >
                 {check.isPending ? '检查中…' : '检查更新'}
@@ -412,6 +434,8 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
                   value={resource.policy}
                   aria-label="策略"
                   className="!w-40"
+                  // 保存进行中锁定策略选择：避免上一份保存未落库又叠加新值。
+                  disabled={patch.isPending}
                   onChange={(e) => patch.mutate({ policy: e.target.value as Policy })}
                 >
                   <option value="ignore">忽略</option>
@@ -464,9 +488,10 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
               variant="outline"
               onClick={() => previewMut.mutate()}
               disabled={readOnly || previewMut.isPending}
+              aria-busy={previewMut.isPending}
               title={readOnly ? '当前管理受限' : undefined}
             >
-              预览更新
+              {previewMut.isPending ? '预览中…' : '预览更新'}
             </Button>
             {preview != null && (
               <Button
@@ -474,8 +499,11 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
                 className="whitespace-normal"
                 onClick={() => updateMut.mutate()}
                 disabled={updateMut.isPending}
+                aria-busy={updateMut.isPending}
               >
-                确认更新到 {shortDigest(preview.candidateDigest)}
+                {updateMut.isPending
+                  ? '提交中…'
+                  : `确认更新到 ${shortDigest(preview.candidateDigest)}`}
               </Button>
             )}
           </div>
@@ -674,8 +702,10 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
   const [actionError, setActionError] = useState<string | null>(null);
   const retry = useMutation({
     mutationFn: () => api.retryJob(job.id),
-    onSuccess: () => {
+    meta: { errorFeedback: 'local' } satisfies ActionFeedbackMeta,
+    onSuccess: (res) => {
       setActionError(null);
+      toast.success(`任务 #${res.job.id} 已重新排队`, { duration: FEEDBACK.successMs });
       void refresh();
     },
     onError: (e) =>
@@ -683,8 +713,10 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
   });
   const confirm = useMutation({
     mutationFn: () => api.confirmJob(job.id, job.candidateDigest),
-    onSuccess: () => {
+    meta: { errorFeedback: 'local' } satisfies ActionFeedbackMeta,
+    onSuccess: (res) => {
       setActionError(null);
+      toast.success(`任务 #${res.job.id} 人工确认已记录`, { duration: FEEDBACK.successMs });
       void refresh();
     },
     onError: (e) =>
@@ -717,8 +749,13 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
         </span>
         <span className="ml-auto flex gap-1.5">
           {['failed', 'conflict', 'blocked'].includes(job.status) && (
-            <Button variant="ghost" onClick={() => retry.mutate()} disabled={retry.isPending}>
-              同目标重试
+            <Button
+              variant="ghost"
+              onClick={() => retry.mutate()}
+              disabled={retry.isPending}
+              aria-busy={retry.isPending}
+            >
+              {retry.isPending ? '重试中…' : '同目标重试'}
             </Button>
           )}
           {awaiting && (
@@ -728,8 +765,9 @@ function JobCard({ job }: { job: import('../../shared/types.js').JobDTO }): Reac
               title="记录人工确认并解除等待；也可等提交约 60 秒后的单次自动检查"
               onClick={() => confirm.mutate()}
               disabled={confirm.isPending}
+              aria-busy={confirm.isPending}
             >
-              我已确认容器正常，记录人工确认
+              {confirm.isPending ? '确认中…' : '我已确认容器正常，记录人工确认'}
             </Button>
           )}
         </span>

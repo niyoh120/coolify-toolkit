@@ -19,6 +19,7 @@
     "format": "biome format --write .",
     "test": "vitest run",
     "test:responsive": "npm run build:web && node scripts/verify-responsive.mjs",
+    "test:feedback": "npm run build:web && node scripts/verify-feedback.mjs",
     "test:watch": "vitest",
     "check": "npm run typecheck && npm run lint && npm run test && npm run build",
     "db:generate": "drizzle-kit generate",
@@ -33,6 +34,7 @@
     "hono": "4.13.9",
     "react": "19.3.0",
     "react-dom": "19.3.0",
+    "sonner": "2.0.8",
     "undici": "8.11.2",
     "yaml": "2.9.1",
     "zod": "4.6.5"

@@ -256,8 +256,9 @@ function ApplicationsView() {
   });
   const resources = data?.resources ?? [];
   const nameOf = (id: number): string => resources.find((r) => r.id === id)?.name ?? `资源 #${id}`;
-  const checkOne = useCheckOne(nameOf, pushFeedback);
-  const updateOne = useUpdateOne(nameOf, pushFeedback);
+  // 单项与批量共用同一把同步锁：双向互斥，杜绝同资源并发重复请求。
+  const checkOne = useCheckOne(nameOf, pushFeedback, batchRunner);
+  const updateOne = useUpdateOne(nameOf, pushFeedback, batchRunner);
   // 筛选/分页/每页变化在各自处理器里清空选择，避免隐藏资源混入批量操作。
   const clearSelection = (): void => setSelected([]);
 
@@ -314,8 +315,17 @@ function ApplicationsView() {
   const serverChoices =
     server !== '' && !knownServers.includes(server) ? [server, ...knownServers] : knownServers;
 
+  // 读取失败时保留已完成的操作反馈（批量汇总与单项结果在错误框上方同时可见），
+  // 避免用户只看到读取失败而丢失「更新任务已提交」等真实写结果。
   if (isLoading) return <Loading />;
-  if (error != null) return <ErrorBox error={error} />;
+  if (error != null) {
+    return (
+      <>
+        <FeedbackArea batch={batchRunner.result} lines={feedbackLines} />
+        <ErrorBox error={error} />
+      </>
+    );
+  }
 
   // 排除视图只读：不提供选择与操作。
   const readOnly = view === 'excluded';
@@ -339,6 +349,7 @@ function ApplicationsView() {
     const pending = pendingBatch;
     setPendingBatch(null);
     if (pending == null) return;
+    if (batchRunner.busy) return; // runner 执行锁拒绝叠加。
     if (pending.kind === 'check') {
       void batchRunner.runChecks(
         checkableRows.map((r) => r.id),
@@ -826,8 +837,16 @@ function ServicesView() {
     });
   }, [selectableKey]);
 
+  // 同上：读取失败时保留批量汇总与单项操作反馈。
   if (isLoading) return <Loading />;
-  if (error != null) return <ErrorBox error={error} />;
+  if (error != null) {
+    return (
+      <>
+        <FeedbackArea batch={batchRunner.result} lines={feedbackLines} />
+        <ErrorBox error={error} />
+      </>
+    );
+  }
 
   const pageSelectable = selectableChildIds(paged);
   const pageSelection = selectionState(pageSelectable, selected);
@@ -864,6 +883,7 @@ function ServicesView() {
     const pending = pendingBatch;
     setPendingBatch(null);
     if (pending == null) return;
+    if (batchRunner.busy) return; // runner 执行锁拒绝叠加。
     if (pending.kind === 'check') {
       void batchRunner.runChecks(
         checkableRows.map((r) => r.id),
@@ -1101,7 +1121,7 @@ function ServicesView() {
                 // 页面级执行锁：批量进行中不接受新的行级确认。
                 if (batchRunner.busy) return;
                 const item = confirmSnapshotItem(resources, r.id);
-                if (item != null) void batchRunner.runConfirmations([item]);
+                if (item != null && !batchRunner.busy) void batchRunner.runConfirmations([item]);
               }}
               checkingId={batchRunner.activeCheckId}
               updatingId={batchRunner.activeUpdateId}

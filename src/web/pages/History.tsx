@@ -1,6 +1,7 @@
 // Update history across all resources.
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
+import { toast } from 'sonner';
 
 import { ResourceTabsBar } from '../components/ResourceTabsBar.js';
 import { JobStatusBadge, SUCCESS_SOURCE_LABEL, shortDigest } from '../components/status.js';
@@ -18,6 +19,7 @@ import {
   Td,
   Th,
 } from '../components/ui.js';
+import { FEEDBACK } from '../lib/action-feedback.js';
 import { api } from '../lib/api.js';
 import { useRefresh, useRouter } from '../main.js';
 
@@ -40,10 +42,14 @@ export function HistoryPage() {
     queryFn: () => api.jobs(status),
     refetchInterval: 5_000,
   });
+  // 重试/确认保留内联错误（actionError）；成功补一次已提交语义 toast。
+  // 错误已内联展示，显式声明 local 避免全局兑底重复弹错。
   const retry = useMutation({
     mutationFn: (id: number) => api.retryJob(id),
-    onSuccess: () => {
+    meta: { errorFeedback: 'local' },
+    onSuccess: (res) => {
       setActionError(null);
+      toast.success(`任务 #${res.job.id} 已重新排队`, { duration: FEEDBACK.successMs });
       void refresh();
     },
     onError: (e) =>
@@ -51,8 +57,10 @@ export function HistoryPage() {
   });
   const confirm = useMutation({
     mutationFn: (job: (typeof jobs)[number]) => api.confirmJob(job.id, job.candidateDigest),
-    onSuccess: () => {
+    meta: { errorFeedback: 'local' },
+    onSuccess: (res) => {
       setActionError(null);
+      toast.success(`任务 #${res.job.id} 人工确认已记录`, { duration: FEEDBACK.successMs });
       void refresh();
     },
     onError: (e) =>
@@ -175,8 +183,9 @@ export function HistoryPage() {
                           variant="ghost"
                           onClick={() => retry.mutate(j.id)}
                           disabled={retry.isPending}
+                          aria-busy={retry.isPending}
                         >
-                          重试
+                          {retry.isPending ? '重试中…' : '重试'}
                         </Button>
                       )}
                       {j.status === 'running' && j.stage === 'awaiting_confirmation' && (
@@ -193,8 +202,9 @@ export function HistoryPage() {
                             }
                           }}
                           disabled={confirm.isPending}
+                          aria-busy={confirm.isPending}
                         >
-                          人工确认
+                          {confirm.isPending ? '确认中…' : '人工确认'}
                         </Button>
                       )}
                     </div>

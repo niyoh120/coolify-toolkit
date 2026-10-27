@@ -1,7 +1,6 @@
 // Coolify-style sidebar: section labels, inline icons, elevated active state.
 import type { ReactNode } from 'react';
-import { api } from '../lib/api.js';
-import { useRefresh } from '../main.js';
+import { useSyncAction } from './SyncActionProvider.js';
 import { Badge, Button } from './ui.js';
 
 export type PageName =
@@ -92,7 +91,20 @@ export function Layout({
   paused: boolean;
   children: ReactNode;
 }) {
-  const refresh = useRefresh();
+  const { syncing, runSync } = useSyncAction();
+  const syncButton = (): ReactNode => (
+    <Button
+      variant="ghost"
+      title="从 Coolify 重新同步资源"
+      aria-busy={syncing}
+      disabled={syncing}
+      onClick={() => {
+        void runSync();
+      }}
+    >
+      {syncing ? '同步中…' : '重新同步'}
+    </Button>
+  );
   return (
     <div className="flex h-full flex-col md:flex-row">
       <aside className="flex shrink-0 flex-col border-b border-[var(--color-border-base)] bg-[var(--color-bg-raised)] px-3 py-2 md:h-full md:w-52 md:overflow-y-auto md:border-b-0 md:border-r md:px-3 md:py-4">
@@ -115,15 +127,7 @@ export function Layout({
           </div>
           <div className="flex items-center gap-2 md:hidden">
             {paused && <Badge tone="warning">全局已暂停</Badge>}
-            <Button
-              variant="ghost"
-              title="从 Coolify 重新同步资源"
-              onClick={() => {
-                void api.sync().then(refresh);
-              }}
-            >
-              重新同步
-            </Button>
+            {syncButton()}
           </div>
         </div>
         <div className="flex flex-wrap gap-x-4 gap-y-1 md:flex-col">
@@ -154,15 +158,7 @@ export function Layout({
         </div>
         <div className="mt-auto hidden items-center gap-2 md:flex">
           {paused && <Badge tone="warning">全局已暂停</Badge>}
-          <Button
-            variant="ghost"
-            title="从 Coolify 重新同步资源"
-            onClick={() => {
-              void api.sync().then(refresh);
-            }}
-          >
-            重新同步
-          </Button>
+          {syncButton()}
         </div>
       </aside>
       <main className="min-h-0 min-w-0 flex-1 overflow-y-auto p-4 md:p-6">{children}</main>

@@ -246,6 +246,16 @@ export interface SettingsDTO {
   apprise: AppriseStatusDTO;
 }
 
+/** /api/sync 响应内的同步结果；resourcesSeen 是父服务/应用扫描计数。 */
+export interface SyncResultDTO {
+  resourcesSeen: number;
+  created: number;
+  externalChanges: number;
+  removed: number;
+  /** 部分（子容器读取等）失败收集；非空时同步视为部分完成。 */
+  errors: string[];
+}
+
 export interface ApiError {
   error: {
     code: string;

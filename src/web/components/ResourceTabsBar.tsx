@@ -2,20 +2,22 @@
 // Resources (both tabs) and history pages render the same bar so switching
 // keeps the navigation visible; the refresh button lives here too.
 
-import { api } from '../lib/api.js';
-import { useRefresh, useRouter } from '../main.js';
+import { useRouter } from '../main.js';
+import { useSyncAction } from './SyncActionProvider.js';
 import { Button, HeadingTab } from './ui.js';
 
 export type ResourceWorkspaceTab = 'applications' | 'services' | 'history';
 
 function RefreshButton() {
-  const refresh = useRefresh();
+  const { syncing, runSync } = useSyncAction();
   return (
     <Button
       variant="outline"
       title="从 Coolify 重新同步资源"
+      aria-busy={syncing}
+      disabled={syncing}
       onClick={() => {
-        void api.sync().then(refresh);
+        void runSync();
       }}
     >
       <svg
@@ -29,7 +31,7 @@ function RefreshButton() {
         <path d="M21 12a9 9 0 1 1-2.64-6.36" />
         <path d="M21 3v6h-6" />
       </svg>
-      刷新
+      {syncing ? '同步中…' : '刷新'}
     </Button>
   );
 }

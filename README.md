@@ -71,6 +71,8 @@ npm run check               # typecheck + lint + test + build
 | 命令 | 说明 |
 | --- | --- |
 | `npm run check` | typecheck + lint + test + build（CI 基线） |
+| `npm run test:responsive` | 浏览器响应式回归（agent-browser + 本地 fixture，见 docs/responsive-validation.md） |
+| `npm run test:feedback` | 浏览器操作反馈回归（Sonner toast/同步防重/复制，见 docs/action-feedback-validation.md） |
 | `npm run dev` | 并行启动前端 dev server 与 API watch |
 | `npm run db:generate` | 修改 `src/server/db/schema.ts` 后生成迁移 |
 | `npx tsx scripts/smoke-registry.ts` | 真实 registry 只读 smoke（Docker Hub/GHCR/LSCR） |
@@ -84,4 +86,6 @@ npm run check               # typecheck + lint + test + build
 ## 文档
 
 - `docs/operations.md` — 运维手册：部署、备份、失败处理、排障
+- `docs/responsive-validation.md` — 响应式布局回归说明
+- `docs/action-feedback-validation.md` — 操作反馈回归说明（Sonner/同步/复制）
 - `docs/integrations.md` — Coolify / Registry / Apprise 集成契约与已验证差异

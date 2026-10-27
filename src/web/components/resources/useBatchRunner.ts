@@ -2,7 +2,7 @@
 // per-item feedback and business-outcome statistics (blocked counts as skip).
 
 import { useMutation } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import type { Policy } from '../../../shared/types.js';
 import { ApiError, api } from '../../lib/api.js';
 import {
@@ -19,6 +19,18 @@ import {
   summarizeBatchUpdates,
 } from '../../lib/resource-view.js';
 import { useRefresh } from '../../main.js';
+
+/**
+ * 等列表重取完成；刷新失败（网络/服务端错误）吞掉 rejection：
+ * 批量结果反馈基于已收集的逐项业务结果，轮询与后续 10s 定时刷新会继续重试。
+ */
+async function refreshQuietly(refresh: () => Promise<void>): Promise<void> {
+  try {
+    await refresh();
+  } catch {
+    // 列表刷新失败与操作结果分离；下一轮询会再试。
+  }
+}
 
 export interface FeedbackLine {
   id: number;
@@ -45,9 +57,31 @@ export function useFeedbackLines(): [FeedbackLine[], (text: string) => void] {
   return [lines, push];
 }
 
+/**
+ * 页面级互斥锁：批量与单项操作共用同一个同步 acquire/release 入口。
+ * state 更新是异步的，防重必须依赖同步设置的 ref；busy 供按钮禁用。
+ * 单项操作占用锁后，批量与另一个单项都会被拒绝，杜绝同资源重复请求。
+ */
+function useActionLock() {
+  const running = useRef(false);
+  const [busy, setBusy] = useState(false);
+  const acquire = useCallback((): (() => void) | null => {
+    if (running.current) return null;
+    running.current = true;
+    setBusy(true);
+    return () => {
+      running.current = false;
+      setBusy(false);
+    };
+  }, []);
+  return { busy, acquire };
+}
+
 export function useBatchRunner() {
   const refresh = useRefresh();
-  const [busy, setBusy] = useState(false);
+  // 同步执行锁：批量与单项（useCheckOne/useUpdateOne 的 lock 参数）共用，
+  // 任一方向进行中，另一个方向都被拒绝，杜绝同资源并发重复请求。
+  const { busy, acquire } = useActionLock();
   const [activeCheckId, setActiveCheckId] = useState<number | null>(null);
   const [activeUpdateId, setActiveUpdateId] = useState<number | null>(null);
   const [activeConfirmId, setActiveConfirmId] = useState<number | null>(null);
@@ -56,7 +90,8 @@ export function useBatchRunner() {
 
   /** Serial batch check: stats by business outcome, detail lines for skips/failures. */
   const runChecks = async (ids: number[], nameOf: (id: number) => string): Promise<BatchLines> => {
-    setBusy(true);
+    const release = acquire();
+    if (release == null) return { summary: '已有批量任务进行中，本次未执行。', detail: [] };
     setProgress({ done: 0, total: ids.length });
     const stats: BatchCheckStats = { succeeded: 0, blocked: 0, failed: 0 };
     const detail: FeedbackLine[] = [];
@@ -86,16 +121,17 @@ export function useBatchRunner() {
     setProgress(null);
     const lines = { summary: summarizeBatchChecks(stats), detail };
     // 先等列表重取完成再展示反馈：反馈与刷新后的表格同帧出现。
-    // busy 保持到重取结束：重取窗口内不可叠加新批量（与 runPolicy 语义一致）。
-    await refresh();
+    // 锁保持到重取结束：重取窗口内不可叠加新批量（与 runPolicy 语义一致）。
+    await refreshQuietly(refresh);
     setResult(lines);
-    setBusy(false);
+    release();
     return lines;
   };
 
   /** Serial batch update via skipPreview; 202=submitted, skipped=no-update. */
   const runUpdates = async (ids: number[], nameOf: (id: number) => string): Promise<BatchLines> => {
-    setBusy(true);
+    const release = acquire();
+    if (release == null) return { summary: '已有批量任务进行中，本次未执行。', detail: [] };
     setProgress({ done: 0, total: ids.length });
     const stats: BatchUpdateStats = { submitted: 0, skipped: 0, failed: 0 };
     const detail: FeedbackLine[] = [];
@@ -126,20 +162,24 @@ export function useBatchRunner() {
     setProgress(null);
     const lines = { summary: summarizeBatchUpdates(stats), detail };
     // 先等列表重取完成再展示反馈：反馈与刷新后的表格同帧出现。
-    // busy 保持到重取结束：重取窗口内不可叠加新批量（与 runPolicy 语义一致）。
-    await refresh();
+    // 锁保持到重取结束：重取窗口内不可叠加新批量（与 runPolicy 语义一致）。
+    await refreshQuietly(refresh);
     setResult(lines);
-    setBusy(false);
+    release();
     return lines;
   };
 
   const runPolicy = async (ids: number[], policy: Policy): Promise<void> => {
-    setBusy(true);
+    const release = acquire();
+    if (release == null) {
+      setResult({ summary: '已有批量任务进行中，本次未执行。', detail: [] });
+      return;
+    }
     try {
       const res = await api.batchPolicy(ids, policy);
       // 成功数来自 API（去重后的实际目标数），与提交数可能不同。
       // 先等列表重取完成再展示反馈：反馈与刷新后的表格同帧出现。
-      await refresh();
+      await refreshQuietly(refresh);
       setResult({ summary: `已将 ${res.updated} 项资源策略设置完成。`, detail: [] });
     } catch (err) {
       // 整批原子失败：展示「整批未保存」与逐项原因，策略保持原值。
@@ -162,9 +202,9 @@ export function useBatchRunner() {
         summary: `策略整批未保存：${err instanceof Error ? err.message : '请求错误'}`,
         detail,
       });
-      await refresh();
+      await refreshQuietly(refresh);
     } finally {
-      setBusy(false);
+      release();
     }
   };
 
@@ -174,7 +214,8 @@ export function useBatchRunner() {
    * (auto-check won, retried, or resource removed) and is reported as a skip.
    */
   const runConfirmations = async (items: ConfirmItem[]): Promise<BatchLines> => {
-    setBusy(true);
+    const release = acquire();
+    if (release == null) return { summary: '已有批量任务进行中，本次未执行。', detail: [] };
     setProgress({ done: 0, total: items.length });
     const stats: BatchConfirmStats = { confirmed: 0, skipped: 0, failed: 0 };
     const detail: FeedbackLine[] = [];
@@ -208,15 +249,17 @@ export function useBatchRunner() {
     setProgress(null);
     const lines = { summary: summarizeBatchConfirmations(stats), detail };
     // 先等列表重取完成再展示反馈：反馈与刷新后的表格同帧出现。
-    // busy 保持到重取结束：重取窗口内不可叠加新批量（与 runPolicy 语义一致）。
-    await refresh();
+    // 锁保持到重取结束：重取窗口内不可叠加新批量（与 runPolicy 语义一致）。
+    await refreshQuietly(refresh);
     setResult(lines);
-    setBusy(false);
+    release();
     return lines;
   };
 
   return {
     busy,
+    /** 页面把同一把锁传给 useCheckOne/useUpdateOne，实现单项/批量互斥。 */
+    acquire,
     activeCheckId,
     activeUpdateId,
     activeConfirmId,
@@ -230,14 +273,33 @@ export function useBatchRunner() {
   };
 }
 
-/** Single-resource check mutation with named outcome feedback. */
-export function useCheckOne(nameOf: (id: number) => string, onFeedback: (line: string) => void) {
+/**
+ * Single-resource check mutation with named outcome feedback.
+ * lock.acquire 与批量共用一把页面级同步锁：单项执行期间批量被拒，
+ * 批量进行中单项同样被拒（任一方向都不产生并发重复请求）。
+ */
+export function useCheckOne(
+  nameOf: (id: number) => string,
+  onFeedback: (line: string) => void,
+  lock: { acquire(): (() => void) | null },
+) {
   const refresh = useRefresh();
   return useMutation({
-    mutationFn: (id: number) => api.checkResource(id),
+    mutationFn: async (id: number) => {
+      const release = lock.acquire();
+      if (release == null) throw new Error('已有批量任务进行中，请稍后再试');
+      try {
+        return await api.checkResource(id);
+      } finally {
+        // 等列表重取完成再释放，与批量 busy-to-refresh 窗口语义一致。
+        await refresh();
+        release();
+      }
+    },
+    // 结果走行内反馈区；错误同样由 onError 落到反馈区，全局兑底跳过。
+    meta: { errorFeedback: 'local' },
     onSuccess: (res, id) => {
       onFeedback(checkOutcomeFeedback(nameOf(id), res.check.outcome, res.check.message).text);
-      void refresh();
     },
     onError: (e, id) => {
       onFeedback(`${nameOf(id)}：检查失败（${e instanceof Error ? e.message : '请求错误'}）`);
@@ -245,15 +307,28 @@ export function useCheckOne(nameOf: (id: number) => string, onFeedback: (line: s
   });
 }
 
-/** Single-resource skip-preview update mutation. */
-export function useUpdateOne(nameOf: (id: number) => string, onFeedback: (line: string) => void) {
+/** Single-resource skip-preview update mutation; shares the page action lock. */
+export function useUpdateOne(
+  nameOf: (id: number) => string,
+  onFeedback: (line: string) => void,
+  lock: { acquire(): (() => void) | null },
+) {
   const refresh = useRefresh();
   return useMutation({
-    mutationFn: (id: number) => api.executeUpdate(id),
+    mutationFn: async (id: number) => {
+      const release = lock.acquire();
+      if (release == null) throw new Error('已有批量任务进行中，请稍后再试');
+      try {
+        return await api.executeUpdate(id);
+      } finally {
+        await refresh();
+        release();
+      }
+    },
+    meta: { errorFeedback: 'local' },
     onSuccess: (res, id) => {
       if (res.skipped) onFeedback(`${nameOf(id)}：无更新，已跳过`);
       else onFeedback(`${nameOf(id)}：更新任务已提交`);
-      void refresh();
     },
     onError: (e, id) => {
       onFeedback(`${nameOf(id)}：提交失败（${e instanceof Error ? e.message : '请求错误'}）`);

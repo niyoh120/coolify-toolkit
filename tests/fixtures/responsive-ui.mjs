@@ -719,6 +719,18 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
     forceError: false,
     confirmDelayMs: 0,
   };
+  // 操作反馈场景控制（仅 verify-responsive 经控制端点调整）：
+  // sync：可控延迟 + JSON 502 / HTML 503 / 限流 / 网络拒绝；probe：业务失败。
+  const syncControl = {
+    delayMs: 0,
+    mode: 'ok', // 'ok' | 'json502' | 'html503' | 'rate-limit' | 'rate-limit-no-retry' | 'network'
+    hits: 0,
+  };
+  const probeControl = { ok: true };
+  const notifControl = { redeliverOk: true, notifyTestOk: true };
+  const settingsControl = { failSave: false };
+  const updateHits = [];
+  let resourcesGetHits = 0;
   const unknownHits = [];
   let server = null;
   let url = null;
@@ -771,33 +783,140 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
           delayMs: resourceControl.delayMs,
           failRequests: resourceControl.failRequests,
           shrinkTo: resourceControl.shrinkTo,
+          getHits: resourcesGetHits,
         },
       });
+    }
+
+    if (pathname === '/api/__fixture/sync-control') {
+      if (method === 'POST') {
+        const body = await readBody(req);
+        if (typeof body.delayMs === 'number') syncControl.delayMs = Math.max(0, body.delayMs);
+        if (typeof body.mode === 'string') syncControl.mode = body.mode;
+        if (body.resetHits === true) syncControl.hits = 0;
+      }
+      return json({ control: { ...syncControl, hits: syncControl.hits } });
+    }
+    if (pathname === '/api/__fixture/update-hits') {
+      return json({ hits: updateHits.length });
+    }
+    if (pathname === '/api/__fixture/action-control') {
+      if (method === 'POST') {
+        const body = await readBody(req);
+        if (typeof body.probeOk === 'boolean') probeControl.ok = body.probeOk;
+        if (typeof body.redeliverOk === 'boolean') notifControl.redeliverOk = body.redeliverOk;
+        if (typeof body.notifyTestOk === 'boolean') notifControl.notifyTestOk = body.notifyTestOk;
+      }
+      return json({
+        control: {
+          probeOk: probeControl.ok,
+          redeliverOk: notifControl.redeliverOk,
+          notifyTestOk: notifControl.notifyTestOk,
+        },
+      });
+    }
+    if (pathname === '/api/__fixture/settings-control') {
+      if (method === 'POST') {
+        const body = await readBody(req);
+        if (typeof body.failSave === 'boolean') settingsControl.failSave = body.failSave;
+      }
+      return json({ control: { failSave: settingsControl.failSave } });
     }
 
     if (method === 'GET' && pathname === '/api/overview') return json(state.overview());
     if (method === 'GET' && pathname === '/api/settings') return json(state.settings);
     if (method === 'PATCH' && pathname === '/api/settings') {
       const body = await readBody(req);
+      // 可控保存失败：模拟服务端 cron 校验拒绝（先校验后落库，坏值不落库）。
+      if (settingsControl.failSave) {
+        return send(res, 400, {
+          error: { code: 'validation_error', message: 'Invalid cron expression or timezone' },
+        });
+      }
       Object.assign(state.settings, body);
       if (body.cronTimezone != null) state.settings.cronTimezone = body.cronTimezone;
       return json({ ok: true });
     }
     if (method === 'POST' && pathname === '/api/sync') {
-      return json({
-        ok: true,
-        sync: { resourcesSeen: state.resources.length, created: 0, externalChanges: 0, removed: 0 },
-      });
+      // 可控故障：JSON 502 / HTML 503 / 限流（带或不带 Retry-After）/ 网络拒绝；
+      // hits 计数供脚本断言「快速重复点击只产生一个请求」。
+      syncControl.hits += 1;
+      if (syncControl.delayMs > 0) await sleep(syncControl.delayMs);
+      if (syncControl.mode === 'json502') {
+        return send(res, 502, {
+          error: { code: 'coolify_unavailable', message: 'fixture: coolify upstream failed' },
+        });
+      }
+      if (syncControl.mode === 'html503') {
+        res.writeHead(503, { 'content-type': 'text/html; charset=utf-8' });
+        res.end('<html><body>503 Service Unavailable</body></html>');
+        return;
+      }
+      if (syncControl.mode === 'rate-limit' || syncControl.mode === 'rate-limit-no-retry') {
+        const headers = { 'content-type': 'application/json; charset=utf-8' };
+        if (syncControl.mode === 'rate-limit') headers['retry-after'] = '45';
+        res.writeHead(503, headers);
+        res.end(
+          JSON.stringify({
+            error: {
+              code: 'coolify_rate_limited',
+              message: 'Coolify /applications?page=0: Too Many Attempts.',
+              details:
+                syncControl.mode === 'rate-limit'
+                  ? { upstreamStatus: 429, retryAfterSeconds: 45 }
+                  : { upstreamStatus: 429 },
+            },
+          }),
+        );
+        return;
+      }
+      if (syncControl.mode === 'network') {
+        res.destroy();
+        return;
+      }
+      const partial =
+        syncControl.mode === 'partial'
+          ? {
+              resourcesSeen: state.resources.length,
+              created: 0,
+              externalChanges: 0,
+              removed: 0,
+              errors: ['service svc-edge-1: child list failed: fixture forced'],
+            }
+          : {
+              resourcesSeen: state.resources.length,
+              created: 0,
+              externalChanges: 0,
+              removed: 0,
+              errors: [],
+            };
+      return json({ ok: true, sync: partial });
     }
     if (method === 'POST' && pathname === '/api/check') {
       return json({ ok: true, checked: state.resources.filter((r) => r.track != null).length });
     }
     if (method === 'POST' && pathname === '/api/coolify/probe') {
-      return json({ ok: true, version: state.settings.coolifyVersion });
+      if (probeControl.ok) return json({ ok: true, version: state.settings.coolifyVersion });
+      return json({ ok: false, version: null });
     }
-    if (method === 'POST' && pathname === '/api/notifications/test') return json({ ok: true });
+    if (method === 'POST' && pathname === '/api/notifications/test') {
+      // 可控测试通知：失败时模拟服务端行为（先落库 lastTestOk=false，再抛 502）。
+      if (!notifControl.notifyTestOk) {
+        state.settings.apprise.lastTestOk = false;
+        state.settings.apprise.lastTestAt = new Date().toISOString();
+        state.settings.apprise.lastTestError = 'fixture: apprise unreachable';
+        return send(res, 502, {
+          error: { code: 'apprise_error', message: 'fixture: apprise unreachable' },
+        });
+      }
+      state.settings.apprise.lastTestOk = true;
+      state.settings.apprise.lastTestAt = new Date().toISOString();
+      state.settings.apprise.lastTestError = null;
+      return json({ ok: true });
+    }
 
     if (method === 'GET' && pathname === '/api/resources') {
+      resourcesGetHits += 1;
       // 恢复场景控制：强制失败（覆盖 react-query 的 1 次重试需连续两次）→ 延迟 → 缩水。
       if (resourceControl.failRequests > 0) {
         resourceControl.failRequests -= 1;
@@ -1010,6 +1129,7 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
         });
       }
       if (rest === 'update' && method === 'POST') {
+        updateHits.push(rid);
         const body = await readBody(req);
         const track = resource.track;
         if (track == null || track.observedDigest == null)
@@ -1113,7 +1233,8 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
         });
       n.status = 'pending';
       n.attempts += 1;
-      return json({ ok: true });
+      if (notifControl.redeliverOk) return json({ ok: true });
+      return json({ ok: false });
     }
 
     unknownHits.push(`${method} ${pathname}`);
@@ -1148,6 +1269,14 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
     /** Paths the browser requested that the fixture does not implement. */
     get unknownHits() {
       return unknownHits;
+    },
+    /** /api/sync 请求计数：断言「重复点击只产生一个请求」用。 */
+    get syncHits() {
+      return syncControl.hits;
+    },
+    /** /api/resources/:id/update POST 计数：断言写操作确实发生。 */
+    get updateHits() {
+      return updateHits.length;
     },
     start() {
       return new Promise((resolve, reject) => {

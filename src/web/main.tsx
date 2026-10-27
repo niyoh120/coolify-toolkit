@@ -1,5 +1,11 @@
 // App shell: sidebar navigation + polling queries.
-import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  MutationCache,
+  QueryClient,
+  QueryClientProvider,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query';
 import {
   createContext,
   type ReactNode,
@@ -10,9 +16,12 @@ import {
   useState,
 } from 'react';
 import { createRoot } from 'react-dom/client';
+import { Toaster } from 'sonner';
 import './styles.css';
 import type { PageName } from './components/Layout.js';
 import { Layout } from './components/Layout.js';
+import { SyncActionProvider } from './components/SyncActionProvider.js';
+import { FEEDBACK, mutationErrorFeedback } from './lib/action-feedback.js';
 import { api } from './lib/api.js';
 import {
   parseResourceTab,
@@ -31,6 +40,11 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: { refetchInterval: 10_000, retry: 1, staleTime: 5_000 },
   },
+  // 全局错误兜底：未显式声明 meta.errorFeedback:'local' 的 mutation 失败时
+  // 弹一次错误 toast；页面内已有内联/弹窗错误的调用点显式选 local。
+  mutationCache: new MutationCache({
+    onError: mutationErrorFeedback,
+  }),
 });
 
 type Route =
@@ -134,13 +148,17 @@ function Shell(): ReactNode {
     </RouterContext.Provider>
   );
 }
-
 // Refresh invalidation helper shared by mutation flows. Resolves when the
 // invalidated active queries have finished refetching, so batch flows can
-// sequence their result feedback behind fresh list data.
+// sequence their result feedback behind fresh list data. Refetch failures are
+// swallowed here: callers own their action feedback; the 10s polling and the
+// next invalidation keep retrying the read.
 export function useRefresh(): () => Promise<void> {
   const qc = useQueryClient();
-  return () => qc.invalidateQueries();
+  return () =>
+    qc.invalidateQueries().catch(() => {
+      // 刷新失败与写操作结果分离；周期轮询会继续恢复数据。
+    });
 }
 
 export function main(): void {
@@ -148,7 +166,24 @@ export function main(): void {
   if (root == null) throw new Error('missing #root');
   createRoot(root).render(
     <QueryClientProvider client={queryClient}>
-      <Shell />
+      {/* 同步控制器放路由内容之外：切换页面仍完成请求与反馈。 */}
+      <SyncActionProvider>
+        <Shell />
+      </SyncActionProvider>
+      {/* 暗色、右上角、带关闭按钮；颜色变量由 styles.css 中的 Sonner 覆盖统一。 */}
+      <Toaster
+        theme="dark"
+        position="top-right"
+        closeButton
+        duration={FEEDBACK.successMs}
+        toastOptions={{
+          classNames: {
+            toast: 'sonner-toast-item',
+            title: 'sonner-toast-title',
+            description: 'sonner-toast-description',
+          },
+        }}
+      />
     </QueryClientProvider>,
   );
 }

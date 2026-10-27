@@ -12,6 +12,7 @@ import type {
   ResourceKind,
   ResourceStatus,
   SettingsDTO,
+  SyncResultDTO,
   TrackDTO,
 } from '../../shared/types.js';
 
@@ -183,10 +184,7 @@ export const api = {
     }>,
   ) => request<unknown>('/api/settings', { method: 'PATCH', body: JSON.stringify(patch) }),
   sync: () =>
-    request<{
-      ok: boolean;
-      sync: { resourcesSeen: number; created: number; externalChanges: number; removed: number };
-    }>('/api/sync', { method: 'POST', body: '{}' }),
+    request<{ ok: boolean; sync: SyncResultDTO }>('/api/sync', { method: 'POST', body: '{}' }),
   checkAll: () =>
     request<{ ok: boolean; checked: number }>('/api/check', { method: 'POST', body: '{}' }),
   probe: () =>

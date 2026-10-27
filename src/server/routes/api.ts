@@ -22,6 +22,7 @@ import type { Db } from '../db/client.js';
 import type { UpdateJobRow } from '../db/schema.js';
 import { imageTracks, notificationOutbox, resources, updateJobs } from '../db/schema.js';
 import type { Deps } from '../deps.js';
+import type { CoolifyRateLimitDetails } from '../integrations/coolify/client.js';
 import { normalizeReference } from '../integrations/registry/reference.js';
 import { isAwaitingConfirmation, resourceToDTO } from '../modules/dto.js';
 import {
@@ -54,9 +55,18 @@ function originOk(c: Context, publicOrigin: string | null): boolean {
 
 function errorResponse(c: Context, err: unknown): Response {
   if (err instanceof ApiRequestError) {
+    // 限流错误携带经过验证的 Retry-After（秒）；缺失或无效时省略该头，
+    // 避免向客户端下发不可用的等待时间。
+    const headers: Record<string, string> = {};
+    if (err.code === errorCodes.coolifyRateLimited) {
+      const seconds = (err.details as CoolifyRateLimitDetails | null | undefined)
+        ?.retryAfterSeconds;
+      if (seconds !== undefined) headers['Retry-After'] = String(seconds);
+    }
     return c.json(
       { error: { code: err.code, message: err.message, details: err.details ?? null } },
       err.status as never,
+      headers,
     );
   }
   if (err instanceof ZodError) {

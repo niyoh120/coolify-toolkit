@@ -1,6 +1,7 @@
 // Settings: schedules, platform, connections, pause; no secrets ever displayed.
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
+import { toast } from 'sonner';
 import {
   Badge,
   Button,
@@ -12,6 +13,7 @@ import {
   Loading,
   TimezoneSelect,
 } from '../components/ui.js';
+import { FEEDBACK } from '../lib/action-feedback.js';
 import { api } from '../lib/api.js';
 import { useRefresh } from '../main.js';
 
@@ -27,9 +29,46 @@ export function SettingsPage() {
   const [checkCron, setCheckCron] = useState<string | null>(null);
   const [tz, setTz] = useState<string | null>(null);
 
-  const patch = useMutation({ mutationFn: api.patchSettings, onSuccess: refresh });
-  const probe = useMutation({ mutationFn: api.probe, onSuccess: refresh });
-  const notifyTest = useMutation({ mutationFn: api.notifyTest, onSuccess: refresh });
+  const patch = useMutation({
+    mutationFn: api.patchSettings,
+    meta: { actionName: '保存设置' },
+    onSuccess: () => {
+      toast.success('设置已保存', { duration: FEEDBACK.successMs });
+      return refresh();
+    },
+  });
+  // probe：HTTP 失败走全局兑底；ok:false 是业务失败（200），在此显式展示。
+  const probe = useMutation({
+    mutationFn: api.probe,
+    meta: { actionName: 'Coolify 连接测试' },
+    onSuccess: (res) => {
+      if (res.ok) {
+        toast.success(
+          res.version != null ? `Coolify 连接正常（${res.version}）` : 'Coolify 连接正常',
+          { duration: FEEDBACK.successMs },
+        );
+      } else {
+        toast.error('Coolify 连接失败', {
+          description: '无法读取 Coolify 版本接口，请检查地址与凭证。',
+          duration: FEEDBACK.errorMs,
+          closeButton: true,
+        });
+      }
+      return refresh();
+    },
+  });
+  // notifyTest：服务端失败时先落库再抛 502，onSettled 统一刷新，
+  // 让「上次测试」在失败后也立即反映真实状态（错误提示仍由全局兑底弹一次）。
+  const notifyTest = useMutation({
+    mutationFn: api.notifyTest,
+    meta: { actionName: '测试通知发送' },
+    onSettled: (_res, error) => {
+      void refresh();
+      if (error == null) {
+        toast.success('测试通知已发送', { duration: FEEDBACK.successMs });
+      }
+    },
+  });
 
   if (isLoading) return <Loading />;
   if (error != null) return <ErrorBox error={error} />;
@@ -89,8 +128,9 @@ export function SettingsPage() {
                 })
               }
               disabled={patch.isPending}
+              aria-busy={patch.isPending}
             >
-              保存
+              {patch.isPending ? '保存中…' : '保存'}
             </Button>
           </div>
         </CardBody>
@@ -100,8 +140,13 @@ export function SettingsPage() {
         <CardHeader
           title="Coolify"
           actions={
-            <Button variant="outline" onClick={() => probe.mutate()} disabled={probe.isPending}>
-              测试连接
+            <Button
+              variant="outline"
+              onClick={() => probe.mutate()}
+              disabled={probe.isPending}
+              aria-busy={probe.isPending}
+            >
+              {probe.isPending ? '探测中…' : '测试连接'}
             </Button>
           }
         />
@@ -130,8 +175,9 @@ export function SettingsPage() {
               variant="outline"
               onClick={() => notifyTest.mutate()}
               disabled={notifyTest.isPending || !data.apprise.configured}
+              aria-busy={notifyTest.isPending}
             >
-              发送测试
+              {notifyTest.isPending ? '发送中…' : '发送测试'}
             </Button>
           }
         />

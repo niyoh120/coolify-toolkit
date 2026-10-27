@@ -100,6 +100,8 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
     const action = pendingAction;
     setPendingAction(null);
     if (action == null) return;
+    // runner 执行锁拒绝叠加（弹窗提交与行级操作同源防护）。
+    if (batchRunner.busy) return;
     if (action === 'check') {
       void batchRunner.runChecks(
         checkable.map((r) => r.id),
@@ -257,12 +259,21 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
           }
         />
         <CardBody className="flex flex-col gap-3">
+          {/* 读取失败时保留已完成的操作反馈（F22：错误框不遮蔽真实写结果）。 */}
+          {childrenQ.error != null && (
+            <GroupFeedback batch={batchRunner.result} lines={feedbackLines} />
+          )}
           {childrenQ.error != null ? (
             <>
               <ErrorBox error={childrenQ.error} />
               <div>
-                <Button variant="outline" onClick={() => void childrenQ.refetch()}>
-                  重试
+                <Button
+                  variant="outline"
+                  onClick={() => void childrenQ.refetch()}
+                  disabled={childrenQ.isRefetching}
+                  aria-busy={childrenQ.isRefetching}
+                >
+                  {childrenQ.isRefetching ? '重试中…' : '重试'}
                 </Button>
               </div>
             </>
@@ -320,9 +331,12 @@ export function ServiceDetail({ parent }: { parent: ResourceDTO }) {
                 }
                 onOpen={(id) => navigate({ page: 'resource', id })}
                 onCheck={(id) => {
+                  // runner 执行锁拒绝叠加：批量进行中静默忽略（按钮同时由 busy 禁用）。
+                  if (batchRunner.busy) return;
                   void batchRunner.runChecks([id], nameOf);
                 }}
                 onUpdate={(id) => {
+                  if (batchRunner.busy) return;
                   void batchRunner.runUpdates([id], nameOf);
                 }}
                 onConfirm={(r) => {

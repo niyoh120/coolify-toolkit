@@ -8,6 +8,7 @@ export const errorCodes = {
   externalChange: 'external_change',
   candidateUnknown: 'candidate_unknown',
   coolifyUnavailable: 'coolify_unavailable',
+  coolifyRateLimited: 'coolify_rate_limited', // upstream 429; downstream responds 503 + Retry-After
   registryError: 'registry_error',
   appriseError: 'apprise_error',
   singleInstance: 'single_instance',

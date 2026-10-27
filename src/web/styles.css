@@ -102,3 +102,36 @@ body {
   white-space: nowrap;
   max-width: 100%;
 }
+
+/* Sonner toast：贴合 graphite 主题的暗色层级，复用现有颜色变量；
+   移动端限制宽度、长文案换行，保持可读。 */
+.sonner-toast-item {
+  background-color: var(--color-bg-raised) !important;
+  border: 1px solid var(--color-border-strong) !important;
+  color: var(--color-text-primary) !important;
+  font-size: 13px;
+  word-break: break-word;
+  white-space: normal !important;
+}
+.sonner-toast-title {
+  color: var(--color-text-primary) !important;
+  font-weight: 500;
+}
+.sonner-toast-description {
+  color: var(--color-text-secondary) !important;
+  white-space: pre-line; /* 部分完成详情按行展示 */
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 640px) {
+  .sonner-toast-item {
+    width: calc(100vw - 32px) !important;
+    max-width: calc(100vw - 32px) !important;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sonner-toast-item {
+    transition: none !important;
+    animation: none !important;
+  }
+}

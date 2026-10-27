@@ -1,6 +1,7 @@
 // 通知队列视图：事件、状态、重试与补发。
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
+import { toast } from 'sonner';
 import type { BadgeTone } from '../components/ui.js';
 import {
   Badge,
@@ -15,6 +16,7 @@ import {
   Td,
   Th,
 } from '../components/ui.js';
+import { FEEDBACK } from '../lib/action-feedback.js';
 import { api } from '../lib/api.js';
 import { useRefresh } from '../main.js';
 
@@ -47,9 +49,22 @@ export function NotificationsPage() {
     queryKey: ['notifications'],
     queryFn: api.notifications,
   });
+  // 补发：ok:false 是业务失败（200），显式展示并刷新队列；请求错误走全局兑底。
   const redeliver = useMutation({
     mutationFn: (id: number) => api.redeliver(id),
-    onSuccess: refresh,
+    meta: { actionName: '通知补发' },
+    onSuccess: async (res) => {
+      if (res.ok) {
+        toast.success('通知已重新发送', { duration: FEEDBACK.successMs });
+      } else {
+        toast.error('补发失败', {
+          description: '通知保留在队列中，稍后可再次补发。',
+          duration: FEEDBACK.errorMs,
+          closeButton: true,
+        });
+      }
+      await refresh();
+    },
   });
 
   if (isLoading) return <Loading />;
@@ -128,8 +143,9 @@ export function NotificationsPage() {
                           variant="ghost"
                           onClick={() => redeliver.mutate(n.id)}
                           disabled={redeliver.isPending}
+                          aria-busy={redeliver.isPending}
                         >
-                          补发
+                          {redeliver.isPending ? '补发中…' : '补发'}
                         </Button>
                       )}
                     </Td>

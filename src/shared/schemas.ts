@@ -77,6 +77,24 @@ export const confirmRequestSchema = z
   })
   .strict();
 
+/** Adopt preview input: optional explicit tracking tag for the new channel. */
+export const adoptPreviewRequestSchema = z
+  .object({
+    sourceTag: z
+      .string()
+      .trim()
+      .regex(/^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/)
+      .optional(),
+  })
+  .strict();
+
+/** Adopt confirm: only the short-lived preview token. */
+export const adoptConfirmRequestSchema = z
+  .object({
+    previewToken: z.string().min(16).max(200),
+  })
+  .strict();
+
 export const settingsPatchSchema = z
   .object({
     syncCron: z.string().min(5).max(100).optional(),

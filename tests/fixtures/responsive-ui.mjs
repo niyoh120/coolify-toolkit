@@ -714,6 +714,11 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
     failRequests: 0,
     shrinkTo: null,
   };
+  // 采纳场景控制：预览强制失败 / 确认延迟（仅 verify-responsive 经控制端点调整）。
+  const adoptControl = {
+    forceError: false,
+    confirmDelayMs: 0,
+  };
   const unknownHits = [];
   let server = null;
   let url = null;
@@ -741,6 +746,15 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
     const json = (payload) => send(res, 200, payload);
 
     // 测试控制端点：调整资源列表响应行为（延迟/强制失败/数据缩水）。
+    if (pathname === '/api/__fixture/adopt-control') {
+      if (method === 'POST') {
+        const body = await readBody(req);
+        if (typeof body.forceError === 'boolean') adoptControl.forceError = body.forceError;
+        if (typeof body.confirmDelayMs === 'number')
+          adoptControl.confirmDelayMs = Math.max(0, Math.floor(body.confirmDelayMs));
+      }
+      return json({ control: adoptControl });
+    }
     if (pathname === '/api/__fixture/resources-control') {
       if (method === 'POST') {
         const body = await readBody(req);
@@ -893,6 +907,106 @@ export function createResponsiveFixtureServer({ webRoot, host = '127.0.0.1', por
               note: `将更新 ${resource.parentName ?? resource.name} 的镜像引用并触发 Coolify 重新部署；同服务后续任务会排队等待人工确认。`,
             },
           },
+        });
+      }
+      if (rest === 'adopt-preview' && method === 'POST') {
+        if (resource.track == null)
+          return send(res, 409, { error: { code: 'blocked', message: '无镜像追踪' } });
+        const body = await readBody(req);
+        if (adoptControl.forceError === true) {
+          return send(res, 502, {
+            error: { code: 'registry_error', message: 'fixture 强制失败的采纳预览' },
+          });
+        }
+        const tag = body.sourceTag ?? resource.track.sourceTag ?? 'latest';
+        const digest = hex64(`adopt-${rid}-${tag}`);
+        return json({
+          preview: {
+            liveReference:
+              resource.currentImage ??
+              `${resource.track.sourceRegistry}/${resource.track.sourceRepository}:${tag}`,
+            configuredReference: resource.track.configuredReference,
+            configuredDigest: resource.track.configuredDigest,
+            channel: {
+              source: body.sourceTag != null ? 'user_tag' : 'live',
+              registry: resource.track.sourceRegistry,
+              repository: resource.track.sourceRepository,
+              repositoryAuthored: `${resource.track.sourceRegistry}/${resource.track.sourceRepository}`,
+              tag,
+            },
+            targetReference: `${resource.track.sourceRegistry}/${resource.track.sourceRepository}:${tag}@${digest}`,
+            targetDigest: digest,
+            referenceKind: 'index',
+            resolvedAt: new Date().toISOString(),
+            platform: resource.track.targetPlatform,
+            impact: {
+              kind: resource.kind === 'service_application' ? 'compose_child' : 'application',
+              parentName: resource.parentName,
+              note: '采纳后创建一条普通更新任务，按既有执行器部署。',
+            },
+            previewToken: `adopt-tok-${rid}-${tag}`,
+          },
+        });
+      }
+      if (rest === 'adopt' && method === 'POST') {
+        const body = await readBody(req);
+        if (adoptControl.confirmDelayMs > 0) await sleep(adoptControl.confirmDelayMs);
+        if (resource.track == null)
+          return send(res, 409, { error: { code: 'blocked', message: '无镜像追踪' } });
+        if (
+          body.previewToken == null ||
+          !String(body.previewToken).startsWith(`adopt-tok-${rid}-`)
+        ) {
+          return send(res, 409, {
+            error: { code: 'conflict', message: '采纳预览已过期或不匹配；请重新预览' },
+          });
+        }
+        const tag = String(body.previewToken).split('-').pop();
+        const digest = hex64(`adopt-${rid}-${tag}`);
+        resource.track.sourceTag = tag;
+        resource.track.trackingRevision = (resource.track.trackingRevision ?? 0) + 1;
+        resource.track.observedDigest = digest;
+        resource.track.configuredReference = `${resource.track.sourceRegistry}/${resource.track.sourceRepository}:${tag}@${digest}`;
+        resource.track.configuredDigest = digest;
+        resource.track.view = {
+          configuredMatchesUpstream: true,
+          hasCandidate: false,
+          checkOutcome: 'matching',
+          deployState: 'success',
+        };
+        if (resource.blockedReason === 'external_change') resource.blockedReason = null;
+        return json({
+          status: 'skipped',
+          message: '已采纳当前镜像为新追踪渠道；现场摘要已与该渠道一致，无需部署。',
+          job: null,
+          resource,
+        });
+      }
+      if (rest === 'reset-tracking' && method === 'POST') {
+        if (resource.track == null)
+          return send(res, 409, { error: { code: 'blocked', message: '无镜像追踪' } });
+        resource.policy = 'ignore';
+        resource.track.configuredReference = null;
+        resource.track.configuredDigest = null;
+        resource.track.observedDigest = null;
+        resource.track.lastSuccessfulDigest = null;
+        resource.track.lastSuccessAt = null;
+        resource.track.pinnedAt = null;
+        resource.track.view = {
+          configuredMatchesUpstream: null,
+          hasCandidate: false,
+          checkOutcome: 'unfixed',
+          deployState: 'unknown',
+        };
+        if (
+          resource.blockedReason === 'external_change' ||
+          resource.blockedReason === 'update_failed'
+        ) {
+          resource.blockedReason = null;
+        }
+        return json({
+          resource,
+          message: '已重置追踪并忽略：后续检查与自动初始化暂停，Coolify 配置与任务历史保留。',
         });
       }
       if (rest === 'update' && method === 'POST') {

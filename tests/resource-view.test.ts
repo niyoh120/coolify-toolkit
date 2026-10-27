@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ResourceDTO, TrackDTO, TrackView } from '../src/shared/types.js';
 import {
+  adoptBlockedHint,
   buildConfirmSnapshot,
   buildServiceGroups,
   type ConfirmItem,
@@ -20,6 +21,7 @@ import {
   paginateGroups,
   policyTone,
   projectGroupsForView,
+  resetBlockedHint,
   type ServiceFilters,
   selectableChildIds,
   selectionState,
@@ -27,6 +29,7 @@ import {
   summarizeBatchChecks,
   summarizeBatchConfirmations,
   summarizeBatchUpdates,
+  unfixedNotice,
   updateBlockedHint,
 } from '../src/web/lib/resource-view.js';
 
@@ -572,5 +575,63 @@ describe('manual confirmation eligibility and batch snapshot', () => {
     expect(isStaleConfirmError(404)).toBe(true);
     expect(isStaleConfirmError(500)).toBe(false);
     expect(isStaleConfirmError(403)).toBe(false);
+  });
+});
+
+describe('tracking recovery eligibility', () => {
+  it('adoptBlockedHint: ignore → pick policy first; issues/pending inherit management reason', () => {
+    const base = { id: 90, name: 'app', kind: 'application' as const, track: track() };
+    expect(adoptBlockedHint(dto(base))).toBeNull();
+    expect(adoptBlockedHint(dto({ ...base, policy: 'ignore' }))).toBe(
+      '先选择管理策略，再采纳当前镜像',
+    );
+    expect(adoptBlockedHint(dto({ ...base, managementClassified: false }))).toBe('待同步确认');
+    expect(
+      adoptBlockedHint(
+        dto({
+          ...base,
+          policy: 'ignore',
+          managementClassified: false,
+        }),
+      )?.length ?? 0,
+    ).toBeGreaterThan(0);
+    expect(
+      adoptBlockedHint(
+        dto({ ...base, imageIssue: { code: 'unsupported_registry', registry: 'quay.io' } }),
+      ),
+    ).toContain('暂不支持');
+    expect(adoptBlockedHint(dto({ ...base, status: 'removed' }))).toBe('资源已移除');
+    expect(adoptBlockedHint(dto({ ...base, track: null }))).toBe('无镜像追踪');
+  });
+
+  it('resetBlockedHint: local fallback survives ignore and image issues; boundary states refuse', () => {
+    const base = { id: 91, name: 'app', kind: 'application' as const, track: track() };
+    expect(resetBlockedHint(dto(base))).toBeNull();
+    // ignore 状态与镜像问题仍可本地重置（缩小管理范围）。
+    expect(resetBlockedHint(dto({ ...base, policy: 'ignore' }))).toBeNull();
+    expect(
+      resetBlockedHint(dto({ ...base, imageIssue: { code: 'invalid_reference', registry: null } })),
+    ).toBeNull();
+    // 边界：待同步与配置排除维持管理边界。
+    expect(resetBlockedHint(dto({ ...base, managementClassified: false }))).toContain('待同步');
+    expect(resetBlockedHint(dto({ ...base, excludedInfra: true }))).toContain('已排除');
+    expect(resetBlockedHint(dto({ ...base, status: 'removed' }))).toBe('资源已移除');
+    expect(resetBlockedHint(dto({ ...base, track: null }))).toBe('无镜像追踪');
+  });
+
+  it('unfixedNotice: ignore shows paused copy; non-ignore returns null (default copy renders)', () => {
+    const base = {
+      id: 92,
+      name: 'app',
+      kind: 'application' as const,
+      track: track({ view: trackView({ checkOutcome: 'unfixed' }) }),
+    };
+    expect(unfixedNotice(dto(base))).toBeNull();
+    expect(unfixedNotice(dto({ ...base, policy: 'ignore' }))).toContain('已忽略');
+    expect(
+      unfixedNotice(
+        dto({ ...base, track: track({ view: trackView({ checkOutcome: 'matching' }) }) }),
+      ),
+    ).toBeNull();
   });
 });

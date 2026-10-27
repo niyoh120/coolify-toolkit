@@ -15,10 +15,15 @@ import type { SettingsRepo } from '../../db/settings-repo.js';
 import type { CoolifyClient } from '../../integrations/coolify/client.js';
 import { CoolifyApiError } from '../../integrations/coolify/client.js';
 import { applicationImageRef, applicationTagField } from '../../integrations/coolify/mapper.js';
-import { coolifyDigestTag, normalizeReference } from '../../integrations/registry/reference.js';
+import {
+  coolifyDigestTag,
+  type NormalizedRef,
+  normalizeReference,
+} from '../../integrations/registry/reference.js';
 import { effectiveManagementGate } from '../inventory/management-state.js';
 import { parentRowOf } from '../inventory/parent-row.js';
 import type { Outbox } from '../notifications/outbox.js';
+import { liveReferenceAcceptableForJob } from './image-state.js';
 import type { JobsService } from './jobs.js';
 
 const CONFIRM_WINDOW_MS = 10 * 60_000;
@@ -41,6 +46,14 @@ const DEFAULT_TIMING: ExecutorTiming = {
   confirmWindowMs: CONFIRM_WINDOW_MS,
   autoConfirmDelayMs: AUTO_CONFIRM_DELAY_MS,
 };
+
+/** Internal control-flow signal: the job was finalized by a pre-effect guard. */
+class AbortJobSignal extends Error {
+  constructor() {
+    super('job finalized by pre-effect guard');
+    this.name = 'AbortJobSignal';
+  }
+}
 
 /** Typed check failure carrying an explicit error code for the job row. */
 class ComposeCheckError extends Error {
@@ -82,6 +95,51 @@ export class UpdateExecutor {
       .run();
   }
 
+  /**
+   * Pre-side-effect guard: the job must still belong to the current channel
+   * revision and the resource must still be manageable. Historical jobs that
+   * raced an adopt/save/reset return `tracking_changed` without any new
+   * effect; ignore-policy resources likewise never produce new writes.
+   */
+  private staleAgainstTrack(job: UpdateJobRow, track: ImageTrackRow): boolean {
+    return job.trackingRevision !== track.trackingRevision;
+  }
+
+  /**
+   * F11: re-validate revision + policy immediately before each NEW side
+   * effect (PATCH / start). A reset/ignore flip during the network waits must
+   * stop further writes; the job finalizes as a non-write conflict.
+   */
+  private assertWritableBeforeEffect(job: UpdateJobRow): void {
+    const resource = this.db.select().from(resources).where(eq(resources.id, job.resourceId)).get();
+    const track = this.db
+      .select()
+      .from(imageTracks)
+      .where(eq(imageTracks.resourceId, job.resourceId))
+      .get();
+    if (resource == null || track == null) {
+      this.finishJob(job, 'blocked', 'resource_missing', 'Resource or track disappeared');
+      throw new AbortJobSignal();
+    }
+    if (this.staleAgainstTrack(job, track)) {
+      this.finishJob(
+        job,
+        'conflict',
+        'tracking_changed',
+        '追踪配置在任务执行期间已变化；此任务已失效，不再写入',
+      );
+      throw new AbortJobSignal();
+    }
+    if (resource.policy === 'ignore') {
+      this.blockJob(job, 'policy_ignore', '资源已切换为忽略策略；任务不再产生新写入');
+      throw new AbortJobSignal();
+    }
+    if (this.settings.get().globalPaused) {
+      this.finishJob(job, 'blocked', 'global_paused', '全局暂停生效；任务不再产生新写入');
+      throw new AbortJobSignal();
+    }
+  }
+
   // --- queue processing -------------------------------------------------------
 
   /**
@@ -103,6 +161,7 @@ export class UpdateExecutor {
             await this.runJob(job);
           }
         } catch (err) {
+          if (err instanceof AbortJobSignal) continue; // finalized by pre-effect guard
           this.failJob(job, 'internal_error', err instanceof Error ? err.message : 'unknown error');
         }
       }
@@ -143,6 +202,19 @@ export class UpdateExecutor {
     // Awaiting-confirmation jobs hold their resource/parent exclusively but do
     // NOT consume global deployment concurrency (plan §5: scope is per-resource).
     const executing = running.filter((j) => j.stage !== 'awaiting_confirmation');
+    // R5-F2: unknown_submit holds the exclusive scope for the resource and its
+    // parent even though it is terminal — reconcile must come first.
+    const unknownSubmits = this.db
+      .select({ resourceId: updateJobs.resourceId })
+      .from(updateJobs)
+      .where(eq(updateJobs.status, 'unknown_submit'))
+      .all();
+    const unknownResourceIds = new Set(unknownSubmits.map((u) => u.resourceId));
+    for (const rid of unknownResourceIds) {
+      activeByResource.set(rid, (activeByResource.get(rid) ?? 0) + 1);
+      const res = this.db.select().from(resources).where(eq(resources.id, rid)).get();
+      if (res?.parentId != null) activeParents.add(res.parentId);
+    }
     for (const a of running) {
       activeByResource.set(a.resourceId, (activeByResource.get(a.resourceId) ?? 0) + 1);
       const res = this.db.select().from(resources).where(eq(resources.id, a.resourceId)).get();
@@ -389,6 +461,20 @@ export class UpdateExecutor {
     //  - 已分类但受限（排除/镜像问题/父级继承）且未提交部署：blocked + 原因。
     //  - 已提交部署（deploymentUuid 存在）：证据恢复路径继续，只 poll/readback。
     if (job.deploymentUuid == null) {
+      // Channel moved on (adopt/save/reset): historical jobs never write.
+      if (this.staleAgainstTrack(job, track)) {
+        this.finishJob(
+          job,
+          'conflict',
+          'tracking_changed',
+          '追踪配置在任务执行前已变化；此任务已失效，请从当前渠道重新预览',
+        );
+        return;
+      }
+      if (resource.policy === 'ignore') {
+        this.blockJob(job, 'policy_ignore', '资源处于忽略策略；任务不再执行');
+        return;
+      }
       if (!resource.managementClassified) {
         // 防御路径（当前 claim 过滤不可达）：把已领取的任务显式放回队列，
         // 避免滞留 running 等待重启 reconcile。
@@ -455,16 +541,21 @@ export class UpdateExecutor {
     } catch {
       parsed = null;
     }
-    const expectTag = track.sourceTag === '' ? null : track.sourceTag;
-    const alreadyCandidate = parsed?.digest === job.candidateDigest;
-    const matchesPrior =
+    // Shared semantic check (plan §2): acceptable start states are the
+    // candidate (same repository AND digest), the job's prior, or the track's
+    // confirmed baseline. The tracked tag is never a baseline proxy.
+    const acceptable =
       parsed != null &&
-      parsed.registry === track.sourceRegistry &&
-      parsed.repository === track.sourceRepository &&
-      (parsed.digest != null
-        ? parsed.digest === (job.priorDigest ?? track.configuredDigest)
-        : parsed.tag === expectTag);
-    if (!alreadyCandidate && !matchesPrior) {
+      liveReferenceAcceptableForJob(
+        {
+          priorDigest: job.priorDigest,
+          priorReference: job.priorReference,
+          candidateDigest: job.candidateDigest,
+        },
+        track,
+        parsed,
+      );
+    if (!acceptable) {
       this.db
         .update(resources)
         .set({ blockedReason: 'external_change', updatedAt: Date.now() })
@@ -479,8 +570,17 @@ export class UpdateExecutor {
       return;
     }
 
-    // 2. PATCH only the image tag field.
+    // 2. PATCH only the image tag field (skipped when the live config already
+    // carries the candidate digest in the same repository).
+    const alreadyCandidate =
+      parsed?.digest === job.candidateDigest &&
+      (job.priorReference != null || track.configuredReference != null
+        ? referenceRepositoryOf(parsed) ===
+          referenceRepositoryOf(referenceOf(job.priorReference ?? track.configuredReference))
+        : true);
     if (!alreadyCandidate) {
+      // F11: the revalidation GET was a network wait — re-check before writing.
+      this.assertWritableBeforeEffect(job);
       this.setStage(job, 'patching', `写入固定摘要 ${short(job.candidateDigest)}`);
       try {
         await this.coolify.patchApplication(resource.coolifyUuid, { [tagField]: digestTag });
@@ -517,6 +617,8 @@ export class UpdateExecutor {
     // 4. Submit deployment.
     let deploymentUuid: string | null = job.deploymentUuid;
     if (deploymentUuid == null) {
+      // F11: readback was another network wait — re-check before the start.
+      this.assertWritableBeforeEffect(job);
       try {
         const started = await this.coolify.startApplication(resource.coolifyUuid);
         deploymentUuid = started.deploymentUuid;
@@ -778,6 +880,8 @@ export class UpdateExecutor {
 
     // 2. PATCH child image (raw compose is rewritten by Coolify).
     if (!alreadyCandidate) {
+      // F11: the children GET was a network wait — re-check before writing.
+      this.assertWritableBeforeEffect(job);
       this.setStage(job, 'patching', `写入 ${expectedImage}`);
       try {
         await this.coolify.patchServiceApplication(parent.coolifyUuid, resource.coolifyUuid, {
@@ -851,6 +955,8 @@ export class UpdateExecutor {
 
     // 4. Targeted child deploy (queued-only evidence in v4.3.23).
     if (job.stage !== 'awaiting_confirmation') {
+      // F11: readback was a network wait — re-check before the start.
+      this.assertWritableBeforeEffect(job);
       try {
         await this.coolify.startServiceApplication(parent.coolifyUuid, resource.coolifyUuid, true);
       } catch (err) {
@@ -1249,6 +1355,19 @@ export class UpdateExecutor {
 
 function short(digest: string): string {
   return digest.startsWith('sha256:') ? digest.slice(7, 19) : digest.slice(0, 12);
+}
+
+function referenceOf(ref: string | null): NormalizedRef | null {
+  if (ref == null || ref.trim() === '') return null;
+  try {
+    return normalizeReference(ref);
+  } catch {
+    return null;
+  }
+}
+
+function referenceRepositoryOf(parsed: NormalizedRef | null): string | null {
+  return parsed == null ? null : `${parsed.registry}/${parsed.repository}`;
 }
 
 /**

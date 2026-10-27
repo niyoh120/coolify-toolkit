@@ -3,7 +3,7 @@
 // aggregated ServiceDetail; everything else renders the single-resource view.
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { type ReactNode, useState } from 'react';
-import type { JobDTO, ResourceDTO } from '../../shared/types.js';
+import type { AdoptPreviewDTO, JobDTO, ResourceDTO } from '../../shared/types.js';
 import {
   BlockedBadge,
   CheckBadge,
@@ -26,17 +26,21 @@ import {
   ErrorBox,
   Input,
   Loading,
+  Modal,
   Mono,
   Select,
 } from '../components/ui.js';
 import { api, type Policy, type PreviewResult } from '../lib/api.js';
 import {
+  adoptBlockedHint,
   checkBlockedHint,
   checkOutcomeFeedback,
   type FeedbackTone,
   isConfigReadOnly,
   managementReason,
   managementReasonDetail,
+  resetBlockedHint,
+  unfixedNotice,
 } from '../lib/resource-view.js';
 import { useRefresh, useRouter } from '../main.js';
 import { ServiceDetail } from './ServiceDetail.js';
@@ -65,15 +69,42 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
   const [checkFeedback, setCheckFeedback] = useState<{ text: string; tone: FeedbackTone } | null>(
     null,
   );
+  const [adoptPreview, setAdoptPreview] = useState<AdoptPreviewDTO | null>(null);
+  const [adoptTag, setAdoptTag] = useState('');
+  const [adoptError, setAdoptError] = useState<string | null>(null);
+  const [adoptFeedback, setAdoptFeedback] = useState<{ text: string; tone: FeedbackTone } | null>(
+    null,
+  );
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
   const settingsQ = useQuery({ queryKey: ['settings'], queryFn: api.settings });
   const deployTimeQ = useQuery({
     queryKey: ['deploy-time', id],
     queryFn: () => api.deployTime(id),
   });
 
+  // F17: any successful state change (save/adopt/reset) invalidates locally
+  // cached previews and old feedback — they described the previous state.
+  const clearStaleActionState = () => {
+    setPreview(null);
+    setActionError(null);
+    setAdoptPreview(null);
+    setAdoptError(null);
+    setAdoptTag('');
+    setCheckFeedback(null);
+  };
+
   const patch = useMutation({
     mutationFn: (p: Parameters<typeof api.patchResource>[1]) => api.patchResource(id, p),
-    onSuccess: () => void refresh(),
+    onSuccess: (res) => {
+      clearStaleActionState();
+      setAdoptFeedback({
+        text: '保存成功：配置已更新，追踪状态已刷新。',
+        tone: 'success',
+      });
+      void refresh();
+      return res;
+    },
   });
   const check = useMutation({
     mutationFn: api.checkResource,
@@ -103,11 +134,41 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
       return api.submitUpdate(id, preview.candidateDigest, preview.previewToken);
     },
     onSuccess: () => {
-      setPreview(null);
-      setActionError(null);
+      clearStaleActionState();
       void refresh();
     },
     onError: (e) => setActionError(e instanceof Error ? e.message : String(e)),
+  });
+  const adoptPreviewMut = useMutation({
+    mutationFn: () => api.adoptPreview(id, adoptTag.trim() !== '' ? adoptTag.trim() : undefined),
+    onSuccess: (res) => {
+      setAdoptPreview(res.preview);
+      setAdoptError(null);
+    },
+    onError: (e) => setAdoptError(e instanceof Error ? e.message : String(e)),
+  });
+  const adoptMut = useMutation({
+    mutationFn: () => {
+      if (adoptPreview == null) throw new Error('请先预览采纳');
+      return api.adopt(id, adoptPreview.previewToken);
+    },
+    onSuccess: (res) => {
+      clearStaleActionState();
+      setAdoptFeedback({ text: res.message, tone: res.status === 'skipped' ? 'info' : 'success' });
+      void refresh();
+    },
+    onError: (e) => setAdoptError(e instanceof Error ? e.message : String(e)),
+  });
+  const resetMut = useMutation({
+    mutationFn: () => api.resetTracking(id),
+    onSuccess: (res) => {
+      setResetOpen(false);
+      setResetError(null);
+      clearStaleActionState();
+      setAdoptFeedback({ text: res.message, tone: 'success' });
+      void refresh();
+    },
+    onError: (e) => setResetError(e instanceof Error ? e.message : String(e)),
   });
 
   const track = resource.track;
@@ -117,6 +178,10 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
   const reasonDetail = managementReasonDetail(resource);
   const parentResourceId =
     resource.kind === 'service_application' ? resource.parentResourceId : null;
+  const adoptHint = adoptBlockedHint(resource);
+  const resetHint = resetBlockedHint(resource);
+  const externalChange = resource.blockedReason === 'external_change';
+  const ignoreUnfixed = unfixedNotice(resource);
 
   return (
     <div className="flex flex-col gap-4">
@@ -209,7 +274,9 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
         <CardBody className="flex flex-col gap-4">
           <div className="grid gap-x-4 gap-y-3 sm:grid-cols-2 lg:grid-cols-4">
             <div className="sm:col-span-2 lg:col-span-4">
-              <span className="text-[11px] text-[var(--color-text-muted)]">镜像</span>
+              <span className="text-[11px] text-[var(--color-text-muted)]">
+                Coolify 当前配置（同步时读取）
+              </span>
               <div className="mono break-all text-[12px]">
                 {resource.currentImage != null ? (
                   <Mono copyable>{resource.currentImage}</Mono>
@@ -217,9 +284,47 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
                   '—'
                 )}
               </div>
+              {track?.configuredReference != null && (
+                <div className="pt-1">
+                  <span className="text-[11px] text-[var(--color-text-muted)]">已记录配置基线</span>
+                  <div className="mono break-all text-[12px]">
+                    <Mono copyable>{track.configuredReference}</Mono>
+                    {track.configuredDigest == null && (
+                      <span className="pl-2 text-[11px] text-[var(--color-text-muted)]">
+                        （浮动 tag，摘要待任务确认）
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
               {track == null && (
                 <div className="pt-1 text-[11px] text-[var(--color-text-muted)]">
                   尚未建立追踪{reason != null && `（${reason}）`}；镜像修复并同步后自动建立。
+                </div>
+              )}
+              {track != null && (
+                <div className="pt-1 text-[11px] text-[var(--color-text-muted)]">
+                  追踪渠道：{track.sourceRegistry}/{track.sourceRepository}:{track.sourceTag}
+                  {resource.lastSyncedAt != null &&
+                    ` · 配置读取时间 ${fmtTime(resource.lastSyncedAt)}`}
+                </div>
+              )}
+              {track?.lastSuccessfulDigest != null && (
+                <div className="pt-1">
+                  <span className="text-[11px] text-[var(--color-text-muted)]">
+                    已确认成功摘要（
+                    {SUCCESS_SOURCE_LABEL[track.lastSuccessSource ?? 'deployment'] ?? '部署证据'}）
+                  </span>
+                  <div className="mono break-all text-[12px]">
+                    <Mono copyable>
+                      {track.lastSuccessDeploymentUuid == null
+                        ? track.lastSuccessfulDigest
+                        : `${track.sourceRegistry}/${track.sourceRepository}:${track.lastSuccessfulDigest.replace(/^sha256:/, 'sha256-')}`}
+                    </Mono>
+                    <span className="pl-2 text-[11px] text-[var(--color-text-muted)]">
+                      {fmtTime(track.lastSuccessAt)}
+                    </span>
+                  </div>
                 </div>
               )}
             </div>
@@ -263,7 +368,7 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
                 disabled={readOnly || patch.isPending}
                 title={readOnly ? '当前管理受限，配置只读' : undefined}
               >
-                保存
+                {externalChange ? '保存并确认当前配置' : '保存'}
               </Button>
               <Button
                 onClick={() => {
@@ -323,17 +428,25 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
               状态已刷新，请核对后重试。
             </div>
           )}
-          {resource.blockedReason === 'external_change' && !readOnly && (
+          {externalChange && (
             <div className="rounded border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/5 px-3 py-2 text-[12px] text-[var(--color-warning)]">
-              检测到 Coolify
-              中的镜像引用被外部修改。核对上方当前镜像与追踪来源，修正后点击「保存」解除阻塞。
+              检测到 Coolify 中的镜像引用被外部修改。旧基线已保留在上方「已记录配置基线」；
+              核对后用下方「采纳当前镜像并更新」接管新配置，或在镜像追踪卡片修改追踪 tag
+              后点「保存并确认当前配置」（保存会采纳现场为新基线并解除阻塞）。
             </div>
           )}
-          {track?.view.checkOutcome === 'unfixed' && !readOnly && (
-            <div className="rounded border border-[var(--color-info)]/40 bg-[var(--color-info)]/5 px-3 py-2 text-[12px] text-[var(--color-info)]">
-              该资源尚未初始化，下次检查（定时或手动「检查更新」）将自动创建初始化任务；也可通过
-              「预览更新 → 确认更新」立即执行。
+          {ignoreUnfixed != null ? (
+            <div className="rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] px-3 py-2 text-[12px] text-[var(--color-text-secondary)]">
+              {ignoreUnfixed}
             </div>
+          ) : (
+            track?.view.checkOutcome === 'unfixed' &&
+            !readOnly && (
+              <div className="rounded border border-[var(--color-info)]/40 bg-[var(--color-info)]/5 px-3 py-2 text-[12px] text-[var(--color-info)]">
+                该资源尚未初始化，下次检查（定时或手动「检查更新」）将自动创建初始化任务；也可通过
+                「预览更新 → 确认更新」立即执行。
+              </div>
+            )
           )}
         </CardBody>
       </Card>
@@ -384,6 +497,161 @@ function SingleResourceDetail({ resource, jobs }: { resource: ResourceDTO; jobs:
           )}
         </CardBody>
       </Card>
+
+      <Card>
+        <CardHeader title="恢复管理" />
+        <CardBody className="flex flex-col gap-3">
+          {adoptFeedback != null && (
+            <div role="status" className={`text-[12px] ${FEEDBACK_TONE_CLASS[adoptFeedback.tone]}`}>
+              {adoptFeedback.text}
+            </div>
+          )}
+          <div className="text-[12px] text-[var(--color-text-secondary)]">
+            绕过 toolkit 手动改过镜像或外部修改阻塞时，从这里恢复：采纳会把 Coolify
+            当前配置作为新基线并按需部署一次；重置则停止管理并清空追踪账本（Coolify
+            配置与任务历史保留）。
+          </div>
+          <div className="flex flex-wrap items-end gap-2">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setAdoptError(null);
+                setAdoptFeedback(null);
+                adoptPreviewMut.mutate();
+              }}
+              disabled={adoptHint != null || adoptPreviewMut.isPending}
+              title={adoptHint ?? '把 Coolify 当前镜像采纳为新追踪渠道，并按需更新'}
+            >
+              {adoptPreviewMut.isPending ? '读取中…' : '采纳当前镜像并更新'}
+            </Button>
+            <label
+              htmlFor="adopt-source-tag"
+              className="flex flex-col gap-1 text-[12px] text-[var(--color-text-secondary)]"
+            >
+              <span className="text-[11px] text-[var(--color-text-muted)]">
+                追踪 tag（可选，覆盖现场 tag）
+              </span>
+              <Input
+                id="adopt-source-tag"
+                value={adoptTag}
+                placeholder="默认取 Coolify 当前 tag"
+                className="max-w-[220px]"
+                disabled={adoptHint != null || adoptPreviewMut.isPending || adoptPreview != null}
+                onChange={(e) => setAdoptTag(e.target.value)}
+              />
+            </label>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setResetError(null);
+                setResetOpen(true);
+              }}
+              disabled={resetHint != null || resetMut.isPending}
+              title={resetHint ?? '停止管理并清空追踪账本（本地操作，Coolify 可达性无关）'}
+            >
+              重置追踪并忽略
+            </Button>
+          </div>
+          {adoptHint != null && (
+            <div className="text-[12px] text-[var(--color-text-muted)]">采纳停用：{adoptHint}</div>
+          )}
+          {resetHint != null && (
+            <div className="text-[12px] text-[var(--color-text-muted)]">重置停用：{resetHint}</div>
+          )}
+          {adoptError != null && (
+            <div
+              role="alert"
+              className="rounded border border-[var(--color-danger)]/40 bg-[var(--color-danger)]/5 px-3 py-2 text-[12px] text-[var(--color-danger)]"
+            >
+              {adoptError}
+            </div>
+          )}
+          {adoptPreview != null && (
+            <div className="break-words rounded border border-[var(--color-border-base)] bg-[var(--color-bg-overlay)] px-3 py-2 text-[12px]">
+              <div className="font-medium">确认采纳</div>
+              <div className="pt-1">
+                原追踪渠道：{track?.sourceRegistry}/{track?.sourceRepository}:
+                {track?.sourceTag ?? '（未配置）'}
+              </div>
+              <div>
+                Coolify 实时配置：
+                <Mono copyable>{adoptPreview.liveReference}</Mono>
+              </div>
+              <div>
+                将采用的渠道：{adoptPreview.channel.registry}/{adoptPreview.channel.repository}:
+                {adoptPreview.channel.tag}
+                {adoptPreview.channel.source === 'user_tag' && '（你填写的 tag）'}
+              </div>
+              {adoptPreview.channel.source !== 'user_tag' && adoptTag.trim() !== '' && (
+                <div className="text-[11px] text-[var(--color-text-muted)]">
+                  注意：输入框中的 tag「{adoptTag}」未用于本次预览；清空或重新预览后生效。
+                </div>
+              )}
+              <div>
+                目标完整引用（预览时解析）：
+                <Mono copyable>{adoptPreview.targetReference}</Mono>
+              </div>
+              <div className="pt-1 text-[var(--color-text-secondary)]">
+                影响范围：{adoptPreview.impact.note}；解析时间
+                {new Date(adoptPreview.resolvedAt).toLocaleString('zh-CN', { hour12: false })}。
+              </div>
+              <div className="flex flex-wrap items-center gap-2 pt-2">
+                <Button
+                  variant="accent"
+                  onClick={() => adoptMut.mutate()}
+                  disabled={adoptMut.isPending}
+                >
+                  {adoptMut.isPending ? '提交中…' : '确认采纳'}
+                </Button>
+                <Button
+                  variant="ghost"
+                  onClick={() => setAdoptPreview(null)}
+                  disabled={adoptMut.isPending}
+                >
+                  取消
+                </Button>
+              </div>
+            </div>
+          )}
+        </CardBody>
+      </Card>
+
+      <Modal
+        open={resetOpen}
+        title="重置追踪并忽略"
+        onClose={() => setResetOpen(false)}
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              onClick={() => setResetOpen(false)}
+              disabled={resetMut.isPending}
+            >
+              取消
+            </Button>
+            <Button
+              variant="accent"
+              onClick={() => resetMut.mutate()}
+              disabled={resetMut.isPending}
+            >
+              {resetMut.isPending ? '执行中…' : '确认重置'}
+            </Button>
+          </>
+        }
+      >
+        <div>此操作会：</div>
+        <ul className="list-disc pl-5">
+          <li>停止后续检查与自动更新（策略置为忽略）</li>
+          <li>清空追踪账本（基线、观察、成功证据投影）</li>
+          <li>保留 Coolify 配置与任务历史</li>
+        </ul>
+        <div>重新选择管理策略即可恢复管理；恢复后下一次检查会按所选策略初始化或检查。</div>
+        {resetError != null && (
+          <div role="alert" className="text-[12px] text-[var(--color-danger)]">
+            本次重置未执行：{resetError}
+          </div>
+        )}
+      </Modal>
 
       <Card>
         <CardHeader title="任务历史" />

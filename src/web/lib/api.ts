@@ -1,10 +1,13 @@
 // Typed fetch client for the toolkit API.
 import type {
+  AdoptPreviewDTO,
+  AdoptResultDTO,
   CheckOutcome,
   JobDTO,
   NotificationDTO,
   OverviewDTO,
   Policy,
+  ResetTrackingDTO,
   ResourceDTO,
   ResourceKind,
   ResourceStatus,
@@ -138,6 +141,22 @@ export const api = {
     request<{ job?: JobDTO; skipped?: boolean; message?: string }>(`/api/resources/${id}/update`, {
       method: 'POST',
       body: JSON.stringify({ skipPreview: true }),
+    }),
+  /** Adopt preview: optional explicit tracking tag for the new channel. */
+  adoptPreview: (id: number, sourceTag?: string) =>
+    request<{ preview: AdoptPreviewDTO }>(`/api/resources/${id}/adopt-preview`, {
+      method: 'POST',
+      body: JSON.stringify(sourceTag != null ? { sourceTag } : {}),
+    }),
+  adopt: (id: number, previewToken: string) =>
+    request<AdoptResultDTO & { resource: ResourceDTO | null }>(`/api/resources/${id}/adopt`, {
+      method: 'POST',
+      body: JSON.stringify({ previewToken }),
+    }),
+  resetTracking: (id: number) =>
+    request<ResetTrackingDTO>(`/api/resources/${id}/reset-tracking`, {
+      method: 'POST',
+      body: '{}',
     }),
   jobs: (status?: string) =>
     request<{ jobs: JobDTO[] }>(`/api/jobs${status ? `?status=${status}` : ''}`),

@@ -105,6 +105,12 @@ export const imageTracks = sqliteTable(
       enum: ['deployment', 'manual', 'runtime_observation'],
     }),
     pinnedAt: integer('pinned_at'),
+    /**
+     * Persistent concurrency guard: bumped by source/platform edits, adopt and
+     * reset. Tokens, in-flight jobs and async observations bind to it; a stale
+     * value invalidates the remote effect instead of relying on memory locks.
+     */
+    trackingRevision: integer('tracking_revision').notNull().default(0),
     /** discovered | user */
     trackSource: text('track_source', { enum: ['discovered', 'user'] })
       .notNull()
@@ -162,6 +168,8 @@ export const updateJobs = sqliteTable(
      *  Independent column: log writes bump updatedAt and must not shift the timer. */
     confirmationDueAt: integer('confirmation_due_at'),
     idempotencyKey: text('idempotency_key').notNull(),
+    /** Track revision this job was created under; stale jobs never write. */
+    trackingRevision: integer('tracking_revision').notNull().default(0),
     createdAt: integer('created_at').notNull().$defaultFn(now),
     updatedAt: integer('updated_at').notNull().$defaultFn(now),
     startedAt: integer('started_at'),

@@ -841,3 +841,134 @@ describe('per-node platform resolution', () => {
     });
   });
 });
+
+describe('review round 3 regressions (baseline semantics)', () => {
+  const D_A = `sha256:${'a'.repeat(64)}`;
+
+  function pinnedAppSync(): InventorySync {
+    return new InventorySync(
+      handle.db,
+      stubCoolify(
+        [
+          APP({
+            docker_image: 'ghcr.io/x/y',
+            docker_image_tag: `sha256-${'a'.repeat(64)}`,
+          }),
+        ],
+        [],
+        [],
+      ),
+      cfg,
+      settings,
+    );
+  }
+
+  function externalSync(): InventorySync {
+    return new InventorySync(
+      handle.db,
+      stubCoolify(
+        [
+          APP({
+            docker_image: 'ghcr.io/x/y',
+            docker_image_tag: `sha256-${'c'.repeat(64)}`,
+          }),
+        ],
+        [],
+        [],
+      ),
+      cfg,
+      settings,
+    );
+  }
+
+  it('repeated identical external references never re-adopt the drift (F6)', async () => {
+    sync = pinnedAppSync();
+    await sync.run();
+    const row = handle.db.select().from(resources).where(eq(resources.coolifyUuid, 'app-1')).get();
+    handle.db
+      .update(imageTracks)
+      .set({
+        configuredDigest: D_A,
+        configuredReference: `ghcr.io/x/y:sha256-${'a'.repeat(64)}`,
+      })
+      .where(eq(imageTracks.resourceId, row!.id))
+      .run();
+    // Three consecutive syncs with the SAME external digest C.
+    sync = externalSync();
+    for (let i = 1; i <= 3; i++) {
+      const r = await sync.run();
+      const t = handle.db
+        .select()
+        .from(imageTracks)
+        .where(eq(imageTracks.resourceId, row!.id))
+        .get();
+      const res = handle.db.select().from(resources).where(eq(resources.id, row!.id)).get();
+      if (i === 1) expect(r.externalChanges).toBe(1);
+      expect(t?.configuredDigest).toBe(D_A); // baseline never flips to C
+      expect(res?.blockedReason).toBe('external_change'); // stays blocked
+    }
+  });
+
+  it('same digest in a different repository is drift, not a match (F7)', async () => {
+    sync = pinnedAppSync();
+    await sync.run();
+    const row = handle.db.select().from(resources).where(eq(resources.coolifyUuid, 'app-1')).get();
+    handle.db
+      .update(imageTracks)
+      .set({
+        configuredDigest: D_A,
+        configuredReference: `ghcr.io/x/y:sha256-${'a'.repeat(64)}`,
+      })
+      .where(eq(imageTracks.resourceId, row!.id))
+      .run();
+    // Live moves to another repository but carries the SAME digest.
+    sync = new InventorySync(
+      handle.db,
+      stubCoolify(
+        [
+          APP({
+            docker_image: 'ghcr.io/other/repo',
+            docker_image_tag: `sha256-${'a'.repeat(64)}`,
+          }),
+        ],
+        [],
+        [],
+      ),
+      cfg,
+      settings,
+    );
+    await sync.run();
+    const t = handle.db.select().from(imageTracks).where(eq(imageTracks.resourceId, row!.id)).get();
+    const res = handle.db.select().from(resources).where(eq(resources.id, row!.id)).get();
+    // Digest alone never validates a different repository.
+    expect(res?.blockedReason).toBe('external_change');
+    expect(t?.configuredReference).toBe(`ghcr.io/x/y:sha256-${'a'.repeat(64)}`);
+  });
+
+  it('revision-changed resources skip stale sync writes (F8)', async () => {
+    sync = new InventorySync(handle.db, stubCoolify([APP()], [], []), cfg, settings);
+    await sync.run();
+    const row = handle.db.select().from(resources).where(eq(resources.coolifyUuid, 'app-1')).get();
+    // Simulate a slow list read while an adopt/reset bumps the revision.
+    const track = handle.db
+      .select()
+      .from(imageTracks)
+      .where(eq(imageTracks.resourceId, row!.id))
+      .get();
+    handle.db
+      .update(imageTracks)
+      .set({ trackingRevision: track!.trackingRevision + 5 })
+      .where(eq(imageTracks.resourceId, row!.id))
+      .run();
+    sync = new InventorySync(
+      handle.db,
+      stubCoolify([APP({ docker_image_tag: '9.9.9' })], [], []),
+      cfg,
+      settings,
+    );
+    await sync.run();
+    const t = handle.db.select().from(imageTracks).where(eq(imageTracks.resourceId, row!.id)).get();
+    // The stale batch must not rewrite the baseline of a revision-bumped track.
+    expect(t?.configuredDigest).toBeNull();
+  });
+});

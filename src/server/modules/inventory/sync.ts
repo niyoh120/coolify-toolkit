@@ -14,6 +14,7 @@ import type { CoolifyClient } from '../../integrations/coolify/client.js';
 import { applicationImageRef } from '../../integrations/coolify/mapper.js';
 import type { NormalizedRef } from '../../integrations/registry/reference.js';
 import { fingerprintObject, sha256Hex } from '../fingerprint.js';
+import { clearedObservation, liveMatchesBaseline } from '../updates/image-state.js';
 import { classifyImage } from './management-state.js';
 export interface SyncResult {
   resourcesSeen: number;
@@ -225,11 +226,15 @@ export class InventorySync {
       if (resolved.platform === track.targetPlatform && resolved.source === track.platformSource) {
         continue;
       }
+      // F13: a platform change invalidates platform-scoped observations and
+      // bumps the tracking revision (same semantics as the manual PATCH).
       this.db
         .update(imageTracks)
         .set({
           targetPlatform: resolved.platform,
           platformSource: resolved.platform == null ? null : resolved.source,
+          trackingRevision: track.trackingRevision + 1,
+          ...clearedObservation(),
           updatedAt: now,
         })
         .where(eq(imageTracks.id, track.id))
@@ -324,6 +329,11 @@ export class InventorySync {
     // Topology first so upserts can label resources with their real server.
     await this.refreshTopology();
 
+    // Track revisions captured BEFORE every external read (F8): a concurrent
+    // adopt/save/reset invalidates the whole batch's external data for that
+    // resource, so the snapshot must precede listApplications/listServices.
+    const revisionsAtStart = this.trackRevisions();
+
     // Full lists first — a failure here aborts before any removal marking.
     const applications = (await this.coolify.listApplications())
       .map(appToAppLike)
@@ -370,26 +380,57 @@ export class InventorySync {
       for (const child of children) {
         const platform = composeServicePlatform(svc.docker_compose_raw ?? '', childName(child));
         const childExcluded = svcExcluded || this.cfg.excludedUuids.includes(child.uuid);
-        await this.upsertChild(parentRow, svc, child, platform, childExcluded, now, result);
+        await this.upsertChild(
+          parentRow,
+          svc,
+          child,
+          platform,
+          childExcluded,
+          now,
+          result,
+          revisionsAtStart,
+        );
         seenKeys.add(`service_application|${child.uuid}`);
       }
     }
 
     for (const app of applications) {
       const excluded = this.cfg.excludedUuids.includes(app.uuid);
-      await this.upsertApplication(app, excluded, now, result);
+      await this.upsertApplication(app, excluded, now, result, revisionsAtStart);
       seenKeys.add(`application|${app.uuid}`);
     }
 
-    // Complete sync succeeded for listed parents/children/apps we saw; mark stale rows removed.
+    // Complete sync succeeded for listed parents/children/apps we saw; mark
+    // stale rows removed. F8/R5-F4: the write is CONDITIONAL on the snapshot
+    // revision (checked again inside a short transaction per row), so a reset
+    // landing between the stale computation and the UPDATE cannot be undone.
     const allActive = await this.db.select().from(resources).where(eq(resources.status, 'active'));
     const stale = allActive.filter((r) => !seenKeys.has(`${r.kind}|${r.coolifyUuid}`));
     for (const row of stale) {
-      await this.db
-        .update(resources)
-        .set({ status: 'removed', updatedAt: now })
-        .where(eq(resources.id, row.id));
-      result.removed += 1;
+      const before = revisionsAtStart?.get(row.id);
+      if (before == null) {
+        // No track at snapshot time: nothing to guard (parent rows etc.).
+        await this.db
+          .update(resources)
+          .set({ status: 'removed', updatedAt: now })
+          .where(eq(resources.id, row.id));
+        result.removed += 1;
+        continue;
+      }
+      const applied = this.db.transaction((tx) => {
+        const current = tx
+          .select({ rev: imageTracks.trackingRevision })
+          .from(imageTracks)
+          .where(eq(imageTracks.resourceId, row.id))
+          .get();
+        if (current == null || current.rev !== before) return false;
+        tx.update(resources)
+          .set({ status: 'removed', updatedAt: now })
+          .where(eq(resources.id, row.id))
+          .run();
+        return true;
+      });
+      if (applied) result.removed += 1;
     }
 
     // Re-apply node/global defaults to discovery-aligned tracks so new
@@ -487,6 +528,33 @@ export class InventorySync {
     return inserted;
   }
 
+  /** resourceId → trackingRevision snapshot taken before external reads. */
+  private trackRevisions(): Map<number, number> {
+    return new Map(
+      this.db
+        .select({ resourceId: imageTracks.resourceId, revision: imageTracks.trackingRevision })
+        .from(imageTracks)
+        .all()
+        .map((r) => [r.resourceId, r.revision]),
+    );
+  }
+
+  /**
+   * True when the resource's tracking revision changed since the batch
+   * snapshot: an adopt/save/reset happened mid-sync, so this batch's external
+   * read is stale for that resource. Resource/track writes are skipped whole.
+   */
+  private trackingChangedSince(snapshot: Map<number, number>, resourceId: number): boolean {
+    const before = snapshot.get(resourceId);
+    if (before == null) return false; // no track at snapshot time: nothing to guard
+    const current = this.db
+      .select({ revision: imageTracks.trackingRevision })
+      .from(imageTracks)
+      .where(eq(imageTracks.resourceId, resourceId))
+      .get();
+    return current != null && current.revision !== before;
+  }
+
   private async upsertChild(
     parent: ResourceRow,
     _svc: Awaited<ReturnType<CoolifyClient['listServices']>>[number],
@@ -495,6 +563,7 @@ export class InventorySync {
     excluded: boolean,
     now: number,
     result: SyncResult,
+    revisionsAtStart?: Map<number, number>,
   ): Promise<void> {
     const image = child.image ?? null;
     const domains = child.fqdn ?? child.url;
@@ -557,90 +626,107 @@ export class InventorySync {
       return;
     }
 
-    // Existing child: detect external image changes against the track's expectations.
-    const track = await this.db
-      .select()
-      .from(imageTracks)
-      .where(eq(imageTracks.resourceId, existing.id))
-      .get();
-    const matchesExpectation = this.imageMatchesTrack(track, parsed);
-    const revertToTag = track?.configuredDigest != null && parsed != null && parsed.digest == null;
-    const externalChange =
-      existing.lastSyncedAt != null &&
-      !matchesExpectation &&
-      (existing.configFingerprint !== fingerprint || revertToTag);
+    // Existing child: detect external image changes against the confirmed
+    // baseline (shared semantics; see image-state.liveMatchesBaseline).
+    // An adopt/save/reset during this batch invalidates the external read:
+    // skip the whole projection for this resource (plan §5).
+    if (revisionsAtStart != null && this.trackingChangedSince(revisionsAtStart, existing.id)) {
+      return;
+    }
+    // R4-F2: resource write + track backfill form ONE short transaction with
+    // an in-transaction revision re-check (same shape as upsertApplication).
+    this.db.transaction((tx) => {
+      const track = tx
+        .select()
+        .from(imageTracks)
+        .where(eq(imageTracks.resourceId, existing.id))
+        .get();
+      if (revisionsAtStart != null && this.trackingChangedSince(revisionsAtStart, existing.id)) {
+        return;
+      }
+      const matchesExpectation = this.imageMatchesTrack(track, parsed);
+      const externalChange = existing.lastSyncedAt != null && !matchesExpectation;
 
-    if (externalChange) result.externalChanges += 1;
+      if (externalChange) result.externalChanges += 1;
 
-    await this.db
-      .update(resources)
-      .set({
-        name: child.human_name ?? child.name ?? existing.name,
-        projectUuid: parent.projectUuid ?? existing.projectUuid,
-        environmentUuid: parent.environmentUuid ?? existing.environmentUuid,
-        serverName: parent.serverName,
-        domains: child.fqdn,
-        currentImage: image,
-        configFingerprint: fingerprint,
-        excludedInfra: excluded,
-        managementClassified: true,
-        imageIssue,
-        isStopped: stopped,
-        status: 'active',
-        blockedReason: resolveBlockedReason(
-          externalChange,
-          parsed != null && matchesExpectation,
-          existing.blockedReason,
-        ),
-        lastSyncedAt: now,
-        updatedAt: now,
-      })
-      .where(eq(resources.id, existing.id));
-
-    if (parsed != null && track == null) {
-      const fallback = this.resolveServerPlatform(parent.serverUuid);
-      await this.ensureTrack(
-        { id: existing.id } as ResourceRow,
-        parsed,
-        composePlatform ?? fallback.platform,
-        composePlatform != null ? 'compose' : fallback.source,
-        image,
-        now,
-      );
-    } else if (parsed != null && track != null && !externalChange) {
-      // Refresh configured reference/digest from live Coolify values.
-      // On external change the prior target is preserved for re-confirmation.
-      await this.db
-        .update(imageTracks)
+      tx.update(resources)
         .set({
-          configuredReference: image,
-          configuredDigest: parsed.digest,
-          configuredReferenceKind: null,
+          name: child.human_name ?? child.name ?? existing.name,
+          projectUuid: parent.projectUuid ?? existing.projectUuid,
+          environmentUuid: parent.environmentUuid ?? existing.environmentUuid,
+          serverName: parent.serverName,
+          domains: child.fqdn,
+          currentImage: image,
+          configFingerprint: fingerprint,
+          excludedInfra: excluded,
+          managementClassified: true,
+          imageIssue,
+          isStopped: stopped,
+          status: 'active',
+          blockedReason: resolveBlockedReason(
+            externalChange,
+            parsed != null && matchesExpectation,
+            existing.blockedReason,
+          ),
+          lastSyncedAt: now,
           updatedAt: now,
         })
-        .where(eq(imageTracks.id, track.id));
-    }
+        .where(eq(resources.id, existing.id))
+        .run();
+
+      if (parsed != null && track == null) {
+        const fallback = this.resolveServerPlatform(parent.serverUuid);
+        const platform = composePlatform ?? fallback.platform;
+        // R5-F8: explicit branches instead of a nested ternary.
+        let platformSource: string | null = null;
+        if (platform != null) {
+          platformSource = composePlatform != null ? 'compose' : fallback.source;
+        }
+        tx.insert(imageTracks)
+          .values({
+            resourceId: existing.id,
+            sourceRegistry: parsed.registry,
+            sourceRepository: parsed.repository,
+            sourceRepositoryAuthored: parsed.authoredPath,
+            sourceTag: parsed.tag ?? '',
+            targetPlatform: platform,
+            platformSource,
+            configuredReference: image,
+            configuredDigest: parsed.digest,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .run();
+      } else if (parsed != null && track != null && !externalChange) {
+        // Refresh the accepted baseline from live Coolify values. On external
+        // change the prior baseline is preserved for re-confirmation.
+        tx.update(imageTracks)
+          .set({
+            configuredReference: image,
+            configuredDigest: parsed.digest,
+            configuredReferenceKind: null,
+            updatedAt: now,
+          })
+          .where(eq(imageTracks.id, track.id))
+          .run();
+      }
+    });
   }
 
   /**
-   * Plan §3 rule 5: a live image matches the track's expectation when it is the
-   * pinned digest, or — for never-pinned tracks — the tracked tag. Once pinned,
-   * a revert to the plain tag is an external change even when the tag matches.
+   * Shared baseline comparison; null track keeps the historic "no expectations
+   * yet" behavior (anything goes, nothing drifts).
    */
   private imageMatchesTrack(
     track: typeof imageTracks.$inferSelect | undefined,
     parsed: NormalizedRef | null,
   ): boolean {
-    if (track == null || parsed == null) return true;
-    if (parsed.registry !== track.sourceRegistry || parsed.repository !== track.sourceRepository) {
-      return false;
-    }
-    if (parsed.digest != null) {
-      return parsed.digest === track.configuredDigest;
-    }
-    // Pure-tag reference: only acceptable while the track was never pinned.
-    if (track.configuredDigest != null) return false;
-    return track.sourceTag === '' || parsed.tag === track.sourceTag;
+    // The track row IS the channel identity source for legacy digest-only rows.
+    if (track == null) return true;
+    return liveMatchesBaseline(track, parsed, {
+      registry: track.sourceRegistry,
+      repository: track.sourceRepository,
+    });
   }
 
   private async upsertApplication(
@@ -648,6 +734,7 @@ export class InventorySync {
     excluded: boolean,
     now: number,
     result: SyncResult,
+    revisionsAtStart?: Map<number, number>,
   ): Promise<void> {
     const existing = await this.db
       .select()
@@ -703,65 +790,89 @@ export class InventorySync {
       return;
     }
 
-    const track = await this.db
-      .select()
-      .from(imageTracks)
-      .where(eq(imageTracks.resourceId, existing.id))
-      .get();
-    const matchesExpectation = this.imageMatchesTrack(track, parsed);
-    // A pinned track reverting to a plain tag is an external change even when
-    // the resulting fingerprint equals the discovery-time state (same tag).
-    const revertToTag = track?.configuredDigest != null && parsed != null && parsed.digest == null;
-
-    const externalChange =
-      existing.lastSyncedAt != null &&
-      !matchesExpectation &&
-      (existing.configFingerprint !== app.fingerprint || revertToTag);
-    if (externalChange) result.externalChanges += 1;
-
-    await this.db
-      .update(resources)
-      .set({
-        name: app.name ?? existing.name,
-        projectUuid: app.projectUuid ?? existing.projectUuid,
-        environmentUuid: app.environmentUuid ?? existing.environmentUuid,
-        // 与服务父行相同：历史行缺 serverUuid 或迁移时在同步中补全/更新。
-        serverUuid: app.serverUuid ?? existing.serverUuid,
-        serverName: this.serverNameFor(app.serverUuid, existing.serverName),
-        domains: app.domains,
-        currentImage: app.image,
-        configFingerprint: app.fingerprint,
-        excludedInfra: excluded,
-        managementClassified: true,
-        imageIssue,
-        isStopped: app.stopped,
-        status: 'active',
-        blockedReason: resolveBlockedReason(
-          externalChange,
-          parsed != null && matchesExpectation,
-          existing.blockedReason,
-        ),
-        lastSyncedAt: now,
-        updatedAt: now,
-      })
-      .where(eq(resources.id, existing.id));
-
-    if (parsed != null && track == null) {
-      await this.ensureTrack(
-        { id: existing.id } as ResourceRow,
-        parsed,
-        this.resolveServerPlatform(app.serverUuid).platform,
-        this.resolveServerPlatform(app.serverUuid).source,
-        app.image,
-        now,
-      );
-    } else if (parsed != null && track != null && !externalChange) {
-      // On external change the prior pinned digest is preserved for re-confirmation.
-      await this.db
-        .update(imageTracks)
-        .set({ configuredReference: app.image, configuredDigest: parsed.digest, updatedAt: now })
-        .where(eq(imageTracks.id, track.id));
+    // Adopt/save/reset during this batch invalidates the external read for
+    // this resource: skip the whole projection (plan §5).
+    if (revisionsAtStart != null && this.trackingChangedSince(revisionsAtStart, existing.id)) {
+      return;
     }
+    // R4-F2: resource write + track backfill form ONE short transaction with
+    // an in-transaction revision re-check, so an adopt/reset landing between
+    // the two writes can never leave a mixed state (e.g. ignore + old baseline).
+    this.db.transaction((tx) => {
+      const track = tx
+        .select()
+        .from(imageTracks)
+        .where(eq(imageTracks.resourceId, existing.id))
+        .get();
+      // Re-check inside the transaction: the revision may have moved between
+      // the batch snapshot and this write.
+      if (revisionsAtStart != null && this.trackingChangedSince(revisionsAtStart, existing.id)) {
+        return;
+      }
+      const matchesExpectation = this.imageMatchesTrack(track, parsed);
+      // F6: drift is decided ONLY by the baseline match (see upsertChild).
+
+      const externalChange = existing.lastSyncedAt != null && !matchesExpectation;
+      if (externalChange) result.externalChanges += 1;
+
+      tx.update(resources)
+        .set({
+          name: app.name ?? existing.name,
+          projectUuid: app.projectUuid ?? existing.projectUuid,
+          environmentUuid: app.environmentUuid ?? existing.environmentUuid,
+          // 与服务父行相同：历史行缺 serverUuid 或迁移时在同步中补全/更新。
+          serverUuid: app.serverUuid ?? existing.serverUuid,
+          serverName: this.serverNameFor(app.serverUuid, existing.serverName),
+          domains: app.domains,
+          currentImage: app.image,
+          configFingerprint: app.fingerprint,
+          excludedInfra: excluded,
+          managementClassified: true,
+          imageIssue,
+          isStopped: app.stopped,
+          status: 'active',
+          blockedReason: resolveBlockedReason(
+            externalChange,
+            parsed != null && matchesExpectation,
+            existing.blockedReason,
+          ),
+          lastSyncedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(resources.id, existing.id))
+        .run();
+
+      if (parsed != null && track == null) {
+        tx.insert(imageTracks)
+          .values({
+            resourceId: existing.id,
+            sourceRegistry: parsed.registry,
+            sourceRepository: parsed.repository,
+            sourceRepositoryAuthored: parsed.authoredPath,
+            sourceTag: parsed.tag ?? '',
+            targetPlatform: this.resolveServerPlatform(app.serverUuid).platform,
+            platformSource:
+              this.resolveServerPlatform(app.serverUuid).platform == null
+                ? null
+                : this.resolveServerPlatform(app.serverUuid).source,
+            configuredReference: app.image,
+            configuredDigest: parsed.digest,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .run();
+      } else if (parsed != null && track != null && !externalChange) {
+        // On external change the prior pinned digest is preserved for re-confirmation.
+        tx.update(imageTracks)
+          .set({
+            configuredReference: app.image,
+            configuredDigest: parsed.digest,
+            updatedAt: now,
+          })
+          .where(eq(imageTracks.id, track.id))
+          .run();
+      }
+    });
   }
 
   /** First sight of a resource: create its track from the current Coolify config. */

@@ -428,6 +428,43 @@ export function updateBlockedHint(r: ResourceDTO): string | null {
   return null;
 }
 
+// --- tracking recovery eligibility (adopt / reset) ----------------------------------
+
+/**
+ * Why「采纳当前镜像并更新」is unavailable right now; null when the button may
+ * act. ignore 需要先选择管理策略；镜像问题/排除/待同步由管理原因解释。
+ */
+export function adoptBlockedHint(r: ResourceDTO): string | null {
+  if (r.status !== 'active') return '资源已移除';
+  const reason = managementReason(r);
+  if (reason != null) return reason;
+  if (r.policy === 'ignore') return '先选择管理策略，再采纳当前镜像';
+  if (r.track == null) return '无镜像追踪';
+  return null;
+}
+
+/**
+ * Why「重置追踪并忽略」is unavailable; null when allowed. Local-only action:
+ * image problems and ignore states stay resettable; pending-sync and
+ * config-excluded rows keep their management boundary.
+ */
+export function resetBlockedHint(r: ResourceDTO): string | null {
+  if (r.status !== 'active') return '资源已移除';
+  if (isPendingSync(r)) return '待同步确认：完成一次资源同步后再重置';
+  if (isConfigExcluded(r)) return '已排除的资源无需重置追踪';
+  if (r.track == null) return '无镜像追踪';
+  return null;
+}
+
+/** 已忽略策略下的检查/初始化提示（unfixed 文案区分）。 */
+export function unfixedNotice(r: ResourceDTO): string | null {
+  if (r.track?.view.checkOutcome !== 'unfixed') return null;
+  if (r.policy === 'ignore') {
+    return '已忽略：检查与自动初始化暂停。重新选择管理策略后，下一次检查才会初始化。';
+  }
+  return null;
+}
+
 // --- confirmation eligibility & batch snapshot -----------------------------------
 
 /** Why the row cannot run 「确认更新完成」 right now; null when confirmable. */

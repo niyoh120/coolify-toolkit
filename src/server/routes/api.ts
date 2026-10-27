@@ -8,6 +8,8 @@ import { bodyLimit } from 'hono/body-limit';
 import { ZodError } from 'zod';
 import { ApiRequestError, errorCodes } from '../../shared/errors.js';
 import {
+  adoptConfirmRequestSchema,
+  adoptPreviewRequestSchema,
   batchPolicySchema,
   checkRequestSchema,
   confirmRequestSchema,
@@ -27,6 +29,11 @@ import {
   type ManagementGateCode,
 } from '../modules/inventory/management-state.js';
 import { parentRowOf } from '../modules/inventory/parent-row.js';
+import {
+  applicationDigestReference,
+  clearedObservation,
+  composeDigestReference,
+} from '../modules/updates/image-state.js';
 import { assertCronValid } from '../scheduler/cron-validate.js';
 
 const BODY_LIMIT = 256 * 1024;
@@ -97,6 +104,19 @@ function parseIdQuery(value: string | undefined, name: string): number | null {
       `Query param ${name} must be a positive safe integer`,
       400,
     );
+  }
+  return parsed;
+}
+
+/** Strict decimal positive-integer path param; '1junk'/NaN → 400 (F12). */
+function resourceIdParam(c: Context): number {
+  const raw = c.req.param('id') ?? '';
+  if (!/^[0-9]+$/.test(raw)) {
+    throw new ApiRequestError(errorCodes.validation, 'Invalid resource id', 400);
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new ApiRequestError(errorCodes.validation, 'Invalid resource id', 400);
   }
   return parsed;
 }
@@ -288,15 +308,15 @@ export function createApi(deps: Deps): Hono {
       }
       const track = db.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get();
       const now = Date.now();
+      const sourceChanged =
+        input.sourceTag != null || input.sourceRegistry != null || input.sourceRepository != null;
+      const platformChanged = input.targetPlatform !== undefined;
+      // R5-F1: request-start revision snapshot for the in-transaction recheck.
+      const expectedRevision = track?.trackingRevision ?? null;
 
-      if (input.policy != null) {
-        db.update(resources)
-          .set({ policy: input.policy, updatedAt: now })
-          .where(eq(resources.id, id))
-          .run();
-      }
+      // F5: 校验全部先行（含 cron/来源解析/在途任务），恢复写入推迟到
+      // 最终事务内 —— 任何校验失败都保持持久状态原值。
       if (input.checkCron !== undefined) {
-        // 空串 = 恢复全局默认；非法表达式用当前时区校验后拒绝。
         const cronExpr = input.checkCron === '' ? null : input.checkCron;
         if (cronExpr != null) {
           try {
@@ -305,59 +325,228 @@ export function createApi(deps: Deps): Hono {
             throw new ApiRequestError(errorCodes.validation, 'Invalid cron expression', 400);
           }
         }
-        db.update(resources)
-          .set({ checkCron: cronExpr, updatedAt: now })
-          .where(eq(resources.id, id))
-          .run();
-        deps.applyResourceSchedules?.();
       }
-      if (
-        track != null &&
-        (input.sourceTag != null || input.sourceRegistry != null || input.sourceRepository != null)
-      ) {
-        // Source edits re-point the upstream channel; require full tag + validate parse.
+      // 恢复读取（F5/F12）：网络 GET 在全部本地校验前执行（只读）；落库仍
+      // 推迟到最终事务。live 引用同时用于「跟随新仓库」的跨仓例外判断。
+      let recovery: Awaited<ReturnType<typeof deps.tracking.fetchExternalChangeLive>> = null;
+      if (resource.blockedReason === 'external_change' && sourceChanged && track != null) {
+        recovery = await deps.tracking.fetchExternalChangeLive(id);
+        if (recovery == null) {
+          throw new ApiRequestError(
+            errorCodes.conflict,
+            'Coolify 实时配置读取失败；保存未生效，稍后重试或使用「采纳当前镜像并更新」',
+            409,
+          );
+        }
+      }
+      const recoveryLiveRef = recovery?.configuredReference ?? null;
+      let recoveryLiveParsed: ReturnType<typeof normalizeReference> | null = null;
+      if (recoveryLiveRef != null && recoveryLiveRef !== '') {
+        try {
+          recoveryLiveParsed = normalizeReference(recoveryLiveRef);
+        } catch {
+          recoveryLiveParsed = null;
+        }
+      }
+
+      let plannedTag: string | null = null;
+      let probe: ReturnType<typeof normalizeReference> | null = null;
+      if (sourceChanged && track != null) {
         const registry = input.sourceRegistry ?? track.sourceRegistry;
         const repository = input.sourceRepository ?? track.sourceRepository;
         const tag = input.sourceTag ?? (track.sourceTag === '' ? null : track.sourceTag);
         if (tag == null)
           throw new ApiRequestError(errorCodes.validation, 'Tracking tag must not be empty', 400);
-        const probe = normalizeReference(`${registry}/${repository}:${tag}`);
-        db.update(imageTracks)
-          .set({
-            sourceRegistry: probe.registry,
-            sourceRepository: probe.repository,
-            sourceTag: tag,
-            trackSource: 'user',
-            // New channel: prior observations belong to the old stream.
-            observedDigest: null,
-            observedAt: null,
-            observedError: null,
-            platformManifestDigest: null,
-            updatedAt: now,
-          })
-          .where(eq(imageTracks.id, track.id))
-          .run();
+        probe = normalizeReference(`${registry}/${repository}:${tag}`);
+        plannedTag = tag;
+        // F12/F4: actively re-pointing the channel to a DIFFERENT repository
+        // is image migration — rejected. Exception: external_change recovery
+        // where the LIVE config already moved; then (a) an explicitly typed
+        // repository must MATCH the live repository, (b) a tag-only save
+        // follows the live repository. Typed mismatches are still 400.
+        const recovering =
+          resource.blockedReason === 'external_change' &&
+          recoveryLiveRef != null &&
+          recoveryLiveRef.trim() !== '';
+        if (recovering && recoveryLiveParsed != null) {
+          const typedRepo = input.sourceRegistry != null || input.sourceRepository != null;
+          if (typedRepo) {
+            const matchesLive =
+              probe.registry === recoveryLiveParsed.registry &&
+              probe.repository === recoveryLiveParsed.repository;
+            if (!matchesLive) {
+              throw new ApiRequestError(
+                errorCodes.validation,
+                '填写的仓库与 Coolify 当前配置的仓库不一致；请清空仓库字段跟随现场，或先在 Coolify 核对镜像',
+                400,
+              );
+            }
+          }
+        } else {
+          const sameRepo =
+            probe.registry === track.sourceRegistry && probe.repository === track.sourceRepository;
+          if (!sameRepo) {
+            throw new ApiRequestError(
+              errorCodes.validation,
+              '更新来源指向与当前配置不同的仓库属于镜像迁移；请先在 Coolify 修改镜像，同步后用「采纳当前镜像并更新」',
+              400,
+            );
+          }
+        }
       }
-      if (input.targetPlatform !== undefined && track != null) {
-        db.update(imageTracks)
-          .set({
-            targetPlatform: input.targetPlatform,
-            platformSource: input.targetPlatform == null ? null : 'manual',
-            updatedAt: now,
-          })
-          .where(eq(imageTracks.id, track.id))
-          .run();
+
+      // 在途/未知提交任务在来源/平台变更时阻止（版本与基线被重写）。
+      // R5-F7: 统一走 JobsService.assertExclusiveScope（含父级范围与归属）。
+      if ((sourceChanged || platformChanged) && track != null) {
+        deps.jobs.assertExclusiveScope(resource);
       }
-      // Unblocking is explicit: user re-acknowledges the current state.
-      if (
-        resource.blockedReason === 'external_change' &&
-        (input.sourceTag != null || input.sourceRepository != null || input.sourceRegistry != null)
-      ) {
-        db.update(resources)
-          .set({ blockedReason: null, updatedAt: now })
-          .where(eq(resources.id, id))
-          .run();
-      }
+
+      db.transaction((tx) => {
+        // R5-F1/R6-F1: 事务内重读 resource+track，复核资格/恢复状态/任务范围。
+        // 按字段区分前置条件：policy/cron 只要求资源资格；来源、平台、恢复
+        // 涉及追踪账本时才要求 track 存在并做版本比较（Compose 父服务无
+        // track，独立 policy/cron 保存必须继续可用）。
+        const liveResource = tx.select().from(resources).where(eq(resources.id, id)).get();
+        if (liveResource == null) {
+          throw new ApiRequestError(errorCodes.blocked, 'Resource disappeared', 409);
+        }
+        // R6-F3: active 状态在事务内重验 —— recovery GET 等待期间资源可能
+        // 已被移除。
+        if (liveResource.status !== 'active') {
+          throw new ApiRequestError(errorCodes.blocked, 'Resource is not active', 409);
+        }
+        const trackScoped = sourceChanged || platformChanged || recovery != null;
+        // policy/cron saves never touch the ledger; track writes below are
+        // gated on their own conditions, and trackScoped requires the row.
+        // The guard binds the narrowed row for the three track writes below.
+        const liveTrackOrNull =
+          tx.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get() ?? null;
+        if (trackScoped && liveTrackOrNull == null) {
+          throw new ApiRequestError(errorCodes.blocked, 'No image track for this resource', 409);
+        }
+        // Track-scoped write helper: the guard above guarantees the row for
+        // every branch that reaches here (recovery/source/platform all imply
+        // trackScoped).
+        const trackIdForWrite = (): number => {
+          if (liveTrackOrNull == null) {
+            throw new ApiRequestError(errorCodes.blocked, 'No image track', 409);
+          }
+          return liveTrackOrNull.id;
+        };
+        if (
+          liveTrackOrNull != null &&
+          expectedRevision != null &&
+          liveTrackOrNull.trackingRevision !== expectedRevision
+        ) {
+          throw new ApiRequestError(
+            errorCodes.conflict,
+            '追踪配置在保存期间已变化（并发采纳/保存/重置）；请刷新后重试',
+            409,
+          );
+        }
+        const gateNow = effectiveManagementGate(
+          liveResource,
+          parentRowOf(tx, liveResource),
+          liveResource.currentImage,
+        );
+        if (!gateNow.ok) {
+          throw new ApiRequestError(errorCodes.blocked, gateNow.reason, 409, {
+            code: gateNow.code,
+          });
+        }
+        // 恢复状态必须仍然成立：等待期间阻塞被解除（如另一请求已完成采纳）
+        // 时，恢复分支不再适用，拒绝以避免覆盖新基线。
+        if (recovery != null && liveResource.blockedReason !== 'external_change') {
+          throw new ApiRequestError(
+            errorCodes.conflict,
+            '外部修改状态在保存期间已解除；请刷新后核对，再做来源修改',
+            409,
+          );
+        }
+
+        let nextRevision = liveTrackOrNull?.trackingRevision ?? 0;
+        if (input.policy != null) {
+          tx.update(resources)
+            .set({ policy: input.policy, updatedAt: now })
+            .where(eq(resources.id, id))
+            .run();
+        }
+        if (input.checkCron !== undefined) {
+          tx.update(resources)
+            .set({ checkCron: input.checkCron === '' ? null : input.checkCron, updatedAt: now })
+            .where(eq(resources.id, id))
+            .run();
+        }
+        if (recovery != null) {
+          // 恢复：采纳现场为已确认基线并解除阻塞（事务内，原子）。
+          nextRevision += 1;
+          tx.update(imageTracks)
+            .set({
+              configuredReference: recovery.configuredReference,
+              configuredDigest: recovery.configuredDigest,
+              configuredReferenceKind: null,
+              pinnedAt: null,
+              trackingRevision: nextRevision,
+              lastSuccessfulDigest: null,
+              lastSuccessAt: null,
+              lastSuccessDeploymentUuid: null,
+              lastSuccessSource: null,
+              updatedAt: now,
+            })
+            .where(eq(imageTracks.id, trackIdForWrite()))
+            .run();
+          tx.update(resources)
+            .set({ blockedReason: null, updatedAt: now })
+            .where(eq(resources.id, id))
+            .run();
+        }
+        if (sourceChanged && probe != null && plannedTag != null) {
+          // 渠道变更：保留已确认配置与真实成功证据，清旧渠道观察。
+          // F12: 恢复路径且现场已换仓时，渠道跟随现场仓库（authored 同步维护）。
+          let channelRef = probe;
+          if (recovery != null) {
+            try {
+              const liveParsed = normalizeReference(recovery.configuredReference);
+              channelRef = normalizeReference(
+                `${liveParsed.registry}/${liveParsed.repository}:${plannedTag}`,
+              );
+            } catch {
+              channelRef = probe;
+            }
+          }
+          nextRevision += 1;
+          tx.update(imageTracks)
+            .set({
+              sourceRegistry: channelRef.registry,
+              sourceRepository: channelRef.repository,
+              sourceRepositoryAuthored: channelRef.authoredPath,
+              sourceTag: plannedTag,
+              trackSource: 'user',
+              trackingRevision: nextRevision,
+              ...clearedObservation(),
+              updatedAt: now,
+            })
+            .where(eq(imageTracks.id, trackIdForWrite()))
+            .run();
+        }
+        if (platformChanged) {
+          // 平台变更（F13）：平台相关观察全部失效并递增版本。
+          nextRevision += 1;
+          tx.update(imageTracks)
+            .set({
+              targetPlatform: input.targetPlatform,
+              platformSource: input.targetPlatform == null ? null : 'manual',
+              trackingRevision: nextRevision,
+              ...clearedObservation(),
+              updatedAt: now,
+            })
+            .where(eq(imageTracks.id, trackIdForWrite()))
+            .run();
+        }
+        // 非来源修改的外部修改解除入口已移除：保存 cron/策略不再解除阻塞。
+      });
+
+      if (input.checkCron !== undefined) deps.applyResourceSchedules?.();
       const updated = db.select().from(resources).where(eq(resources.id, id)).get();
       const updatedTrack =
         db.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get() ?? null;
@@ -516,7 +705,20 @@ export function createApi(deps: Deps): Hono {
       if (track.configuredDigest != null && track.observedDigest === track.configuredDigest) {
         return c.json({ preview: null, message: '配置已匹配上游，没有候选更新' });
       }
-      const token = jobs.issuePreviewToken(id, track.observedDigest);
+      const candidateReference =
+        resource.kind === 'service_application'
+          ? composeDigestReference(track.sourceRepositoryAuthored, track.observedDigest)
+          : applicationDigestReference(
+              track.sourceRegistry,
+              track.sourceRepository,
+              track.observedDigest,
+            );
+      const token = jobs.issuePreviewToken(
+        id,
+        track.observedDigest,
+        track.trackingRevision,
+        candidateReference,
+      );
       const impact =
         resource.kind === 'service_application'
           ? {
@@ -532,15 +734,76 @@ export function createApi(deps: Deps): Hono {
       return c.json({
         preview: {
           candidateDigest: track.observedDigest,
-          candidateReference: track.sourceRepositoryAuthored
-            ? `${track.sourceRepositoryAuthored}@${track.observedDigest}`
-            : `${track.sourceRepository}:${track.observedDigest}`,
+          candidateReference:
+            resource.kind === 'service_application'
+              ? composeDigestReference(track.sourceRepositoryAuthored, track.observedDigest)
+              : applicationDigestReference(
+                  track.sourceRegistry,
+                  track.sourceRepository,
+                  track.observedDigest,
+                ),
           observedAt: iso(track.observedAt),
           referenceKind: track.observedReferenceKind,
           previewToken: token,
           impact,
         },
       });
+    } catch (err) {
+      return errorResponse(c, err);
+    }
+  });
+
+  // --- tracking recovery: adopt preview / confirm / reset -------------------------
+
+  /**
+   * Adopt preview: read-only live snapshot + channel resolution + upstream
+   * digest for the new channel; issues a short-lived adopt token.
+   */
+  api.post('/api/resources/:id/adopt-preview', async (c) => {
+    try {
+      if (!originOk(c, deps.cfg.publicOrigin))
+        throw new ApiRequestError(errorCodes.validation, 'Cross-origin write rejected', 403);
+      const id = resourceIdParam(c);
+      const body = await c.req.json().catch(() => ({}));
+      const input = adoptPreviewRequestSchema.parse(body ?? {});
+      const preview = await deps.tracking.adoptPreview(id, input.sourceTag ?? null);
+      return c.json({ preview });
+    } catch (err) {
+      return errorResponse(c, err);
+    }
+  });
+
+  /** Adopt confirm: consume the token, flip tracking state, create one task. */
+  api.post('/api/resources/:id/adopt', async (c) => {
+    try {
+      if (!originOk(c, deps.cfg.publicOrigin))
+        throw new ApiRequestError(errorCodes.validation, 'Cross-origin write rejected', 403);
+      const id = resourceIdParam(c);
+      const input = adoptConfirmRequestSchema.parse(await c.req.json());
+      const result = await deps.tracking.adoptConfirm(id, input.previewToken);
+      deps.applyResourceSchedules?.();
+      const label = resourceLabel(db, id);
+      const kind = resourceKind(db, id);
+      return c.json({
+        status: result.status,
+        message: result.message,
+        job: result.job != null ? jobToDTO(result.job as UpdateJobRow, label, kind) : null,
+        resource: result.resource, // tracking service owns the DTO mapping
+      });
+    } catch (err) {
+      return errorResponse(c, err);
+    }
+  });
+
+  /** Reset tracking and ignore: local-only ledger clear + policy flip. */
+  api.post('/api/resources/:id/reset-tracking', async (c) => {
+    try {
+      if (!originOk(c, deps.cfg.publicOrigin))
+        throw new ApiRequestError(errorCodes.validation, 'Cross-origin write rejected', 403);
+      const id = resourceIdParam(c);
+      const result = deps.tracking.resetTracking(id);
+      deps.applyResourceSchedules?.();
+      return c.json(result);
     } catch (err) {
       return errorResponse(c, err);
     }
@@ -579,7 +842,20 @@ export function createApi(deps: Deps): Hono {
           return c.json({ skipped: true, message: '无更新' });
         }
         candidateDigest = track.observedDigest;
-        previewToken = jobs.issuePreviewToken(id, track.observedDigest);
+        const skipRef =
+          resource.kind === 'service_application'
+            ? composeDigestReference(track.sourceRepositoryAuthored, track.observedDigest)
+            : applicationDigestReference(
+                track.sourceRegistry,
+                track.sourceRepository,
+                track.observedDigest,
+              );
+        previewToken = jobs.issuePreviewToken(
+          id,
+          track.observedDigest,
+          track.trackingRevision,
+          skipRef,
+        );
       }
       if (candidateDigest == null || previewToken == null) {
         throw new ApiRequestError(errorCodes.validation, 'Invalid update request', 400);

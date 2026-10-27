@@ -156,9 +156,26 @@ describe('api', () => {
   });
 
   // 用例走真实 registry 网络调用，满载并行下可能变慢：显式放宽超时避免偶发抖动。
-  it('targeted check accepts resourceIds and rejects invalid bodies', {
-    timeout: 40_000,
-  }, async () => {
+  it('targeted check accepts resourceIds and rejects invalid bodies', async () => {
+    // 用受控 resolver 替换真实网络（旧行为依赖外网时序，满载下会超时抖动）。
+    const { UpdateChecker } = await import('../src/server/modules/updates/checker.js');
+    const { Outbox } = await import('../src/server/modules/notifications/outbox.js');
+    deps.checker = new UpdateChecker(
+      h.db,
+      deps.cfg,
+      deps.settings,
+      new Outbox(h.db, () => null),
+      deps.jobs,
+      () =>
+        Promise.resolve({
+          digest: D_B,
+          referenceKind: 'index' as const,
+          platformManifestDigest: D_B,
+          observedAt: Date.now(),
+          manifestContentType: null,
+        }),
+      null,
+    );
     const app = createApp(deps);
     const track = h.db.select().from(imageTracks).get();
     expect(track).toBeTruthy();

@@ -253,3 +253,57 @@ export interface ApiError {
     details?: unknown;
   };
 }
+
+// --- tracking recovery (adopt / save-recovery / reset) -----------------------------
+
+/** Where the adopt preview found the channel for the new tracking source. */
+export type AdoptChannelSource = 'live' | 'user_tag';
+
+/** Impact scope of an adopt-confirm, mirroring the update preview shape. */
+export interface AdoptImpact {
+  kind: 'application' | 'compose_child';
+  parentName: string | null;
+  note: string;
+}
+
+/** Adopt preview response: read-only plan plus a short-lived token. */
+export interface AdoptPreviewDTO {
+  /** Live full reference currently configured in Coolify (as of the preview). */
+  liveReference: string;
+  /** Current confirmed baseline before adoption. */
+  configuredReference: string | null;
+  configuredDigest: string | null;
+  /** Channel the new tracking will use. */
+  channel: {
+    source: AdoptChannelSource;
+    registry: string;
+    repository: string;
+    repositoryAuthored: string;
+    tag: string;
+  };
+  /** Complete target reference the next update will write. */
+  targetReference: string;
+  targetDigest: string;
+  referenceKind: ReferenceKind;
+  /** Upstream resolution time of the preview (ISO). */
+  resolvedAt: string;
+  /** Platform the preview resolved against. */
+  platform: string | null;
+  impact: AdoptImpact;
+  previewToken: string;
+}
+
+/** Adopt confirm result: adopted with a task, or a no-op with explanation. */
+export interface AdoptResultDTO {
+  status: 'adopted' | 'skipped';
+  message: string;
+  /** Created task (server row shape); null on skip. The API layer maps JobDTO. */
+  job: Record<string, unknown> | null;
+  resource: unknown;
+}
+
+/** Reset-tracking result: always ignores; ledger cleared, config untouched. */
+export interface ResetTrackingDTO {
+  resource: ResourceDTO;
+  message: string;
+}

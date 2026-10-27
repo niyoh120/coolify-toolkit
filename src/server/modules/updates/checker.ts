@@ -25,6 +25,10 @@ import type { JobsService } from './jobs.js';
 const CHECK_CONCURRENCY = 4;
 const CHECK_RETRIES = 2;
 const RETRY_BASE_DELAY_MS = 2_000;
+/** Wall-clock budget for the resolve loop: connection-refused cases retry on
+ *  connection errors whose open timeout (10s each) would otherwise exceed the
+ *  API contract; bounded retries keep checkResource responsive. */
+const RESOLVE_BUDGET_MS = 30_000;
 
 export interface CheckResult {
   resourceId: number;
@@ -188,6 +192,10 @@ export class UpdateChecker {
     }
 
     // Resolve with limited retry; Retry-After respected when present.
+    // Capture the channel revision BEFORE the network call: any adopt/reset/
+    // source edit during the request invalidates this observation.
+    const revisionAtStart = track.trackingRevision;
+    const resolveDeadline = Date.now() + RESOLVE_BUDGET_MS;
     let resolved: Awaited<ReturnType<typeof resolveTagDigestCoalesced>> | null = null;
     let lastError: string | null = null;
     for (let attempt = 0; attempt <= CHECK_RETRIES; attempt++) {
@@ -211,6 +219,12 @@ export class UpdateChecker {
             err.normalized.retryAfterSeconds != null
               ? err.normalized.retryAfterSeconds * 1000
               : RETRY_BASE_DELAY_MS * (attempt + 1);
+          // Budget guard: a third 10s open timeout must not exceed the check
+          // contract (prevents API-level test/handler timeouts).
+          if (Date.now() + delay >= resolveDeadline) {
+            lastError = lastError ?? 'registry resolve budget exhausted';
+            break;
+          }
           await new Promise((r) => setTimeout(r, delay));
           continue;
         }
@@ -219,32 +233,62 @@ export class UpdateChecker {
       }
     }
 
-    const now = Date.now();
-    // Best-effort upstream tag push time. Docker Hub 公开元数据；GHCR 需要可选
-    // 的 GITHUB_TOKEN；其余来源或未配置时保持未知。
+    // Best-effort upstream tag push time BEFORE any local write (F9): all
+    // network work finishes first, then one guard + one atomic apply follows.
+    let pushedAt: number | null = null;
     if (this.tagTime != null) {
       try {
         const githubToken = this.cfg.githubToken;
         const ghcr = track.sourceRegistry === 'ghcr.io' && githubToken != null;
-        const pushedAt = ghcr
+        pushedAt = ghcr
           ? await ghcrTagUpdatedAt(githubToken, track.sourceRepository, track.sourceTag)
           : await this.tagTime(track.sourceRegistry, track.sourceRepository, track.sourceTag);
-        if (pushedAt != null) {
-          this.db
-            .update(imageTracks)
-            .set({ upstreamTagUpdatedAt: pushedAt, updatedAt: now })
-            .where(eq(imageTracks.id, track.id))
-            .run();
-        }
       } catch {
-        // Metadata lookup is advisory only.
+        pushedAt = null; // Metadata lookup is advisory only.
       }
     }
+
+    // Version + eligibility guard AFTER all network waits (F9): reset/adopt/
+    // ignore-flip during the requests invalidates the whole result — no
+    // observation, error, tag time, notification or job may land.
+    const trackNow =
+      this.db.select().from(imageTracks).where(eq(imageTracks.resourceId, resourceId)).get() ??
+      null;
+    const resourceNow =
+      this.db.select().from(resources).where(eq(resources.id, resourceId)).get() ?? null;
+    const stillEligible =
+      resourceNow != null &&
+      resourceNow.status === 'active' &&
+      resourceNow.policy !== 'ignore' &&
+      resourceNow.policy === resource.policy && // R4-F8: policy flips invalidate
+      resourceNow.blockedReason !== 'external_change' &&
+      // R4-F8: management gate re-check (exclusion/image issues/pending sync).
+      effectiveManagementGate(
+        resourceNow,
+        parentRowOf(this.db, resourceNow),
+        resourceNow.currentImage,
+      ).ok &&
+      trackNow != null &&
+      trackNow.trackingRevision === revisionAtStart &&
+      trackNow.sourceRegistry === track.sourceRegistry &&
+      trackNow.sourceRepository === track.sourceRepository &&
+      trackNow.sourceTag === track.sourceTag &&
+      trackNow.targetPlatform === track.targetPlatform;
+    if (!stillEligible) {
+      return {
+        resourceId,
+        outcome: 'blocked',
+        observedDigest: null,
+        candidate: false,
+        message: '追踪配置在检查期间变化；本次结果已丢弃，请重新检查',
+      };
+    }
+    const now = Date.now();
     if (resolved == null) {
       this.db
         .update(imageTracks)
         .set({ observedError: lastError, updatedAt: now })
-        .where(eq(imageTracks.id, track.id))
+        .where(eq(imageTracks.id, trackNow.id))
         .run();
       return {
         resourceId,
@@ -255,7 +299,7 @@ export class UpdateChecker {
       };
     }
 
-    const priorObserved = track.observedDigest;
+    const priorObserved = trackNow.observedDigest;
     this.db
       .update(imageTracks)
       .set({
@@ -264,12 +308,14 @@ export class UpdateChecker {
         observedReferenceKind: resolved.referenceKind,
         platformManifestDigest: resolved.platformManifestDigest,
         observedError: null,
+        // Advisory tag push time applied atomically with the observation.
+        ...(pushedAt != null ? { upstreamTagUpdatedAt: pushedAt } : {}),
         updatedAt: now,
       })
-      .where(eq(imageTracks.id, track.id))
+      .where(eq(imageTracks.id, trackNow.id))
       .run();
 
-    const configured = track.configuredDigest;
+    const configured = trackNow.configuredDigest;
     if (configured == null) {
       // 未接管：任何一次检查（定时/手动）都自动初始化（首次固定摘要），
       // 所有非 ignore 策略生效；守卫（全局暂停/停止/阻塞/在途任务）在 JobsService。

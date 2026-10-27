@@ -1668,6 +1668,7 @@ async function main() {
     await scenarioPolicy(baseUrl);
     await scenarioPersistence(baseUrl);
     await scenarioRecovery(recoveryServer.url);
+    await scenarioTrackingRecovery(recoveryServer.url);
 
     const unknownHits = [...fixture.unknownHits, ...recoveryFixture.unknownHits];
     if (unknownHits.length > 0) {
@@ -1724,6 +1725,228 @@ main().catch((err) => {
   console.error('环境阻塞：', err);
   process.exit(2);
 });
+
+/** 追踪恢复闭环：采纳预览/确认、重置弹窗、忽略下资格停用与提示（浏览器断言）。 */
+async function scenarioTrackingRecovery(baseUrl) {
+  const group = 'G 追踪恢复';
+  await setViewport(1024, HEIGHT);
+
+  // 目标：edge-external-change（有 track、external_change 阻塞）。
+  let extId;
+  try {
+    const apps = await (await fetch(`${baseUrl}/api/resources`)).json();
+    const ext = apps.resources.find((r) => r.name === 'edge-external-change');
+    extId = String(ext.id);
+  } catch {
+    check(group, 'fixture 数据可用', false);
+    return;
+  }
+
+  // 1) 详情页出现「恢复管理」卡片与两个入口。
+  await goto(baseUrl, `#/resources/${extId}`);
+  // 卡片渲染 + 首个 eval 都可能碰到 daemon 抖动：统一走 waitFor 的重试轮询。
+  const card = await waitFor(
+    `(() => {
+    const buttons = [...document.querySelectorAll('button')];
+    const adopt = buttons.find((b) => b.textContent.includes('采纳当前镜像并更新'));
+    const reset = buttons.find((b) => b.textContent.includes('重置追踪并忽略'));
+    if (adopt == null || reset == null) return null;
+    return {
+      adopt: { disabled: adopt.disabled },
+      reset: { disabled: reset.disabled },
+      externalHint: document.body.textContent.includes('检测到 Coolify 中的镜像引用被外部修改'),
+      baselineShown: document.body.textContent.includes('已记录配置基线'),
+    };
+  })()`,
+    { label: 'recovery card', timeoutMs: 10000 },
+  );
+  check(
+    group,
+    '恢复卡片提供采纳与重置入口，外部修改提示与基线展示可见',
+    card.adopt != null && card.reset != null && card.externalHint && card.baselineShown,
+    card,
+  );
+
+  // 2) tag 输入：填写 tag 后预览的渠道使用该 tag（fixture 回显 sourceTag）。
+  //    放在 reset 之前：reset 后策略=忽略会停用采纳入口。
+  await waitFor(
+    `(() => { const i = document.querySelector('input[id="adopt-source-tag"]'); return i != null && !i.disabled ? { ready: true } : null; })()`,
+    { label: 'adopt tag input ready', timeoutMs: 10000 },
+  );
+  await typeIntoId('adopt-source-tag', 'stable');
+  await clickInPage(
+    "[...document.querySelectorAll('button')].find((b) => b.textContent.includes('采纳当前镜像并更新'))",
+    'adopt preview with tag',
+  );
+  const tagged = await waitFor(
+    `(() => {
+      const t = document.body.textContent;
+      if (!t.includes('确认采纳')) return null;
+      return { channelHasTag: t.includes(':stable'), userTagMark: t.includes('你填写的 tag') };
+    })()`,
+    { label: 'adopt preview with tag', timeoutMs: 8000 },
+  );
+  check(
+    group,
+    '采纳预览尊重填写的 tag（渠道显示 stable 并标注来源）',
+    tagged.channelHasTag && tagged.userTagMark,
+    tagged,
+  );
+  await clickInPage(
+    "[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '取消')",
+    'cancel tagged adopt',
+  );
+
+  // 3) 错误恢复：fixture 强制预览失败 → 错误框出现；重试成功可进入确认。
+  await setAdoptControl(baseUrl, { forceError: true });
+  await clickInPage(
+    "[...document.querySelectorAll('button')].find((b) => b.textContent.includes('采纳当前镜像并更新'))",
+    'adopt preview forced failure',
+  );
+  await waitFor(`document.body.textContent.includes('fixture 强制失败的采纳预览')`, {
+    label: 'adopt error box',
+    timeoutMs: 8000,
+  });
+  const errState = await evalJson(
+    `(() => ({ noConfirm: ![...document.querySelectorAll('button')].some((b) => b.textContent.trim() === '确认采纳') }))()`,
+  );
+  check(group, '采纳预览失败显示明确错误且无确认框', errState.noConfirm === true, errState);
+  await setAdoptControl(baseUrl, { forceError: false });
+  await clickInPage(
+    "[...document.querySelectorAll('button')].find((b) => b.textContent.includes('采纳当前镜像并更新'))",
+    'adopt preview retry after failure',
+  );
+  await waitFor(`document.body.textContent.includes('确认采纳')`, {
+    label: 'adopt preview recovered',
+    timeoutMs: 8000,
+  });
+  check(group, '错误恢复后重试可进入确认框', true);
+  await clickInPage(
+    "[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === '取消')",
+    'cancel recovered adopt',
+  );
+
+  // 4) 提交 pending：确认期间按钮禁用（fixture 延迟 adopt 响应）。
+  await setAdoptControl(baseUrl, { confirmDelayMs: 800 });
+  await clickInPage(
+    "[...document.querySelectorAll('button')].find((b) => b.textContent.includes('采纳当前镜像并更新'))",
+    'adopt preview for pending check',
+  );
+  await waitFor(`document.body.textContent.includes('确认采纳')`, {
+    label: 'adopt preview for pending',
+    timeoutMs: 8000,
+  });
+  await clickInPage(
+    "[...document.querySelectorAll('button')].find((b) => b.textContent.includes('确认采纳'))",
+    'confirm adopt (delayed)',
+  );
+  const pendingState = await waitFor(
+    `(() => {
+      const b = [...document.querySelectorAll('button')].find((x) => x.textContent.includes('提交中') || (x.textContent.trim() === '确认采纳' && x.disabled));
+      return b != null ? { text: b.textContent.trim(), disabled: b.disabled } : null;
+    })()`,
+    { label: 'adopt submit pending state', timeoutMs: 5000 },
+  );
+  check(
+    group,
+    '采纳确认提交期间按钮进入提交中禁用态',
+    pendingState?.disabled === true,
+    pendingState,
+  );
+  await waitFor(`document.body.textContent.includes('已采纳')`, {
+    label: 'delayed adopt success',
+    timeoutMs: 15000,
+  });
+  check(group, '延迟采纳响应后反馈正常出现', true);
+  await setAdoptControl(baseUrl, { confirmDelayMs: 0 });
+
+  // 5) 采纳生效：阻塞提示条消失（详情 10s 轮询刷新后）。
+  const cleared = await waitFor(
+    `document.body.textContent.includes('检测到 Coolify 中的镜像引用被外部修改') ? null : { hintGone: true }`,
+    { label: 'external-change banner cleared after adopt', timeoutMs: 15000 },
+  );
+  check(group, '确认采纳后外部修改提示消失', cleared?.hintGone === true, cleared);
+
+  // 6) 重置：弹窗说明 + 确认 → 忽略提示出现，采纳停用并解释前置条件。
+  await clickInPage(
+    "[...document.querySelectorAll('button')].find((b) => b.textContent.includes('重置追踪并忽略'))",
+    'reset button',
+  );
+  await waitFor(`document.querySelector('[role="dialog"]') != null`, { label: 'reset modal open' });
+  const modal = await evalJson(`(() => {
+    const dlg = document.querySelector('[role="dialog"]');
+    const t = dlg?.textContent ?? '';
+    return {
+      title: t.includes('重置追踪并忽略'),
+      effects: t.includes('清空追踪账本') && t.includes('保留 Coolify 配置与任务历史'),
+      confirm: [...(dlg?.querySelectorAll('button') ?? [])].some((b) => b.textContent.includes('确认重置')),
+    };
+  })()`);
+  check(
+    group,
+    '重置弹窗列出效果并保留确认/取消',
+    modal.title && modal.effects && modal.confirm,
+    modal,
+  );
+  await clickInPage(
+    "[...document.querySelectorAll('button')].find((b) => b.textContent.includes('确认重置'))",
+    'confirm reset',
+  );
+  await waitFor(`document.body.textContent.includes('已重置追踪并忽略')`, {
+    label: 'reset feedback',
+    timeoutMs: 8000,
+  });
+  // 同样等待轮询刷新：忽略策略与 unfixed 暂停文案需要新数据渲染。
+  const resetState = await waitFor(
+    `(() => {
+      const adoptBtn = [...document.querySelectorAll('button')].find((b) => b.textContent.includes('采纳当前镜像并更新'));
+      if (adoptBtn == null) return null;
+      const hint = document.body.textContent.includes('先选择管理策略，再采纳当前镜像');
+      const paused = document.body.textContent.includes('已忽略：检查与自动初始化暂停');
+      if (!adoptBtn.disabled || !hint || !paused) return null;
+      return { adoptDisabled: adoptBtn.disabled, adoptHint: hint, unfixedPaused: paused };
+    })()`,
+    { label: 'post-reset state', timeoutMs: 15000 },
+  );
+  check(
+    group,
+    '重置后：采纳停用并解释前置条件，忽略下 unfixed 显示暂停文案',
+    resetState?.adoptDisabled === true && resetState.adoptHint && resetState.unfixedPaused,
+    resetState,
+  );
+  await ab(['screenshot', path.join(shotsDir, 'tracking-recovery-reset.png')]);
+
+  // 7) 320px 窄屏：恢复卡片按钮可换行且页面无横向溢出。
+  await setViewport(320, 568);
+  await sleep(300);
+  const narrow = await evalJson(`(() => ({
+    overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+  }))()`);
+  check(group, '320px 下恢复管理卡片无横向溢出', narrow.overflow === false, narrow);
+  await setViewport(1024, HEIGHT);
+}
+
+/** React 兼容输入：按 id 定位（无 aria-label 的输入框）。 */
+async function typeIntoId(id, value) {
+  const ok = await evalJson(`(() => {
+    const input = document.getElementById('${id}');
+    if (input == null) return false;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(input, '${value}');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  })()`);
+  if (ok !== true) throw new Error(`input not found: #${id}`);
+}
+
+/** Fixture helper: adopt-preview forceError + adopt confirmDelayMs（仅测试控制）。 */
+async function setAdoptControl(baseUrl, control) {
+  await fetch(`${baseUrl}/api/__fixture/adopt-control`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(control),
+  });
+}
 
 /** 管理状态三档视图：待同步提示、已排除只读、受管范围（升级过渡验收）。 */
 async function scenarioManagementViews(baseUrl) {

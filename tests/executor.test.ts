@@ -178,9 +178,16 @@ async function resourceId(): Promise<number> {
 
 async function createJobFor(digest: string): Promise<number> {
   const id = await resourceId();
-  const token = jobs.issuePreviewToken(id, digest);
-  const job = jobs.createManualJob(id, digest, token);
-  return job.id;
+  return createManualJob(id, digest).then((j) => j.id);
+}
+
+async function createManualJob(
+  id: number,
+  digest: string,
+): Promise<import('../src/server/db/schema.js').UpdateJobRow> {
+  const track = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get();
+  const token = jobs.issuePreviewToken(id, digest, track?.trackingRevision ?? 0);
+  return jobs.createManualJob(id, digest, token);
 }
 
 describe('application executor', () => {
@@ -257,7 +264,10 @@ describe('application executor', () => {
     const track = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get();
     expect(track?.configuredDigest).toBe(D_B); // target written before submit
     // Re-submission of the same candidate is refused.
-    const token = jobs.issuePreviewToken(id, D_B);
+    const token = (() => {
+      const t = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, id)).get();
+      return jobs.issuePreviewToken(id, D_B, t?.trackingRevision ?? 0);
+    })();
     expect(() => jobs.createManualJob(id, D_B, token)).toThrow(/unknown/i);
     expect(
       h.db
@@ -495,7 +505,10 @@ describe('compose child executor', () => {
     const stub = new StubCompose();
     const exec = composeExecutor(stub);
     const childId = await seedCompose();
-    const token = jobs.issuePreviewToken(childId, D_B);
+    const token = (() => {
+      const t = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, childId)).get();
+      return jobs.issuePreviewToken(childId, D_B, t?.trackingRevision ?? 0);
+    })();
     const job = jobs.createManualJob(childId, D_B, token);
     await exec.processQueue();
     const after = h.db.select().from(updateJobs).where(eq(updateJobs.id, job.id)).get();
@@ -542,7 +555,10 @@ describe('compose child executor', () => {
     stub.children[1]!.image = 'postgres:17'; // sibling edited in Coolify
     const exec = composeExecutor(stub);
     const childId = await seedCompose();
-    const token = jobs.issuePreviewToken(childId, D_B);
+    const token = (() => {
+      const t = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, childId)).get();
+      return jobs.issuePreviewToken(childId, D_B, t?.trackingRevision ?? 0);
+    })();
     const job = jobs.createManualJob(childId, D_B, token);
     await exec.processQueue();
     const after = h.db.select().from(updateJobs).where(eq(updateJobs.id, job.id)).get();
@@ -553,7 +569,10 @@ describe('compose child executor', () => {
   it('blocks manual updates on ignored resources', async () => {
     const childId = await seedCompose();
     h.db.update(resources).set({ policy: 'ignore' }).where(eq(resources.id, childId)).run();
-    const token = jobs.issuePreviewToken(childId, D_B);
+    const token = (() => {
+      const t = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, childId)).get();
+      return jobs.issuePreviewToken(childId, D_B, t?.trackingRevision ?? 0);
+    })();
     expect(() => jobs.createManualJob(childId, D_B, token)).toThrow(/ignored/i);
   });
 });
@@ -600,7 +619,8 @@ describe('review round 1 regressions', () => {
         updatedAt: now,
       })
       .run();
-    const token = jobs.issuePreviewToken(resB.id, D_B);
+    const trackB = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, resB.id)).get();
+    const token = jobs.issuePreviewToken(resB.id, D_B, trackB?.trackingRevision ?? 0);
     const jobB = jobs.createManualJob(resB.id, D_B, token);
 
     await executor.processQueue(); // concurrency 1, A holds an awaiting job only
@@ -775,7 +795,10 @@ describe('queue safety across the upgrade transition', () => {
   it('refuses new manual jobs and retries for ineligible resources (zero side effects)', async () => {
     const exId = seedApp({ uuid: 'q-guard', excludedInfra: true });
     trackFor(exId);
-    const token = jobs.issuePreviewToken(exId, D_B);
+    const token = (() => {
+      const t = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, exId)).get();
+      return jobs.issuePreviewToken(exId, D_B, t?.trackingRevision ?? 0);
+    })();
     expect(() => jobs.createManualJob(exId, D_B, token)).toThrow(/已排除/);
     // 建一条终态任务再重试：资格不满足时原任务保持原值。
     const j = rawPendingJob(exId, D_B, 'q:guard');
@@ -872,7 +895,10 @@ describe('compose delayed auto-check', () => {
     suffix = '',
   ): Promise<{ jobId: number; childId: number }> {
     const childId = await seedCompose(suffix);
-    const token = jobs.issuePreviewToken(childId, D_B);
+    const token = (() => {
+      const t = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, childId)).get();
+      return jobs.issuePreviewToken(childId, D_B, t?.trackingRevision ?? 0);
+    })();
     const job = jobs.createManualJob(childId, D_B, token);
     await exec.processQueue();
     const row = jobRow(job.id);
@@ -924,7 +950,10 @@ describe('compose delayed auto-check', () => {
     expect(success[0]?.dedupeKey).toBe(`update_success:${jobId}`);
 
     // Parent mutex released: a sibling job for the same parent can now run.
-    const token2 = jobs.issuePreviewToken(childId, D_C);
+    const token2 = (() => {
+      const t = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, childId)).get();
+      return jobs.issuePreviewToken(childId, D_C, t?.trackingRevision ?? 0);
+    })();
     const job2 = jobs.createManualJob(childId, D_C, token2);
     await exec.processQueue();
     expect(jobRow(job2.id).status).toBe('running');
@@ -1158,10 +1187,16 @@ describe('compose delayed auto-check', () => {
 
     // Same-digest resubmission falls through to the normal failed-job rules
     // instead of being blocked forever as "in flight".
-    const token = jobs.issuePreviewToken(childId, D_B);
+    const token = (() => {
+      const t = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, childId)).get();
+      return jobs.issuePreviewToken(childId, D_B, t?.trackingRevision ?? 0);
+    })();
     expect(jobs.createManualJob(childId, D_B, token).status).toBe('pending');
     // The resource is now genuinely busy: a second manual job is refused.
-    const token2 = jobs.issuePreviewToken(childId, D_C);
+    const token2 = (() => {
+      const t = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, childId)).get();
+      return jobs.issuePreviewToken(childId, D_C, t?.trackingRevision ?? 0);
+    })();
     expect(() => jobs.createManualJob(childId, D_C, token2)).toThrow(/in flight/i);
   });
 
@@ -1194,7 +1229,10 @@ describe('monitoring continuity after auto confirmation', () => {
     // policy auto so scheduled checks create jobs.
     const childId = await seedCompose();
     h.db.update(resources).set({ policy: 'auto' }).where(eq(resources.id, childId)).run();
-    const token = jobs.issuePreviewToken(childId, D_B);
+    const token = (() => {
+      const t = h.db.select().from(imageTracks).where(eq(imageTracks.resourceId, childId)).get();
+      return jobs.issuePreviewToken(childId, D_B, t?.trackingRevision ?? 0);
+    })();
     const job = jobs.createManualJob(childId, D_B, token);
     await exec.processQueue();
     dueNow(job.id);

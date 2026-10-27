@@ -11,6 +11,7 @@ import { Outbox } from './modules/notifications/outbox.js';
 import { UpdateChecker } from './modules/updates/checker.js';
 import { UpdateExecutor } from './modules/updates/executor.js';
 import { JobsService } from './modules/updates/jobs.js';
+import { TrackingService } from './modules/updates/tracking.js';
 
 export interface Deps {
   cfg: AppConfig;
@@ -22,6 +23,7 @@ export interface Deps {
   checker: UpdateChecker;
   jobs: JobsService;
   executor: UpdateExecutor;
+  tracking: TrackingService;
   outbox: Outbox;
   /** Set by the entrypoint after scheduler construction: live cron reload. */
   applySchedule?: () => void;
@@ -50,5 +52,6 @@ export function buildDeps(cfg: AppConfig, db: Db): Deps {
   const sync = new InventorySync(db, coolify, cfg, settings);
   const checker = new UpdateChecker(db, cfg, settings, outbox, jobs, undefined, tagLastPushedAt);
   const executor = new UpdateExecutor(db, coolify, jobs, outbox, settings, cfg);
-  return { cfg, db, coolify, apprise, settings, sync, checker, jobs, executor, outbox };
+  const tracking = new TrackingService({ db, cfg, settings, coolify, jobs });
+  return { cfg, db, coolify, apprise, settings, sync, checker, jobs, executor, tracking, outbox };
 }

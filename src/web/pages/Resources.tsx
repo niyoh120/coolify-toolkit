@@ -21,6 +21,7 @@ import {
 import {
   BlockedBadge,
   CheckBadge,
+  DEPLOY_STATE_LABEL,
   DeployBadge,
   ManagementBadge,
   POLICY_LABEL,
@@ -47,6 +48,9 @@ import { api } from '../lib/api.js';
 import { decodeString, usePersistedState } from '../lib/persisted-state.js';
 import {
   APP_PREF_KEYS,
+  DEPLOY_FILTERS,
+  type DeployFilter,
+  decodeDeployFilter,
   decodeExclusionView,
   decodeExpanded,
   decodePage,
@@ -54,12 +58,14 @@ import {
   decodePolicyFilter,
   decodeServiceFilters,
   decodeStatusFilter,
+  decodeUpdateFilter,
   encodeExpanded,
   encodeJson,
   PAGE_SIZES,
   type PolicyFilter,
   SERVICE_PREF_KEYS,
   type StatusFilter,
+  type UpdateFilter,
 } from '../lib/resource-preferences.js';
 import {
   belongsToView,
@@ -76,6 +82,8 @@ import {
   isConfigReadOnly,
   isPendingSync,
   paginateGroups,
+  passesDeployFilter,
+  passesUpdateFilter,
   policyTone,
   projectGroupsForView,
   type ServiceFilters,
@@ -215,6 +223,18 @@ function ApplicationsView() {
     encode: encodeJson,
     decode: decodeStatusFilter,
   });
+  const [updateFilter, setUpdateFilter] = usePersistedState<UpdateFilter>({
+    key: APP_PREF_KEYS.update,
+    defaultValue: '',
+    encode: encodeJson,
+    decode: decodeUpdateFilter,
+  });
+  const [deployFilter, setDeployFilter] = usePersistedState<DeployFilter>({
+    key: APP_PREF_KEYS.deploy,
+    defaultValue: '',
+    encode: encodeJson,
+    decode: decodeDeployFilter,
+  });
   const [policyFilter, setPolicyFilter] = usePersistedState<PolicyFilter>({
     key: APP_PREF_KEYS.policy,
     defaultValue: '',
@@ -282,6 +302,8 @@ function ApplicationsView() {
       statusFilter === 'all' ? true : statusFilter === 'stopped' ? r.isStopped : !r.isStopped,
     )
     .filter((r) => (policyFilter === '' ? true : r.policy === policyFilter))
+    .filter((r) => passesUpdateFilter(r, updateFilter))
+    .filter((r) => passesDeployFilter(r, deployFilter))
     .filter((r) => (server === '' ? true : r.serverName === server));
   const q = search.trim().toLowerCase();
   const filtered = q
@@ -420,6 +442,35 @@ function ApplicationsView() {
           {POLICY_SELECT_OPTIONS.map((p) => (
             <option key={p} value={p}>
               {POLICY_LABEL[p]}
+            </option>
+          ))}
+        </Select>
+        <Select
+          value={updateFilter}
+          onChange={(e) => {
+            setUpdateFilter(e.target.value as UpdateFilter);
+            setPage(1);
+            clearSelection();
+          }}
+          aria-label="按候选更新筛选"
+        >
+          <option value="">全部更新状态</option>
+          <option value="update">有更新</option>
+          <option value="none">无更新</option>
+        </Select>
+        <Select
+          value={deployFilter}
+          onChange={(e) => {
+            setDeployFilter(e.target.value as DeployFilter);
+            setPage(1);
+            clearSelection();
+          }}
+          aria-label="按部署状态筛选"
+        >
+          <option value="">全部部署状态</option>
+          {DEPLOY_FILTERS.filter((v) => v !== '').map((state) => (
+            <option key={state} value={state}>
+              {DEPLOY_STATE_LABEL[state]}
             </option>
           ))}
         </Select>
@@ -955,6 +1006,35 @@ function ServicesView() {
           {POLICY_SELECT_OPTIONS.map((p) => (
             <option key={p} value={p}>
               {POLICY_LABEL[p]}
+            </option>
+          ))}
+        </Select>
+        <Select
+          value={filters.update}
+          onChange={(e) => {
+            setFilters((f) => ({ ...f, update: e.target.value as UpdateFilter }));
+            setPage(1);
+            clearSelection();
+          }}
+          aria-label="按子容器候选更新筛选"
+        >
+          <option value="">全部更新状态</option>
+          <option value="update">有更新</option>
+          <option value="none">无更新</option>
+        </Select>
+        <Select
+          value={filters.deploy}
+          onChange={(e) => {
+            setFilters((f) => ({ ...f, deploy: e.target.value as DeployFilter }));
+            setPage(1);
+            clearSelection();
+          }}
+          aria-label="按子容器部署状态筛选"
+        >
+          <option value="">全部部署状态</option>
+          {DEPLOY_FILTERS.filter((v) => v !== '').map((state) => (
+            <option key={state} value={state}>
+              {DEPLOY_STATE_LABEL[state]}
             </option>
           ))}
         </Select>

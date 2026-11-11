@@ -24,6 +24,24 @@ export type StatusFilter = (typeof STATUS_FILTERS)[number];
 /** Update-policy filter tiers (applications and service children); '' = all. */
 export type PolicyFilter = (typeof POLICY_VALUES)[number];
 
+/**
+ * 候选更新筛选项：'' = 全部；'update' = 有候选更新；'none' = 无候选更新
+ * （该档同时排除已排除与已忽略策略的资源，语义见 resource-view.ts）。
+ */
+export const UPDATE_FILTERS = ['', 'update', 'none'] as const;
+export type UpdateFilter = (typeof UPDATE_FILTERS)[number];
+
+/** 部署状态筛选项：'' = 全部，其余为 TrackView.deployState 各状态。 */
+export const DEPLOY_FILTERS = [
+  '',
+  'unknown',
+  'deploying',
+  'success',
+  'failed',
+  'pending_confirmation',
+] as const;
+export type DeployFilter = (typeof DEPLOY_FILTERS)[number];
+
 const EXCLUSION_VIEWS = ['unexcluded', 'managed', 'excluded'] as const;
 const LEGACY_MANAGED = ['all', 'managed'] as const;
 const POLICY_VALUES = ['', 'ignore', 'notify', 'manual', 'auto'] as const;
@@ -35,6 +53,8 @@ export const APP_PREF_KEYS = {
   view: 'resources.applications.view.v1',
   status: 'resources.applications.status.v1',
   policy: 'resources.applications.policy.v1',
+  update: 'resources.applications.update.v1',
+  deploy: 'resources.applications.deploy.v1',
   server: 'resources.applications.server.v1',
   pageSize: 'resources.applications.pageSize.v1',
   page: 'resources.applications.page.v1',
@@ -78,6 +98,14 @@ export function decodePolicyFilter(raw: unknown): PolicyFilter | null {
   return decodeEnum(raw, POLICY_VALUES);
 }
 
+export function decodeUpdateFilter(raw: unknown): UpdateFilter | null {
+  return decodeEnum(raw, UPDATE_FILTERS);
+}
+
+export function decodeDeployFilter(raw: unknown): DeployFilter | null {
+  return decodeEnum(raw, DEPLOY_FILTERS);
+}
+
 export function decodePageSize(raw: unknown): number | null {
   return decodeCount(raw, PAGE_SIZES);
 }
@@ -102,6 +130,8 @@ export function decodeServiceFilters(raw: unknown): ServiceFilters {
   return {
     search: decodeString(obj.search) ?? DEFAULT_SERVICE_FILTERS.search,
     policy: decodeEnum(obj.policy, POLICY_VALUES) ?? DEFAULT_SERVICE_FILTERS.policy,
+    update: decodeEnum(obj.update, UPDATE_FILTERS) ?? DEFAULT_SERVICE_FILTERS.update,
+    deploy: decodeEnum(obj.deploy, DEPLOY_FILTERS) ?? DEFAULT_SERVICE_FILTERS.deploy,
     managed: decodeEnum(obj.managed, LEGACY_MANAGED) ?? DEFAULT_SERVICE_FILTERS.managed,
     status: decodeEnum(obj.status, STATUS_FILTERS) ?? DEFAULT_SERVICE_FILTERS.status,
     server: decodeString(obj.server) ?? DEFAULT_SERVICE_FILTERS.server,

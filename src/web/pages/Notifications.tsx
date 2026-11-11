@@ -22,6 +22,7 @@ import { useRefresh } from '../main.js';
 
 const EVENT_LABEL: Record<string, string> = {
   candidate_found: '发现候选',
+  auto_blocked: '自动更新被阻止',
   upstream_changed: '上游变化',
   update_success: '更新完成',
   update_failed: '更新失败',

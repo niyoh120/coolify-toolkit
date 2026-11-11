@@ -165,6 +165,7 @@ function typeFor(eventType: NotificationEventType): AppriseMessageType {
     case 'update_failed':
       return 'failure';
     case 'submit_unknown':
+    case 'auto_blocked':
       return 'warning';
     case 'candidate_found':
     case 'upstream_changed':

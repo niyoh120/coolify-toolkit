@@ -105,7 +105,7 @@
 - Apprise 用持久配置模式：环境变量 `APPRISE_API_URL` + `APPRISE_CONFIG_KEY`（可选 `APPRISE_TAG`）。
 - **`APPRISE_TAG` 何时必填**：apprise-api v2.0.0 的「公开/已锁定」访问模式拒绝无 tag 的有状态通知（HTTP 400），此时必须设置；「用户」模式或渠道全部未打标签时可省略。未设置时启动日志会给出提示。
 - **非公开模式的认证**：「已锁定/用户」模式需要 HTTP Basic 凭据，配置 `APPRISE_PASSWORD`（服务端 `APPRISE_PASSWORD` 创建，`APPRISE_USER` 可选）后 toolkit 自动携带 `Authorization` 头；「公开」模式留空即可。凭据仅存服务端，设置页只显示"已配置认证"状态。
-- 去重身份：事件类型 + 资源 + 候选摘要。重复检查不会重复入队。
+- 去重身份：事件类型 + 资源 + 候选摘要（`auto_blocked` 另含守卫原因）。重复检查不会重复入队。
 - 重试：至多 3 次，指数退避，429 遵循 Retry-After；404/401/403 标记 paused 并在 UI 显示原因；至少一次语义，超时重试可能重复通知。
 - Apprise 未配置时队列照常入队，配置后自动补发（或在通知页手动补发）。
 

@@ -247,9 +247,45 @@ describe('checker policy rules', () => {
     const jobsRows = handle.db.select().from(updateJobs).all();
     expect(jobsRows).toHaveLength(1);
     expect(jobsRows[0]).toMatchObject({ trigger: 'auto', candidateDigest: D1 });
+    // 任务已接管候选，部署完成另有 update_success；候选通知是噪音。
+    expect(handle.db.select().from(notificationOutbox).all()).toHaveLength(0);
     // Repeat scan: no duplicate job.
     await checker.checkResource(id, 'scheduled');
     expect(handle.db.select().from(updateJobs).all()).toHaveLength(1);
+  });
+
+  it('auto policy never enqueues the candidate notification (manual check)', async () => {
+    const id = await seed({ policy: 'auto', configuredDigest: D2 });
+    resolveValue = D1;
+    const r = await checker.checkResource(id, 'manual');
+    expect(r.outcome).toBe('candidate');
+    expect(handle.db.select().from(updateJobs).all()).toHaveLength(0);
+    expect(handle.db.select().from(notificationOutbox).all()).toHaveLength(0);
+  });
+
+  it('enqueues auto_blocked when the scheduled auto job is guarded', async () => {
+    const id = await seed({ policy: 'auto', configuredDigest: D2, stopped: true });
+    resolveValue = D1;
+    const r = await checker.checkResource(id, 'scheduled');
+    expect(r.outcome).toBe('candidate');
+    expect(handle.db.select().from(updateJobs).all()).toHaveLength(0);
+    const boxes = handle.db.select().from(notificationOutbox).all();
+    expect(boxes).toHaveLength(1);
+    expect(boxes[0]).toMatchObject({
+      eventType: 'auto_blocked',
+      dedupeKey: `auto_blocked:${id}:${D1}:stopped`,
+    });
+    // Repeat scan: same digest + same guard reason dedupes.
+    await checker.checkResource(id, 'scheduled');
+    expect(handle.db.select().from(notificationOutbox).all()).toHaveLength(1);
+
+    // 原因变化时再次提醒（新去重身份）：解除停止后换全局暂停。
+    handle.db.update(resources).set({ isStopped: false }).where(eq(resources.id, id)).run();
+    settings.patch({ globalPaused: true });
+    await checker.checkResource(id, 'scheduled');
+    const after = handle.db.select().from(notificationOutbox).all();
+    expect(after).toHaveLength(2);
+    expect(after[1]?.dedupeKey).toBe(`auto_blocked:${id}:${D1}:global_paused`);
   });
 
   it('skips auto jobs for stopped resources and global pause', async () => {

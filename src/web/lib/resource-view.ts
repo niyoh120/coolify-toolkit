@@ -3,6 +3,7 @@
 // unit-testable against plain ResourceDTO fixtures.
 
 import type { CheckOutcome, Policy, ResourceDTO } from '../../shared/types.js';
+import type { DeployFilter, UpdateFilter } from './resource-preferences.js';
 
 // --- management state (display mirror of the server-side gates) -------------------
 
@@ -223,10 +224,37 @@ export function projectGroupsForView(groups: ServiceGroup[], view: ExclusionView
 
 // --- filtering ------------------------------------------------------------------
 
+/**
+ * 候选更新筛选语义：'update' = 有候选更新；'none' = 无候选更新，且同时排除
+ * 已排除与已忽略策略的资源（这些行本就谈不上更新动作）。track == null 的行
+ * 归入 'none'（无追踪自然无候选更新）。
+ */
+export function passesUpdateFilter(r: ResourceDTO, filter: 'update' | 'none' | ''): boolean {
+  if (filter === '') return true;
+  const hasCandidate = r.track?.view.hasCandidate === true;
+  if (filter === 'update') return hasCandidate;
+  // 'none'：无候选更新，且已排除/已忽略不算「无更新」。
+  if (r.policy === 'ignore' || isConfigExcluded(r)) return false;
+  return !hasCandidate;
+}
+
+/**
+ * 部署状态筛选语义：'' = 全部；track == null（无追踪，无任何部署证据）与
+ * unknown 同档，与表格「部署」列的空白展示一致。
+ */
+export function passesDeployFilter(r: ResourceDTO, filter: DeployFilter): boolean {
+  if (filter === '') return true;
+  return (r.track?.view.deployState ?? 'unknown') === filter;
+}
+
 export interface ServiceFilters {
   search: string;
   /** 子容器策略条件：由服务 Tab「按子容器策略筛选」下拉驱动，单测覆盖过滤行为。 */
   policy: '' | Policy;
+  /** 子容器候选更新条件：'' 全部 / 有更新 / 无更新（不含已排除与已忽略）。 */
+  update: UpdateFilter;
+  /** 子容器部署状态条件：'' 全部，其余为 TrackView.deployState 精确匹配。 */
+  deploy: DeployFilter;
   /** 旧「受管」双轨条件：已被三档视图（ExclusionView.managed）取代，仅为兼容保留。 */
   managed: 'all' | 'managed';
   status: 'all' | 'running' | 'stopped';
@@ -236,19 +264,29 @@ export interface ServiceFilters {
 export const DEFAULT_SERVICE_FILTERS: ServiceFilters = {
   search: '',
   policy: '',
+  update: '',
+  deploy: '',
   managed: 'all',
   status: 'all',
   server: '',
 };
 
-/** Whether any child-scoped condition (policy/managed/status) is active. */
+/** Whether any child-scoped condition (policy/update/deploy/managed/status) is active. */
 function childConditionsActive(f: ServiceFilters): boolean {
-  return f.policy !== '' || f.managed !== 'all' || f.status !== 'all';
+  return (
+    f.policy !== '' ||
+    f.update !== '' ||
+    f.deploy !== '' ||
+    f.managed !== 'all' ||
+    f.status !== 'all'
+  );
 }
 
 function childPassesConditions(r: ResourceDTO, f: ServiceFilters): boolean {
   if (f.policy !== '' && r.policy !== f.policy) return false;
   if (f.managed === 'managed' && r.policy === 'ignore') return false;
+  if (!passesUpdateFilter(r, f.update)) return false;
+  if (!passesDeployFilter(r, f.deploy)) return false;
   if (f.status === 'running' && r.isStopped) return false;
   if (f.status === 'stopped' && !r.isStopped) return false;
   return true;

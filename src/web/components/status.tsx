@@ -31,6 +31,11 @@ const DEPLOY_LABEL: Record<string, { text: string; tone: BadgeTone }> = {
   pending_confirmation: { text: '等待自动检查', tone: 'warning' },
 };
 
+/** 部署状态 → 展示文案；筛选下拉与徽标共用，保证文案一致。 */
+export const DEPLOY_STATE_LABEL: Record<string, string> = Object.fromEntries(
+  Object.entries(DEPLOY_LABEL).map(([state, info]) => [state, info.text]),
+);
+
 const BLOCK_LABEL: Record<Exclude<BlockReason, null>, string> = {
   external_change: '外部修改，需重新确认',
   platform_missing: '目标平台待配置',

@@ -63,6 +63,7 @@ export type JobTrigger = 'manual' | 'auto';
 
 export type NotificationEventType =
   | 'candidate_found'
+  | 'auto_blocked'
   | 'upstream_changed'
   | 'update_success'
   | 'update_failed'

@@ -1,6 +1,6 @@
 // Update checker: resolves tracked tags upstream and derives candidate state.
-// Ignores policy for observation; only notify/auto resources produce notifications,
-// only auto resources produce update jobs (§2/§3).
+// Ignores policy for observation; notify resources produce candidate
+// notifications, auto resources produce update jobs (§2/§3).
 
 import { eq } from 'drizzle-orm';
 import { ApiRequestError } from '../../../shared/errors.js';
@@ -20,7 +20,7 @@ import { shortDigest } from '../fingerprint.js';
 import { effectiveManagementGate } from '../inventory/management-state.js';
 import { parentRowOf } from '../inventory/parent-row.js';
 import type { Outbox } from '../notifications/outbox.js';
-import type { JobsService } from './jobs.js';
+import type { AutoJobGuardReason, JobsService } from './jobs.js';
 
 const CHECK_CONCURRENCY = 4;
 const CHECK_RETRIES = 2;
@@ -29,6 +29,15 @@ const RETRY_BASE_DELAY_MS = 2_000;
  *  connection errors whose open timeout (10s each) would otherwise exceed the
  *  API contract; bounded retries keep checkResource responsive. */
 const RESOLVE_BUDGET_MS = 30_000;
+
+/** 自动更新被守卫阻止时的通知文案（auto_blocked）。 */
+const AUTO_BLOCKED_REASON_TEXT: Record<AutoJobGuardReason, string> = {
+  global_paused: '全局更新已暂停',
+  stopped: '资源已停止',
+  blocked: '资源处于阻塞状态',
+  in_flight: '同目标任务已在途或同摘要任务待重试',
+  exclusive_scope: '同父服务存在在途或提交结果未知的任务',
+};
 
 export interface CheckResult {
   resourceId: number;
@@ -367,8 +376,9 @@ export class UpdateChecker {
       };
     }
 
-    // Candidate found. manual 策略不发通知。
-    if (resource.policy !== 'manual') {
+    // Candidate found. 候选通知仅属于 notify 策略：auto 由定时任务接管
+    // （成功另有 update_success），手动检查的候选通过检查结果即时反馈。
+    if (resource.policy === 'notify') {
       this.outbox.enqueue({
         eventType: 'candidate_found',
         resourceId,
@@ -382,7 +392,21 @@ export class UpdateChecker {
     }
 
     if (resource.policy === 'auto' && reason === 'scheduled') {
-      this.jobs.createAutoJob(resourceId, resolved.digest);
+      // 定时路径：建任务成功时静默；被守卫挡下时发 auto_blocked，让
+      // 「有候选但没自动更新」可见。手动检查只返回检查结果，不建候选更新任务。
+      const { job, guardReason } = this.jobs.createAutoJob(resourceId, resolved.digest);
+      if (job === null && guardReason !== null) {
+        this.outbox.enqueue({
+          eventType: 'auto_blocked',
+          resourceId,
+          dedupeKey: `auto_blocked:${resourceId}:${resolved.digest}:${guardReason}`,
+          payload: {
+            title: '自动更新被阻止',
+            body: `资源 ${resource.name}：发现候选摘要 ${shortDigest(resolved.digest)}，但自动更新被阻止（${AUTO_BLOCKED_REASON_TEXT[guardReason]}）；解除后将在下轮扫描重试。`,
+            type: 'warning',
+          },
+        });
+      }
     }
     return {
       resourceId,

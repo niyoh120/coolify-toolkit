@@ -1497,7 +1497,7 @@ describe('review round 5 regressions (real interleavings)', () => {
         updatedAt: now,
       })
       .run();
-    const job = deps.jobs.createAutoJob(childB.id, D_B);
+    const { job } = deps.jobs.createAutoJob(childB.id, D_B);
     expect(job).toBeNull();
     expect(
       h.db.select().from(updateJobs).where(eq(updateJobs.resourceId, childB.id)).all(),

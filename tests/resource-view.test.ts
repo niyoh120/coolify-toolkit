@@ -19,6 +19,8 @@ import {
   managementReason,
   managementReasonDetail,
   paginateGroups,
+  passesDeployFilter,
+  passesUpdateFilter,
   policyTone,
   projectGroupsForView,
   resetBlockedHint,
@@ -162,6 +164,8 @@ function fixture(): ResourceDTO[] {
 const NO_FILTERS: ServiceFilters = {
   search: '',
   policy: '',
+  update: '',
+  deploy: '',
   managed: 'all',
   status: 'all',
   server: '',
@@ -199,6 +203,69 @@ describe('service group view model', () => {
     expect(filtered).toHaveLength(1);
     expect(filtered[0]?.group.key).toBe('svc-1');
     expect(filtered[0]?.visibleChildren.map((c) => c.name)).toEqual(['db']);
+  });
+
+  it('update filter keeps candidate rows; none excludes ignored/excluded and untracked', () => {
+    // fixture：web/cache/api 有 track，db 无 track 且策略 ignore；solo 为独立应用。
+    const resources = fixture();
+    const excludedChild = dto({
+      id: 14,
+      name: 'excluded',
+      parentResourceId: 2,
+      parentName: 'stack',
+      excludedInfra: true,
+      exclusionSource: 'self',
+      track: track({
+        resourceId: 14,
+        view: trackView({ hasCandidate: true, checkOutcome: 'candidate' }),
+      }),
+    });
+    const all = [...resources, excludedChild];
+    const groups = buildServiceGroups(all);
+    // 'update'：只保留 hasCandidate === true 的行（含已排除子容器）；组间按
+    // svc-1 → svc-2 顺序，组内按名称排序。
+    const withUpdates = filterServiceGroups(groups, { ...NO_FILTERS, update: 'update' });
+    expect(withUpdates.flatMap((g) => g.visibleChildren.map((c) => c.name))).toEqual([
+      'web',
+      'api',
+      'excluded',
+    ]);
+    // 'none'：无候选更新，且排除已忽略（db）与已排除（excluded）；
+    // 无追踪的 cache 与 orphan 组的 lost 归入此档。
+    const withoutUpdates = filterServiceGroups(groups, { ...NO_FILTERS, update: 'none' });
+    expect(withoutUpdates.flatMap((g) => g.visibleChildren.map((c) => c.name))).toEqual([
+      'cache',
+      'lost',
+    ]);
+    // 应用行过滤语义与服务子容器一致。
+    const solo = all.find((r) => r.name === 'solo')!;
+    expect(passesUpdateFilter(solo, 'none')).toBe(true);
+    expect(passesUpdateFilter(solo, 'update')).toBe(false);
+    const db = all.find((r) => r.name === 'db')!;
+    expect(passesUpdateFilter(db, 'none')).toBe(false);
+  });
+
+  it('deploy filter matches deployState exactly and empty string keeps all', () => {
+    const resources = fixture();
+    const deployingChild = dto({
+      id: 15,
+      name: 'deploying',
+      parentResourceId: 2,
+      parentName: 'stack',
+      track: track({ resourceId: 15, view: trackView({ deployState: 'deploying' }) }),
+    });
+    const groups = buildServiceGroups([...resources, deployingChild]);
+    const deploying = filterServiceGroups(groups, { ...NO_FILTERS, deploy: 'deploying' });
+    expect(deploying.flatMap((g) => g.visibleChildren.map((c) => c.name))).toEqual(['deploying']);
+    // 无追踪行（orphan 子容器）与 unknown 同档：无部署证据。
+    const unknown = filterServiceGroups(groups, { ...NO_FILTERS, deploy: 'unknown' });
+    expect(unknown.flatMap((g) => g.visibleChildren.map((c) => c.name))).toContain('lost');
+    expect(unknown.flatMap((g) => g.visibleChildren.map((c) => c.name))).toContain('cache');
+    // 应用行：'' 保留全部，具体状态精确匹配。
+    const solo = resources.find((r) => r.name === 'solo')!;
+    expect(passesDeployFilter(solo, '')).toBe(true);
+    expect(passesDeployFilter(solo, 'unknown')).toBe(true);
+    expect(passesDeployFilter(solo, 'success')).toBe(false);
   });
 
   it('server filter prefers the parent service field', () => {

@@ -190,6 +190,7 @@ export const notificationOutbox = sqliteTable(
     eventType: text('event_type', {
       enum: [
         'candidate_found',
+        'auto_blocked',
         'upstream_changed',
         'update_success',
         'update_failed',

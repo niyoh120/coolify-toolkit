@@ -33,6 +33,17 @@ export interface PreviewRecord {
 
 export const PREVIEW_TTL_MS = 10 * 60_000;
 
+/**
+ * 自动建任务被守卫挡下的原因：全局暂停 / 资源停止 / 资源 blocked / 同目标
+ * 在途或同摘要失败任务 / 同父组 exclusive scope（含兄弟 unknown_submit）。
+ */
+export type AutoJobGuardReason =
+  | 'global_paused'
+  | 'stopped'
+  | 'blocked'
+  | 'in_flight'
+  | 'exclusive_scope';
+
 export class JobsService {
   constructor(
     private readonly db: Db,
@@ -409,12 +420,18 @@ export class JobsService {
     );
   }
 
-  createAutoJob(resourceId: number, candidateDigest: string): UpdateJobRow | null {
+  createAutoJob(
+    resourceId: number,
+    candidateDigest: string,
+  ): {
+    job: UpdateJobRow | null;
+    guardReason: AutoJobGuardReason | null;
+  } {
     const digest = digestSchema.parse(candidateDigest);
     const { resource, track } = this.loadPair(resourceId);
     this.assertUpdatable(resource, track);
-    if (track == null) return null; // assertUpdatable throws first; narrows for TS
-    if (resource.policy !== 'auto') return null;
+    if (track == null) return { job: null, guardReason: null }; // assertUpdatable throws first; narrows for TS
+    if (resource.policy !== 'auto') return { job: null, guardReason: null };
     // 候选路径仅在已接管时可达，这里恒为普通更新任务。
     return this.createGuardedJob(resourceId, digest, track, resource, 'auto', false);
   }
@@ -434,10 +451,13 @@ export class JobsService {
     if (track == null) return null; // assertUpdatable throws first; narrows for TS
     if (resource.policy === 'ignore') return null;
     if (track.configuredDigest != null) return null; // 已接管：走候选更新路径
-    return this.createGuardedJob(resourceId, digest, track, resource, trigger, true);
+    return this.createGuardedJob(resourceId, digest, track, resource, trigger, true).job;
   }
 
-  /** 自动路径共用的守卫与落库；被守卫挡下时静默返回 null。 */
+  /**
+   * 自动路径共用的守卫与落库。被守卫挡下时返回守卫原因（用于自动路径
+   * 的「被阻止」通知），否则 job 为插入的任务。
+   */
   private createGuardedJob(
     resourceId: number,
     digest: string,
@@ -445,19 +465,24 @@ export class JobsService {
     resource: ResourceRow,
     trigger: 'manual' | 'auto',
     isInitialPin: boolean,
-  ): UpdateJobRow | null {
-    if (this.settings.get().globalPaused) return null;
-    if (resource.isStopped) return null;
-    if (resource.blockedReason != null) return null;
-    if (this.blockingJob(resourceId, digest) != null) return null;
+  ): { job: UpdateJobRow | null; guardReason: AutoJobGuardReason | null } {
+    if (this.settings.get().globalPaused) return { job: null, guardReason: 'global_paused' };
+    if (resource.isStopped) return { job: null, guardReason: 'stopped' };
+    if (resource.blockedReason != null) return { job: null, guardReason: 'blocked' };
+    if (this.blockingJob(resourceId, digest) != null)
+      return { job: null, guardReason: 'in_flight' };
     // R5-F2: the auto path obeys the same exclusive scope as the manual path —
     // a sibling's unknown_submit blocks new work for the whole parent group.
     try {
       this.assertExclusiveScope(resource);
     } catch {
-      return null; // guarded path stays silent (plan: guarded = no job)
+      // guarded path stays silent (plan: guarded = no job)
+      return { job: null, guardReason: 'exclusive_scope' };
     }
-    return this.insertJobWith(this.db, resourceId, digest, track, resource, trigger, isInitialPin);
+    return {
+      job: this.insertJobWith(this.db, resourceId, digest, track, resource, trigger, isInitialPin),
+      guardReason: null,
+    };
   }
 
   /** Transaction-parameterized insert so token consumption stays atomic. */
